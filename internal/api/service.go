@@ -615,28 +615,43 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			models.MarkRecommended(gpuOptions, modelVRAM, perGPUGB, filtered)
 		}
 
+		var samplingPresets []models.SamplingPreset
+		var samplingPresetsJSON string
+		if model != nil && !isEmbedding {
+			samplingPresets = models.LookupSamplingPresets(model.ModelID)
+			if len(samplingPresets) > 0 {
+				if b, err := json.Marshal(samplingPresets); err == nil {
+					samplingPresetsJSON = string(b)
+				}
+			}
+		}
+
 		data := struct {
-			ModelID          string
-			Config           *models.ModelConfig
-			EffectiveFlags   string
-			MaxContext       int
-			HasMMProj        bool
-			HasBuiltinVision bool
-			IsEmbedding      bool
-			DraftCandidates  []models.DraftCandidate
-			GPUOptions       []models.GPUOption
-			NumGPUs          int
+			ModelID             string
+			Config              *models.ModelConfig
+			EffectiveFlags      string
+			MaxContext          int
+			HasMMProj           bool
+			HasBuiltinVision    bool
+			IsEmbedding         bool
+			DraftCandidates     []models.DraftCandidate
+			GPUOptions          []models.GPUOption
+			NumGPUs             int
+			SamplingPresets     []models.SamplingPreset
+			SamplingPresetsJSON string
 		}{
-			ModelID:          id,
-			Config:           cfg,
-			EffectiveFlags:   cfg.EffectiveFlagsFor(isEmbedding),
-			MaxContext:       maxContext,
-			HasMMProj:        cfg.MmprojPath != "" || detectedMMProj != "",
-			HasBuiltinVision: hasBuiltinVision,
-			IsEmbedding:      isEmbedding,
-			DraftCandidates:  draftCandidates,
-			GPUOptions:       gpuOptions,
-			NumGPUs:          numGPUs,
+			ModelID:             id,
+			Config:              cfg,
+			EffectiveFlags:      cfg.EffectiveFlagsFor(isEmbedding),
+			MaxContext:          maxContext,
+			HasMMProj:           cfg.MmprojPath != "" || detectedMMProj != "",
+			HasBuiltinVision:    hasBuiltinVision,
+			IsEmbedding:         isEmbedding,
+			DraftCandidates:     draftCandidates,
+			GPUOptions:          gpuOptions,
+			NumGPUs:             numGPUs,
+			SamplingPresets:     samplingPresets,
+			SamplingPresetsJSON: samplingPresetsJSON,
 		}
 		s.renderPartial(w, "model_config", data)
 		return

@@ -335,6 +335,48 @@
 
     <hr style="margin: 1rem 0 0.5rem;">
     <small><strong>Sampling</strong> — applied per-request, no restart needed. Leave blank for server defaults.</small>
+    {{if .SamplingPresets}}
+    <label title="Apply a recommended sampling preset scraped from the model's HuggingFace page. Fills in the fields below — you can edit afterward.">
+        Preset
+        <select class="sampling-preset-picker"
+                data-presets="{{.SamplingPresetsJSON}}"
+                onchange="applySamplingPreset(this);">
+            <option value="">— pick to apply —</option>
+            {{range .SamplingPresets}}
+            <option value="{{.Name}}" title="{{.Description}}">{{.Label}}{{if ne .Name "default"}} ({{.Name}}){{end}}</option>
+            {{end}}
+            <option value="__clear__">Clear all (use server defaults)</option>
+        </select>
+    </label>
+    <script>
+    if (typeof window.applySamplingPreset !== 'function') {
+        window.applySamplingPreset = function(sel) {
+            if (sel.value === '') return;
+            var form = sel.closest('form');
+            var fields = ['temperature','top_p','top_k','min_p','presence_penalty','repeat_penalty'];
+            var clear = sel.value === '__clear__';
+            var preset = null;
+            if (!clear) {
+                try {
+                    var presets = JSON.parse(sel.dataset.presets || '[]');
+                    preset = (presets || []).find(function(p){ return p.name === sel.value; });
+                } catch (e) { return; }
+                if (!preset) return;
+            }
+            fields.forEach(function(name) {
+                var inp = form.querySelector('[name="'+name+'"]');
+                if (!inp) return;
+                var v = clear ? null : preset[name];
+                inp.value = (v === undefined || v === null) ? '' : v;
+            });
+            sel.value = '';
+            // Fire one synthetic change to trigger the existing auto-save.
+            var trig = form.querySelector('[name="temperature"]') || form;
+            trig.dispatchEvent(new Event('change', {bubbles: true}));
+        };
+    }
+    </script>
+    {{end}}
     <div class="grid">
         <label title="Controls randomness. Lower values make output more deterministic. Server default: 0.8">
             Temperature
