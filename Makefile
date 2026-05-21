@@ -1,6 +1,6 @@
 .PHONY: build agent run dev start stop restart clean \
        docker docker-rebuild docker-compose-up docker-compose-down docker-compose-logs \
-       package package-snapshot
+       package package-snapshot scrape-sampling-presets
 
 PID_FILE = bin/llama-toolchest.pid
 
@@ -67,3 +67,9 @@ package-snapshot:
 
 package:
 	goreleaser release --clean
+
+# Refresh internal/models/sampling_presets_data.go by scraping HuggingFace.
+# The generated file is committed — run this manually when you want to pull
+# in new presets (e.g. after a popular model release).
+scrape-sampling-presets:
+	go run ./scripts/scrape-sampling-presets
