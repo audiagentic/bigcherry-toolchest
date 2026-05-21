@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.5.0](https://github.com/tmac1973/llama-toolchest/compare/v2.4.0...v2.5.0) (2026-05-21)
+
+
+### Features
+
+* **presets:** scrape HuggingFace sampling parameters and surface as dropdown presets ([fb77608](https://github.com/tmac1973/llama-toolchest/commit/fb776086ffdd9ff53b97bebc70d8046ab40a9bc2))
+* **presets:** scrape sampling parameters from HuggingFace and surface as dropdown presets ([79655f1](https://github.com/tmac1973/llama-toolchest/commit/79655f10b64ff1605a2757f41ab66bcac65025b8))
+
 ## [2.4.0](https://github.com/tmac1973/llama-toolchest/compare/v2.3.0...v2.4.0) (2026-05-17)
 
 
