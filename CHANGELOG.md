@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.6.0](https://github.com/tmac1973/llama-toolchest/compare/v2.5.0...v2.6.0) (2026-05-25)
+
+
+### Features
+
+* **cuda:** install NCCL so tensor parallelism uses the optimized AllReduce ([6d30977](https://github.com/tmac1973/llama-toolchest/commit/6d309773669620619dace675afece67c963b5c69))
+* **cuda:** install NCCL so tensor parallelism uses the optimized AllReduce ([4e3f2b8](https://github.com/tmac1973/llama-toolchest/commit/4e3f2b81723b0c0485f704a580bcf7ec08f71317))
+
 ## [2.5.0](https://github.com/tmac1973/llama-toolchest/compare/v2.4.0...v2.5.0) (2026-05-21)
 
 
