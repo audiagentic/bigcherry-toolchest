@@ -175,7 +175,7 @@
         <dt>GPU <em>N</em></dt><dd>Pin to a single GPU.</dd>
         <dt>GPUs <em>i-j</em></dt><dd>Contiguous range, layer split — each GPU holds a sequential slice of layers.</dd>
         <dt>All GPUs (layer split)</dt><dd>Layer split across every GPU.</dd>
-        <dt>Tensor Parallelism (<em>N</em> GPUs)</dt><dd>Experimental. Splits individual tensors across N GPUs simultaneously — needs a fast GPU interconnect. Upstream support is still rough for some architectures.</dd>
+        <dt>Tensor Parallelism (<em>N</em> GPUs)</dt><dd>Experimental. Splits individual tensors across N GPUs simultaneously — needs a fast GPU interconnect. On CUDA, NCCL (libnccl-dev) must be present at build time for the optimized AllReduce path; without it the build falls back to a slower path. Pair with Flash Attention <em>on</em> and KV cache at <code>f16</code> (no quant). Upstream support is still rough for some architectures, and N must divide the model's attention head count — many models pick head counts that don't split by 3.</dd>
         <dt>Custom</dt><dd>You provide a raw <code>--tensor-split</code> ratio string.</dd>
     </dl>
 

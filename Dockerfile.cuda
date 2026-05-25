@@ -20,10 +20,15 @@ ARG TARGETARCH=amd64
 
 # curl + ca-certificates for the package download; libssl-dev for OpenSSL-
 # enabled llama.cpp builds. Build toolchain comes via the .deb's Depends.
+# libnccl-dev wires up llama.cpp's optimized AllReduce path for tensor
+# parallelism (-sm tensor) — without it GGML_CUDA_NCCL still defaults ON
+# but the build silently falls back to a slower shfl_tensor_async path.
+# The CUDA devel base image usually ships NCCL already; installing
+# explicitly is a no-op there and guarantees it's present otherwise.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates libssl-dev
+    curl ca-certificates libssl-dev libnccl-dev
 
 # uv is required by the llama-benchy benchmark integration — the
 # benchmark runner shells out to `uvx llama-benchy`. Install
