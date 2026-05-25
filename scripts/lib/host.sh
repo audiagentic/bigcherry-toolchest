@@ -178,6 +178,13 @@ host_missing_gpu_sdk_packages() {
                             fi
                         done
                     fi
+                    # libnccl-devel enables llama.cpp's GGML_CUDA_NCCL path
+                    # (optimized AllReduce for -sm tensor across multiple
+                    # GPUs). The cmake option defaults ON; without the
+                    # headers the build silently falls back to the slower
+                    # shfl_tensor_async path. NVIDIA ships this in their
+                    # cuda-fedoraN repo as libnccl-devel.
+                    rpm -q libnccl-devel >/dev/null 2>&1 || need+=("libnccl-devel")
                     ;;
                 debian)
                     if ! host_find_cuda_host_compiler >/dev/null 2>&1; then
@@ -188,6 +195,9 @@ host_missing_gpu_sdk_packages() {
                             fi
                         done
                     fi
+                    # See fedora branch above — libnccl-dev is what
+                    # llama.cpp's find_package(NCCL) needs at build time.
+                    dpkg -s libnccl-dev >/dev/null 2>&1 || need+=("libnccl-dev")
                     ;;
             esac
             ;;

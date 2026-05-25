@@ -195,6 +195,8 @@ Two modes:
 
 GPU selection: pick "All GPUs" (tensor mode), specific GPUs ("GPU 0", "GPUs 0–1"), or a custom tensor-split string like `1,1,0,0`.
 
+**Tensor parallelism on CUDA — NCCL.** llama.cpp's `-sm tensor` path uses NCCL for the AllReduce that fires after attention and the FFN in every transformer block. NCCL is the optimized GPU-to-GPU collective communications library; without it the build silently falls back to a slower generic path. The CUDA container image installs `libnccl-dev` automatically, and `setup.sh install --cuda` does the same on host installs. At runtime, pair tensor parallelism with **Flash Attention on** and **KV cache at `f16`** (no quant) — those are hard constraints in the current implementation. Note that the per-tensor split requires the model's attention head count to divide cleanly by the number of GPUs, so 3-way splits crash on many architectures (most pick power-of-2 head counts). 2 or 4 GPUs split far more reliably.
+
 ## Architecture
 
 A single Go binary serves the web UI and manages llama-server subprocesses. Server-rendered HTML with [htmx](https://htmx.org/) and [Pico CSS](https://picocss.com/) — no JS build step.
