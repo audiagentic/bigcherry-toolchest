@@ -172,6 +172,15 @@ func (c *ModelConfig) EffectiveFlagsFor(isEmbedding bool) string {
 	}
 	if c.SplitMode != "" {
 		parts = append(parts, "--split-mode", c.SplitMode)
+		// Upstream auto-fit (common_fit_params) is not implemented for
+		// SPLIT_MODE_TENSOR and aborts model load with "llama_params_fit
+		// is not implemented for SPLIT_MODE_TENSOR". Disable it so the
+		// user's explicit --n-gpu-layers / --tensor-split values are
+		// honored verbatim. Drop this when llama.cpp adds the fitter for
+		// tensor mode.
+		if c.SplitMode == "tensor" {
+			parts = append(parts, "--fit", "off")
+		}
 	}
 	if c.MainGPU > 0 {
 		parts = append(parts, "--main-gpu", strconv.Itoa(c.MainGPU))
