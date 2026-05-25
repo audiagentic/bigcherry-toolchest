@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.6.1](https://github.com/tmac1973/llama-toolchest/compare/v2.6.0...v2.6.1) (2026-05-25)
+
+
+### Bug Fixes
+
+* **cuda:** pin libnccl-dev to installed libnccl2 version ([a12273f](https://github.com/tmac1973/llama-toolchest/commit/a12273fd9ee7a4fa92ed0edde81523d0c56632bf))
+* **cuda:** pin libnccl-dev to installed libnccl2 version ([266bcad](https://github.com/tmac1973/llama-toolchest/commit/266bcadfe9a0bd18b31048409341e97f6fdb45c0))
+* **tensor-split:** pass --fit off so model load doesn't abort ([4a05a38](https://github.com/tmac1973/llama-toolchest/commit/4a05a389a5b6092f0e9e216ccc00f296be0cd3ab))
+* **tensor-split:** pass --fit off so model load doesn't abort ([bf032f6](https://github.com/tmac1973/llama-toolchest/commit/bf032f6523b22ffa2efdd3fceede931d83494850))
+
 ## [2.6.0](https://github.com/tmac1973/llama-toolchest/compare/v2.5.0...v2.6.0) (2026-05-25)
 
 
