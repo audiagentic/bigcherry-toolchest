@@ -94,7 +94,8 @@ type ModelConfig struct {
 	Jinja            bool   `json:"jinja"`
 	KVCacheQuant     string `json:"kv_cache_quant"`        // "", "q8_0", "q4_0"
 	DirectIO         bool   `json:"direct_io"`             // bypass page cache, load straight to VRAM
-	MmprojPath       string `json:"mmproj_path,omitempty"` // path to mmproj GGUF for vision models
+	MmprojPath       string `json:"mmproj_path,omitempty"`     // path to mmproj GGUF for vision models
+	MmprojDisabled   bool   `json:"mmproj_disabled,omitempty"` // skip --mmproj at launch even when MmprojPath is set; preserves the path so it can be re-enabled without retyping
 
 	// Speculative decoding
 	SpecType       string `json:"spec_type,omitempty"`        // "", "draft", "draft-mtp", "ngram-simple", "ngram-cache", etc.
@@ -198,7 +199,7 @@ func (c *ModelConfig) EffectiveFlagsFor(isEmbedding bool) string {
 		if c.DirectIO {
 			parts = append(parts, "--direct-io")
 		}
-		if c.MmprojPath != "" {
+		if c.MmprojPath != "" && !c.MmprojDisabled {
 			parts = append(parts, "--mmproj", c.MmprojPath)
 		}
 		// Speculative decoding. llama.cpp split the legacy mode-agnostic

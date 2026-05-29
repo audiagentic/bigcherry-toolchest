@@ -148,6 +148,11 @@
             <input type="text" name="mmproj_path" value="{{.Config.MmprojPath}}"
                    placeholder="Auto-detected or enter path to mmproj GGUF">
         </label>
+        <label title="Uncheck to launch without the vision projector while keeping the path saved. Useful when the projector pushes a tight VRAM budget over the edge.">
+            Load Projector
+            <input type="checkbox" name="mmproj_enabled" role="switch"
+                   {{if not .Config.MmprojDisabled}}checked{{end}}>
+        </label>
     </div>
     {{end}}
 
@@ -310,10 +315,10 @@
     </div>
     {{end}}
     {{if eq .Config.SpecType "draft-mtp"}}
-    {{if or (gt .Config.Parallel 1) (ne .Config.MmprojPath "")}}
+    {{if or (gt .Config.Parallel 1) (and (ne .Config.MmprojPath "") (not .Config.MmprojDisabled))}}
     <small style="color:var(--pico-del-color)"><strong>⚠ MTP incompatibility:</strong>
         {{if gt .Config.Parallel 1}}MTP requires parallel = 1 (currently {{.Config.Parallel}}). {{end}}
-        {{if ne .Config.MmprojPath ""}}MTP does not work with an mmproj vision projector. {{end}}
+        {{if and (ne .Config.MmprojPath "") (not .Config.MmprojDisabled)}}MTP does not work with an mmproj vision projector. {{end}}
         The server may fail to start until this is resolved.
     </small>
     {{end}}
