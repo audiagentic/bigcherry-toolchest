@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.7.0](https://github.com/tmac1973/llama-toolchest/compare/v2.6.1...v2.7.0) (2026-05-29)
+
+
+### Features
+
+* **rocm:** add FP16 cuBLAS compute toggle and bump ROCm to 7.2.4 ([1f66bcd](https://github.com/tmac1973/llama-toolchest/commit/1f66bcde13c0e2db45ad48d7c7dd94efef964263))
+* **rocm:** add FP16 cuBLAS compute toggle and bump ROCm to 7.2.4 ([c638f22](https://github.com/tmac1973/llama-toolchest/commit/c638f2240c4be8cbcf54229ae83ec9f41cb4840e))
+
 ## [2.6.1](https://github.com/tmac1973/llama-toolchest/compare/v2.6.0...v2.6.1) (2026-05-25)
 
 
