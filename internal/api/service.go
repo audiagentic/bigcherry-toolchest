@@ -713,6 +713,10 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 
 		if r.Form.Has("mmproj_path") {
 			cfg.MmprojPath = r.FormValue("mmproj_path")
+			// Inverted storage: form sends mmproj_enabled=on when checked.
+			// Default-false on a missing checkbox means "disabled", which is
+			// exactly the unchecked state.
+			cfg.MmprojDisabled = r.FormValue("mmproj_enabled") != "on"
 		}
 		// Parse aliases (comma-separated, trimmed)
 		if aliasStr := strings.TrimSpace(r.FormValue("aliases")); aliasStr != "" {

@@ -136,7 +136,7 @@ func writeConfigParams(b *strings.Builder, cfg *ModelConfig, isEmbedding bool) {
 		if cfg.DirectIO {
 			b.WriteString("direct-io = true\n")
 		}
-		if cfg.MmprojPath != "" {
+		if cfg.MmprojPath != "" && !cfg.MmprojDisabled {
 			b.WriteString(fmt.Sprintf("mmproj = %s\n", cfg.MmprojPath))
 		}
 		// Speculative decoding. llama.cpp split the legacy mode-agnostic
