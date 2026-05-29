@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.8.0](https://github.com/tmac1973/llama-toolchest/compare/v2.7.0...v2.8.0) (2026-05-29)
+
+
+### Features
+
+* **mmproj:** add toggle to skip vision projector without clearing path ([3ae429f](https://github.com/tmac1973/llama-toolchest/commit/3ae429f5d587267e51e2829849e31c5258fb1755))
+* **mmproj:** add toggle to skip vision projector without clearing path ([44cbde3](https://github.com/tmac1973/llama-toolchest/commit/44cbde3dd82b1a6849f955221f9d905ba83dde58))
+
 ## [2.7.0](https://github.com/tmac1973/llama-toolchest/compare/v2.6.1...v2.7.0) (2026-05-29)
 
 
