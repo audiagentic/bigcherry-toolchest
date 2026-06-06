@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.9.0](https://github.com/tmac1973/llama-toolchest/compare/v2.8.0...v2.9.0) (2026-06-06)
+
+
+### Features
+
+* **benchmark:** add fp16 and MTP overrides to batch job options ([492827c](https://github.com/tmac1973/llama-toolchest/commit/492827ce0623a55325daeb1f8166d642ae1fd5de))
+* **benchmark:** add fp16 and MTP overrides to batch job options ([fa5a3f6](https://github.com/tmac1973/llama-toolchest/commit/fa5a3f6053b0179c3667664618a7f883bb45d1fd))
+
 ## [2.8.0](https://github.com/tmac1973/llama-toolchest/compare/v2.7.0...v2.8.0) (2026-05-29)
 
 
