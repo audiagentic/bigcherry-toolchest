@@ -69,6 +69,7 @@
             <label>KV cache quant
                 <select name="ov_kv_cache_quant">
                     <option value="">inherit</option>
+                    <option value="f16">f16 (no quant)</option>
                     <option value="q8_0">q8_0</option>
                     <option value="q4_0">q4_0</option>
                 </select>
@@ -95,6 +96,7 @@
                 <select name="ov_spec_type">
                     <option value="">inherit</option>
                     <option value="draft">Draft Model</option>
+                    <option value="draft-mtp">MTP (self-speculation)</option>
                     <option value="ngram-simple">N-gram Simple</option>
                     <option value="ngram-cache">N-gram Cache</option>
                     <option value="ngram-map-k">N-gram Map-K</option>
