@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.10.0](https://github.com/tmac1973/llama-toolchest/compare/v2.9.0...v2.10.0) (2026-06-08)
+
+
+### Features
+
+* **mtp:** support gemma-4 separate MTP drafter heads ([9b9194b](https://github.com/tmac1973/llama-toolchest/commit/9b9194b7a5f3d9d2ffbff94fb9de108756fceea0))
+* **mtp:** support gemma-4 separate MTP drafter heads ([3821601](https://github.com/tmac1973/llama-toolchest/commit/382160104ffd1f1e513c832873190f2997611457))
+
+
+### Bug Fixes
+
+* **vram:** model GQA + sliding-window attention and auxiliary files ([c9849e7](https://github.com/tmac1973/llama-toolchest/commit/c9849e78b8fa5370a79cfdd249eda52d689ae980))
+* **vram:** model GQA + sliding-window attention and auxiliary files ([b8720eb](https://github.com/tmac1973/llama-toolchest/commit/b8720ebea55b1c51a0825cdf8924280915cf7182))
+
 ## [2.9.0](https://github.com/tmac1973/llama-toolchest/compare/v2.8.0...v2.9.0) (2026-06-06)
 
 
