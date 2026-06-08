@@ -77,6 +77,14 @@ type Model struct {
 	ContextLength    int    `json:"context_length,omitempty"`     // max trained context
 	SupportsTools    bool   `json:"supports_tools,omitempty"`     // chat template handles tools
 	HasBuiltinVision bool   `json:"has_builtin_vision,omitempty"` // vision encoder baked into model
+
+	// KV-cache scaling factors (see GGUFMeta). Persisted so VRAM estimates
+	// don't re-parse the GGUF on every render. Zero on records parsed before
+	// these existed — BackfillGGUFMeta repopulates them, and KVCacheGB falls
+	// back to the uniform estimate until then.
+	KVFullPerTok  int `json:"kv_full_per_tok,omitempty"`
+	KVSWAPerTok   int `json:"kv_swa_per_tok,omitempty"`
+	SlidingWindow int `json:"sliding_window,omitempty"`
 }
 
 // ModelConfig holds per-model launch configuration for llama-server.
@@ -531,8 +539,11 @@ func (r *Registry) BackfillGGUFMeta() {
 	for _, m := range r.data.Models {
 		needsFull := m.NLayers == 0
 		needsVision := m.NLayers > 0 && !m.HasBuiltinVision // re-check for vision field
+		// Records parsed before KV scaling factors existed have layers but no
+		// per-token factors — re-parse once to repopulate them.
+		needsKV := m.NLayers > 0 && m.KVFullPerTok == 0 && m.KVSWAPerTok == 0
 
-		if !needsFull && !needsVision {
+		if !needsFull && !needsVision && !needsKV {
 			continue
 		}
 		meta, err := ParseGGUFMeta(m.FilePath)
@@ -543,22 +554,29 @@ func (r *Registry) BackfillGGUFMeta() {
 			continue
 		}
 		if needsFull {
-			m.Arch = meta.Architecture
-			m.NLayers = meta.NLayers
-			m.NEmbd = meta.NEmbd
-			m.NHead = meta.NHead
-			m.NKVHead = meta.NKVHead
-			m.ContextLength = meta.ContextLength
-			m.SupportsTools = meta.SupportsTools
-			m.HasBuiltinVision = meta.HasVision
+			meta.ApplyTo(m)
 			changed = true
 			slog.Info("backfilled GGUF metadata", "model", m.ID, "arch", meta.Architecture,
 				"layers", meta.NLayers, "kv_heads", meta.NKVHead, "ctx", meta.ContextLength,
 				"vision", meta.HasVision)
-		} else if meta.HasVision {
-			m.HasBuiltinVision = true
-			changed = true
-			slog.Info("detected built-in vision", "model", m.ID)
+		} else {
+			if meta.HasVision && !m.HasBuiltinVision {
+				m.HasBuiltinVision = true
+				changed = true
+				slog.Info("detected built-in vision", "model", m.ID)
+			}
+			if needsKV && (meta.KVFullPerTok > 0 || meta.KVSWAPerTok > 0) {
+				m.KVFullPerTok = meta.KVFullPerTok
+				m.KVSWAPerTok = meta.KVSWAPerTok
+				m.SlidingWindow = meta.SlidingWindow
+				if m.NKVHead == 0 {
+					m.NKVHead = meta.NKVHead
+				}
+				changed = true
+				slog.Info("backfilled KV scaling", "model", m.ID,
+					"kv_full_per_tok", meta.KVFullPerTok, "kv_swa_per_tok", meta.KVSWAPerTok,
+					"sliding_window", meta.SlidingWindow)
+			}
 		}
 	}
 	if changed {
@@ -724,14 +742,7 @@ func (r *Registry) ScanModels() int {
 
 		// Parse GGUF metadata
 		if meta, err := ParseGGUFMeta(path); err == nil {
-			m.Arch = meta.Architecture
-			m.NLayers = meta.NLayers
-			m.NEmbd = meta.NEmbd
-			m.NHead = meta.NHead
-			m.NKVHead = meta.NKVHead
-			m.ContextLength = meta.ContextLength
-			m.SupportsTools = meta.SupportsTools
-			m.HasBuiltinVision = meta.HasVision
+			meta.ApplyTo(m)
 		}
 
 		// Skip standalone MTP / drafter "assistant" heads (e.g. gemma-4's

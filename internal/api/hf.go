@@ -281,14 +281,7 @@ func (s *Server) onDownloadComplete(downloadID, modelID, filename string, sizeBy
 
 	// Architecture-aware VRAM estimation from the GGUF header parsed above.
 	if meta != nil {
-		m.Arch = meta.Architecture
-		m.NLayers = meta.NLayers
-		m.NEmbd = meta.NEmbd
-		m.NHead = meta.NHead
-		m.NKVHead = meta.NKVHead
-		m.ContextLength = meta.ContextLength
-		m.SupportsTools = meta.SupportsTools
-		m.HasBuiltinVision = meta.HasVision
+		meta.ApplyTo(m)
 	}
 
 	s.registry.Add(m)

@@ -515,26 +515,38 @@ func (s *Server) handleModelVRAMEstimate(w http.ResponseWriter, r *http.Request)
 	contextSize, _ := strconv.Atoi(r.FormValue("context_size"))
 	kvCacheQuant := r.FormValue("kv_cache_quant")
 
-	cfg := &models.ModelConfig{
-		ContextSize:  contextSize,
-		KVCacheQuant: kvCacheQuant,
+	// Start from the saved config so the estimate includes the model's
+	// activated auxiliary files (mmproj / MTP head / draft), then apply the
+	// context and cache-type the user is currently adjusting. Copy so we don't
+	// mutate the registry's live config.
+	cfg := &models.ModelConfig{}
+	if saved, err := s.registry.GetConfig(id); err == nil && saved != nil {
+		*cfg = *saved
 	}
+	cfg.ContextSize = contextSize
+	cfg.KVCacheQuant = kvCacheQuant
 
 	total := models.VRAMEstimateForConfig(model, cfg)
-	kvGB := models.EstimateKVCacheGB(model.NLayers, model.NKVHead, model.NHead, model.NEmbd, contextSize, kvCacheQuant)
+	kvGB := model.KVCacheGB(contextSize, kvCacheQuant)
 	weightsGB := models.BytesToGB(model.SizeBytes)
+	extraGB := models.AuxFilesVRAMGB(cfg)
 
 	if isHTMX(r) {
 		respondHTML(w)
-		fmt.Fprintf(w, `<strong>%.1f GB</strong> <small>(weights: %.1f GB + KV cache: %.1f GB + overhead)</small>`,
-			total, weightsGB, kvGB)
+		extra := ""
+		if extraGB > 0.05 {
+			extra = fmt.Sprintf(" + aux files: %.1f GB", extraGB)
+		}
+		fmt.Fprintf(w, `<strong>%.1f GB</strong> <small>(weights: %.1f GB + KV cache: %.1f GB%s + overhead)</small>`,
+			total, weightsGB, kvGB, extra)
 		return
 	}
 
 	respondJSON(w, map[string]any{
-		"total_gb":    total,
-		"weights_gb":  weightsGB,
-		"kv_cache_gb": kvGB,
+		"total_gb":     total,
+		"weights_gb":   weightsGB,
+		"kv_cache_gb":  kvGB,
+		"aux_files_gb": extraGB,
 	})
 }
 
