@@ -15,9 +15,33 @@ type GGUFMeta struct {
 	NEmbd         int    `json:"n_embd"`
 	NHead         int    `json:"n_head"`
 	NKVHead       int    `json:"n_kv_head"`
-	ContextLength int    `json:"context_length"`  // max trained context size
-	SupportsTools bool   `json:"supports_tools"`  // chat template references tools
-	HasVision     bool   `json:"has_vision"`       // model has a built-in vision encoder
+	ContextLength int    `json:"context_length"` // max trained context size
+	SupportsTools bool   `json:"supports_tools"` // chat template references tools
+	HasVision     bool   `json:"has_vision"`     // model has a built-in vision encoder
+
+	// KV-cache scaling factors, precomputed per-layer to capture grouped-query
+	// attention (which can vary per layer) and sliding-window attention. The KV
+	// cache at context C is: (C·KVFullPerTok + min(C,SlidingWindow)·KVSWAPerTok)
+	// × bytes_per_element. "PerTok" values are KV elements per token, already
+	// summed over the relevant layers and including both K and V.
+	KVFullPerTok  int `json:"kv_full_per_tok,omitempty"` // Σ full-attention layers of kv_heads·(k_dim+v_dim)
+	KVSWAPerTok   int `json:"kv_swa_per_tok,omitempty"`  // Σ sliding-window layers of kv_heads·(k_dim_swa+v_dim_swa)
+	SlidingWindow int `json:"sliding_window,omitempty"`  // sliding-window size; 0 if no local-attention layers
+}
+
+// ApplyTo copies parsed GGUF metadata onto a Model.
+func (meta *GGUFMeta) ApplyTo(m *Model) {
+	m.Arch = meta.Architecture
+	m.NLayers = meta.NLayers
+	m.NEmbd = meta.NEmbd
+	m.NHead = meta.NHead
+	m.NKVHead = meta.NKVHead
+	m.ContextLength = meta.ContextLength
+	m.SupportsTools = meta.SupportsTools
+	m.HasBuiltinVision = meta.HasVision
+	m.KVFullPerTok = meta.KVFullPerTok
+	m.KVSWAPerTok = meta.KVSWAPerTok
+	m.SlidingWindow = meta.SlidingWindow
 }
 
 // HeadDim returns the dimension per attention head.
@@ -65,86 +89,194 @@ func ParseGGUFMeta(path string) (*GGUFMeta, error) {
 	}
 
 	meta := &GGUFMeta{}
-	needed := 7 // architecture + 4 params + context_length + chat_template
-	found := 0
 
-	for i := uint64(0); i < kvCount && found < needed; i++ {
+	// Locals gathered across the metadata scan, reduced into the KV-cache
+	// scaling factors once architecture-prefixed keys are all read. The full
+	// scan (no early exit) is cheap: values we don't capture are seek-skipped.
+	var (
+		headCountKV   int   // scalar head_count_kv (0 if absent or array form)
+		kvHeadCounts  []int // per-layer head_count_kv (gemma stores this as an array)
+		keyLen        int   // attention.key_length (explicit head dim for K)
+		valLen        int   // attention.value_length
+		keyLenSWA     int   // attention.key_length_swa (sliding-window layers)
+		valLenSWA     int   // attention.value_length_swa
+		slidingWindow int   // attention.sliding_window size
+		swaPattern    []bool
+	)
+
+	for i := uint64(0); i < kvCount; i++ {
 		key, err := readGGUFString(f)
 		if err != nil {
-			return meta, nil
+			break
 		}
-
 		valueType, err := readUint32(f)
 		if err != nil {
-			return meta, nil
+			break
 		}
+		arch := meta.Architecture
 
 		// Detect built-in vision encoder from keys like "{arch}.vision.block_count"
 		if strings.Contains(key, ".vision.") {
 			meta.HasVision = true
 		}
 
-		// Check if this is a key we want
 		switch {
 		case key == "general.architecture" && valueType == ggufTypeString:
-			v, err := readGGUFString(f)
-			if err != nil {
-				return meta, nil
+			if v, err := readGGUFString(f); err == nil {
+				meta.Architecture = v
 			}
-			meta.Architecture = v
-			found++
 			continue
 
 		case key == "tokenizer.chat_template" && valueType == ggufTypeString:
-			v, err := readGGUFString(f)
-			if err != nil {
-				return meta, nil
+			if v, err := readGGUFString(f); err == nil {
+				meta.SupportsTools = strings.Contains(v, "tools")
 			}
-			meta.SupportsTools = strings.Contains(v, "tools")
-			found++
 			continue
 
-		case meta.Architecture != "" && key == meta.Architecture+".block_count":
-			if v, err := readGGUFUint32OrInt32(f, valueType); err == nil {
-				meta.NLayers = int(v)
-				found++
+		case arch != "" && key == arch+".block_count":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				meta.NLayers = v
 				continue
 			}
 
-		case meta.Architecture != "" && key == meta.Architecture+".embedding_length":
-			if v, err := readGGUFUint32OrInt32(f, valueType); err == nil {
-				meta.NEmbd = int(v)
-				found++
+		case arch != "" && key == arch+".embedding_length":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				meta.NEmbd = v
 				continue
 			}
 
-		case meta.Architecture != "" && key == meta.Architecture+".attention.head_count":
-			if v, err := readGGUFUint32OrInt32(f, valueType); err == nil {
-				meta.NHead = int(v)
-				found++
+		case arch != "" && key == arch+".attention.head_count":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				meta.NHead = v
 				continue
 			}
 
-		case meta.Architecture != "" && key == meta.Architecture+".attention.head_count_kv":
-			if v, err := readGGUFUint32OrInt32(f, valueType); err == nil {
-				meta.NKVHead = int(v)
-				found++
+		case arch != "" && key == arch+".attention.head_count_kv":
+			// Scalar for most models; a per-layer array for gemma-style models
+			// whose GQA grouping differs between local and global layers.
+			if valueType == ggufTypeArray {
+				kvHeadCounts = readGGUFArrayInts(f)
+				continue
+			}
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				headCountKV = v
+				meta.NKVHead = v
 				continue
 			}
 
-		case meta.Architecture != "" && key == meta.Architecture+".context_length":
-			if v, err := readGGUFUint32OrInt32(f, valueType); err == nil {
-				meta.ContextLength = int(v)
-				found++
+		case arch != "" && key == arch+".context_length":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				meta.ContextLength = v
+				continue
+			}
+
+		case arch != "" && key == arch+".attention.key_length":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				keyLen = v
+				continue
+			}
+		case arch != "" && key == arch+".attention.value_length":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				valLen = v
+				continue
+			}
+		case arch != "" && key == arch+".attention.key_length_swa":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				keyLenSWA = v
+				continue
+			}
+		case arch != "" && key == arch+".attention.value_length_swa":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				valLenSWA = v
+				continue
+			}
+		case arch != "" && key == arch+".attention.sliding_window":
+			if v, ok := readGGUFScalarInt(f, valueType); ok {
+				slidingWindow = v
+				continue
+			}
+		case arch != "" && key == arch+".attention.sliding_window_pattern":
+			// Per-layer bool array (gemma-3/4): true = local/sliding-window
+			// layer. Other layouts (scalar interval) are left unmodeled, which
+			// conservatively keeps those layers at full attention.
+			if valueType == ggufTypeArray {
+				for _, x := range readGGUFArrayInts(f) {
+					swaPattern = append(swaPattern, x != 0)
+				}
 				continue
 			}
 		}
 
-		// Skip values we don't care about
+		// Skip values we don't capture (also handles type-mismatched reads above).
 		skipGGUFValue(f, valueType)
 	}
 
+	computeKVScaling(meta, headCountKV, kvHeadCounts, keyLen, valLen, keyLenSWA, valLenSWA, slidingWindow, swaPattern)
 	return meta, nil
+}
+
+// computeKVScaling reduces the raw per-layer attention parameters into the
+// compact KV-cache scaling factors stored on GGUFMeta. Falls back to uniform
+// full attention with head_dim = n_embd/n_head when the richer keys are absent,
+// which reproduces the legacy estimate exactly for non-gemma architectures.
+func computeKVScaling(meta *GGUFMeta, headCountKV int, kvHeadCounts []int, keyLen, valLen, keyLenSWA, valLenSWA, slidingWindow int, swaPattern []bool) {
+	if meta.NLayers == 0 {
+		return
+	}
+
+	embHeadDim := 0
+	if meta.NHead > 0 {
+		embHeadDim = meta.NEmbd / meta.NHead
+	}
+	kDim, vDim := keyLen, valLen
+	if kDim == 0 {
+		kDim = embHeadDim
+	}
+	if vDim == 0 {
+		vDim = embHeadDim
+	}
+	kDimSWA, vDimSWA := keyLenSWA, valLenSWA
+	if kDimSWA == 0 {
+		kDimSWA = kDim
+	}
+	if vDimSWA == 0 {
+		vDimSWA = vDim
+	}
+	if kDim+vDim == 0 {
+		return // no head-dim info — leave KV factors zero, caller falls back
+	}
+
+	// Default per-layer KV head count: explicit scalar, else full attention.
+	defaultKV := headCountKV
+	if defaultKV == 0 {
+		defaultKV = meta.NHead
+	}
+
+	full, swa, maxKV := 0, 0, meta.NKVHead
+	for i := 0; i < meta.NLayers; i++ {
+		kv := defaultKV
+		if i < len(kvHeadCounts) {
+			kv = kvHeadCounts[i]
+		}
+		if kv > maxKV {
+			maxKV = kv
+		}
+		local := i < len(swaPattern) && swaPattern[i]
+		if local && slidingWindow > 0 {
+			swa += kv * (kDimSWA + vDimSWA)
+		} else {
+			full += kv * (kDim + vDim)
+		}
+	}
+	meta.KVFullPerTok = full
+	meta.KVSWAPerTok = swa
+	if swa > 0 {
+		meta.SlidingWindow = slidingWindow
+	}
+	// Representative scalar for display when head_count_kv was an array.
+	if meta.NKVHead == 0 {
+		meta.NKVHead = maxKV
+	}
 }
 
 // GGUF value type constants
@@ -185,17 +317,67 @@ func readUint32(r io.Reader) (uint32, error) {
 	return v, err
 }
 
-func readGGUFUint32OrInt32(r io.Reader, valueType uint32) (uint32, error) {
+// readGGUFScalarInt reads an integer-typed scalar value. It consumes bytes only
+// when valueType is a recognized integer type; on a type mismatch it reads
+// nothing and returns ok=false so the caller can fall back to skipGGUFValue
+// (keeping the parser aligned).
+func readGGUFScalarInt(r io.Reader, valueType uint32) (int, bool) {
 	switch valueType {
-	case ggufTypeUint32:
-		return readUint32(r)
-	case ggufTypeInt32:
-		var v int32
-		err := binary.Read(r, binary.LittleEndian, &v)
-		return uint32(v), err
-	default:
-		return 0, fmt.Errorf("expected uint32/int32, got type %d", valueType)
+	case ggufTypeUint8, ggufTypeInt8, ggufTypeBool:
+		var v uint8
+		if binary.Read(r, binary.LittleEndian, &v) == nil {
+			return int(int8(v)), true
+		}
+	case ggufTypeUint16, ggufTypeInt16:
+		var v uint16
+		if binary.Read(r, binary.LittleEndian, &v) == nil {
+			return int(int16(v)), true
+		}
+	case ggufTypeUint32, ggufTypeInt32:
+		var v uint32
+		if binary.Read(r, binary.LittleEndian, &v) == nil {
+			return int(int32(v)), true
+		}
+	case ggufTypeUint64, ggufTypeInt64:
+		var v uint64
+		if binary.Read(r, binary.LittleEndian, &v) == nil {
+			return int(int64(v)), true
+		}
 	}
+	return 0, false
+}
+
+// readGGUFArrayInts reads an array value (its element type, count, and elements;
+// the outer array type has already been consumed) and returns fixed-size
+// numeric/bool elements as ints. It always consumes the full value so the parser
+// stays aligned. Returns nil for unsupported element types.
+func readGGUFArrayInts(r io.ReadSeeker) []int {
+	elemType, err := readUint32(r)
+	if err != nil {
+		return nil
+	}
+	var count uint64
+	if binary.Read(r, binary.LittleEndian, &count) != nil {
+		return nil
+	}
+	if count > 1<<20 { // sanity bound
+		return nil
+	}
+	out := make([]int, 0, count)
+	for i := uint64(0); i < count; i++ {
+		v, ok := readGGUFScalarInt(r, elemType)
+		if !ok {
+			// Unsupported element type — consume the remainder generically so
+			// the stream stays aligned, then bail.
+			remaining := int64(count - i)
+			if sz := ggufFixedSize(elemType); sz > 0 {
+				r.Seek(remaining*sz, io.SeekCurrent)
+			}
+			return out
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // ggufFixedSize returns the byte size of a fixed-size GGUF value type, or 0 for variable types.
