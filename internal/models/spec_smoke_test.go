@@ -24,6 +24,66 @@ func TestSpecMTPEffectiveFlags(t *testing.T) {
 	}
 }
 
+func TestSpecMTPSeparateDrafterFlags(t *testing.T) {
+	// gemma-4 style: MTP head ships as its own GGUF, loaded via --model-draft
+	// under spec-type draft-mtp, including draft-resource overrides.
+	cfg := &ModelConfig{
+		GPULayers:   99,
+		ContextSize: 8192,
+		Threads:     8,
+		SpecType:    "draft-mtp",
+		MtpPath:     "/models/gemma-4-12B-it-MTP-Q8_0.gguf",
+		DraftMax:    4,
+		DraftDevice: "CUDA0",
+	}
+	got := cfg.EffectiveFlags()
+	for _, want := range []string{
+		"--spec-type draft-mtp",
+		"--model-draft /models/gemma-4-12B-it-MTP-Q8_0.gguf",
+		"--spec-draft-n-max 4",
+		"--device-draft CUDA0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gemma MTP flags missing %q in: %s", want, got)
+		}
+	}
+}
+
+func TestSpecMTPSeparateDrafterDisabled(t *testing.T) {
+	// MtpDisabled suppresses --model-draft while keeping self-speculation flags.
+	cfg := &ModelConfig{
+		GPULayers:   99,
+		ContextSize: 8192,
+		Threads:     8,
+		SpecType:    "draft-mtp",
+		MtpPath:     "/models/gemma-4-12B-it-MTP-Q8_0.gguf",
+		MtpDisabled: true,
+		DraftMax:    4,
+	}
+	got := cfg.EffectiveFlags()
+	if strings.Contains(got, "--model-draft") {
+		t.Errorf("disabled MTP head should not emit --model-draft, got: %s", got)
+	}
+	if !strings.Contains(got, "--spec-type draft-mtp") {
+		t.Errorf("MTP flags missing --spec-type draft-mtp in: %s", got)
+	}
+}
+
+func TestIsMTPHeadArch(t *testing.T) {
+	for _, arch := range []string{"gemma4-assistant", "gemma4_assistant"} {
+		if !IsMTPHeadArch(arch) {
+			t.Errorf("IsMTPHeadArch(%q) = false, want true", arch)
+		}
+	}
+	// Qwen self-speculation MTP models use a normal runnable arch — must NOT
+	// be classified as a standalone drafter head.
+	for _, arch := range []string{"qwen3", "qwen3moe", "gemma3", "llama"} {
+		if IsMTPHeadArch(arch) {
+			t.Errorf("IsMTPHeadArch(%q) = true, want false", arch)
+		}
+	}
+}
+
 func TestSpecDraftResourceFlags(t *testing.T) {
 	cfg := &ModelConfig{
 		GPULayers:         99,

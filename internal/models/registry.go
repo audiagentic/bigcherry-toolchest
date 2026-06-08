@@ -81,21 +81,23 @@ type Model struct {
 
 // ModelConfig holds per-model launch configuration for llama-server.
 type ModelConfig struct {
-	Enabled          bool   `json:"enabled"`
-	GPULayers        int    `json:"gpu_layers"`
-	TensorSplit      string `json:"tensor_split"`
-	SplitMode        string `json:"split_mode,omitempty"` // "layer", "tensor", or ""
-	MainGPU          int    `json:"main_gpu,omitempty"`
-	GPUAssign        string `json:"gpu_assign,omitempty"` // "all", "0", "0-1", "custom", etc.
-	ContextSize      int    `json:"context_size"`
-	Parallel         int    `json:"parallel,omitempty"` // n parallel sequence slots; 0/1 = no extra slots, >1 divides ctx_size across slots
-	Threads          int    `json:"threads"`
-	FlashAttention   bool   `json:"flash_attention"`
-	Jinja            bool   `json:"jinja"`
-	KVCacheQuant     string `json:"kv_cache_quant"`        // "", "q8_0", "q4_0"
-	DirectIO         bool   `json:"direct_io"`             // bypass page cache, load straight to VRAM
-	MmprojPath       string `json:"mmproj_path,omitempty"`     // path to mmproj GGUF for vision models
-	MmprojDisabled   bool   `json:"mmproj_disabled,omitempty"` // skip --mmproj at launch even when MmprojPath is set; preserves the path so it can be re-enabled without retyping
+	Enabled        bool   `json:"enabled"`
+	GPULayers      int    `json:"gpu_layers"`
+	TensorSplit    string `json:"tensor_split"`
+	SplitMode      string `json:"split_mode,omitempty"` // "layer", "tensor", or ""
+	MainGPU        int    `json:"main_gpu,omitempty"`
+	GPUAssign      string `json:"gpu_assign,omitempty"` // "all", "0", "0-1", "custom", etc.
+	ContextSize    int    `json:"context_size"`
+	Parallel       int    `json:"parallel,omitempty"` // n parallel sequence slots; 0/1 = no extra slots, >1 divides ctx_size across slots
+	Threads        int    `json:"threads"`
+	FlashAttention bool   `json:"flash_attention"`
+	Jinja          bool   `json:"jinja"`
+	KVCacheQuant   string `json:"kv_cache_quant"`            // "", "q8_0", "q4_0"
+	DirectIO       bool   `json:"direct_io"`                 // bypass page cache, load straight to VRAM
+	MmprojPath     string `json:"mmproj_path,omitempty"`     // path to mmproj GGUF for vision models
+	MmprojDisabled bool   `json:"mmproj_disabled,omitempty"` // skip --mmproj at launch even when MmprojPath is set; preserves the path so it can be re-enabled without retyping
+	MtpPath        string `json:"mtp_path,omitempty"`        // path to a separate MTP drafter-head GGUF (gemma-4 style); loaded via --model-draft under spec_type=draft-mtp. Empty for self-speculation MTP (Qwen3.6/DeepSeek-V3) where the head is baked into the main GGUF.
+	MtpDisabled    bool   `json:"mtp_disabled,omitempty"`    // skip the separate --model-draft MTP head at launch even when MtpPath is set; preserves the path so it can be re-enabled
 
 	// Speculative decoding
 	SpecType       string `json:"spec_type,omitempty"`        // "", "draft", "draft-mtp", "ngram-simple", "ngram-cache", etc.
@@ -106,8 +108,9 @@ type ModelConfig struct {
 	NgramSizeN     int    `json:"ngram_size_n,omitempty"`     // n-gram lookup length
 	NgramSizeM     int    `json:"ngram_size_m,omitempty"`     // n-gram draft length
 
-	// Draft model resource overrides (only meaningful when spec_type="draft" —
-	// not used by MTP self-speculation since the draft *is* the main model).
+	// Draft model resource overrides. Apply to spec_type="draft" and to
+	// gemma-4-style draft-mtp (separate head loaded via --model-draft). Not
+	// used by self-speculation MTP, where the draft *is* the main model.
 	DraftCtxSize      int    `json:"draft_ctx_size,omitempty"`       // --ctx-size-draft
 	DraftGPULayers    int    `json:"draft_gpu_layers,omitempty"`     // --gpu-layers-draft
 	DraftDevice       string `json:"draft_device,omitempty"`         // --device-draft
@@ -244,10 +247,32 @@ func (c *ModelConfig) EffectiveFlagsFor(isEmbedding bool) string {
 				parts = append(parts, "--cache-type-k-draft", c.DraftKVCacheQuant, "--cache-type-v-draft", c.DraftKVCacheQuant)
 			}
 		case "draft-mtp":
-			// MTP is self-speculation: the main GGUF carries the draft
-			// head, so no --model-draft is set and the draft-resource
-			// flags above don't apply. Only the draft sampling knobs do.
+			// Two MTP flavors share this spec-type:
+			//   • Self-speculation (Qwen3.6, DeepSeek-V3): the MTP head is baked
+			//     into the main GGUF, so MtpPath is empty — no --model-draft and
+			//     the draft-resource flags don't apply. Only the sampling knobs do.
+			//   • Separate drafter (gemma-4's "gemma4-assistant" head): the head
+			//     ships as its own GGUF in MtpPath, loaded via --model-draft just
+			//     like a draft-simple model, including the draft-resource overrides.
 			parts = append(parts, "--spec-type", "draft-mtp")
+			if c.MtpPath != "" && !c.MtpDisabled {
+				parts = append(parts, "--model-draft", c.MtpPath)
+				if c.DraftCtxSize > 0 {
+					parts = append(parts, "--ctx-size-draft", strconv.Itoa(c.DraftCtxSize))
+				}
+				if c.DraftGPULayers > 0 {
+					parts = append(parts, "--gpu-layers-draft", strconv.Itoa(c.DraftGPULayers))
+				}
+				if c.DraftDevice != "" {
+					parts = append(parts, "--device-draft", c.DraftDevice)
+				}
+				if c.DraftCPUMoE > 0 {
+					parts = append(parts, "--n-cpu-moe-draft", strconv.Itoa(c.DraftCPUMoE))
+				}
+				if c.DraftKVCacheQuant != "" {
+					parts = append(parts, "--cache-type-k-draft", c.DraftKVCacheQuant, "--cache-type-v-draft", c.DraftKVCacheQuant)
+				}
+			}
 			if c.DraftMax > 0 {
 				parts = append(parts, "--spec-draft-n-max", strconv.Itoa(c.DraftMax))
 			}
@@ -709,6 +734,13 @@ func (r *Registry) ScanModels() int {
 			m.HasBuiltinVision = meta.HasVision
 		}
 
+		// Skip standalone MTP / drafter "assistant" heads (e.g. gemma-4's
+		// gemma4-assistant). They're loaded via --model-draft alongside a main
+		// model, not served on their own — auto-associated by AutoDetectMTP below.
+		if IsMTPHeadArch(m.Arch) {
+			return nil
+		}
+
 		found = append(found, m)
 		return nil
 	})
@@ -720,9 +752,10 @@ func (r *Registry) ScanModels() int {
 			"arch", m.Arch)
 	}
 
-	// Auto-associate mmproj files with newly scanned models
+	// Auto-associate mmproj files and separate MTP drafter heads with models
 	if len(found) > 0 {
 		r.AutoDetectMMProj()
+		r.AutoDetectMTP()
 	}
 
 	return len(found)
@@ -792,6 +825,100 @@ func (r *Registry) AutoDetectMMProj() int {
 		}
 		if mmproj := FindMMProj(m.FilePath); mmproj != "" {
 			cfg.MmprojPath = mmproj
+			found++
+		}
+	}
+	if found > 0 {
+		r.save()
+	}
+	return found
+}
+
+// IsMTPHeadArch reports whether a GGUF architecture identifies a standalone
+// MTP / speculative "assistant" drafter head (e.g. gemma-4's "gemma4-assistant")
+// rather than a runnable model. Such files load via --model-draft under
+// spec_type=draft-mtp, not served on their own.
+//
+// Detection is by architecture, not filename: Qwen's self-speculation MTP
+// models also carry "MTP" in their name but ARE runnable (the head is baked
+// into a normal qwen3 arch), so they must keep registering as ordinary models.
+func IsMTPHeadArch(arch string) bool {
+	return strings.Contains(strings.ToLower(arch), "assistant")
+}
+
+// FindMTP looks for a separate MTP drafter-head GGUF associated with the given
+// model: the same directory, an "MTP/" subdirectory (unsloth's gemma-4 layout),
+// or the parent directory and its "MTP/" subdir (for quant-in-subdir repos).
+// Returns the path to the first one found, or empty string.
+func FindMTP(modelFilePath string) string {
+	dir := filepath.Dir(modelFilePath)
+	for _, d := range []string{dir, filepath.Join(dir, "MTP")} {
+		if p := findMTPInDir(d); p != "" {
+			return p
+		}
+	}
+	parent := filepath.Dir(dir)
+	if parent != dir {
+		for _, d := range []string{parent, filepath.Join(parent, "MTP")} {
+			if p := findMTPInDir(d); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// findMTPInDir scans a single directory for a GGUF whose architecture marks it
+// as an MTP drafter head.
+func findMTPInDir(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	// unsloth ships heads in an "MTP/" subdirectory; arch is authoritative but
+	// reading every GGUF header is the expensive part, so use location/name as
+	// a cheap pre-filter.
+	inMTPDir := strings.EqualFold(filepath.Base(dir), "MTP")
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		lname := strings.ToLower(name)
+		if !strings.HasSuffix(lname, ".gguf") {
+			continue
+		}
+		// Only crack open headers for files that plausibly *are* a drafter head.
+		// Skips parsing every multi-GB main quant on each config open / scan.
+		// The IsMTPHeadArch check below stays authoritative — e.g. a Qwen
+		// self-speculation model named "...-MTP-..." passes this pre-filter but
+		// is correctly rejected by its runnable (non-assistant) architecture.
+		if !inMTPDir && !strings.Contains(lname, "mtp") && !strings.Contains(lname, "assistant") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if meta, err := ParseGGUFMeta(path); err == nil && IsMTPHeadArch(meta.Architecture) {
+			return path
+		}
+	}
+	return ""
+}
+
+// AutoDetectMTP scans all registered models and sets MtpPath on configs where a
+// separate MTP drafter head exists in or near the model directory but isn't
+// configured yet.
+func (r *Registry) AutoDetectMTP() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	found := 0
+	for id, m := range r.data.Models {
+		cfg := r.data.Configs[id]
+		if cfg == nil || cfg.MtpPath != "" {
+			continue
+		}
+		if mtp := FindMTP(m.FilePath); mtp != "" {
+			cfg.MtpPath = mtp
 			found++
 		}
 	}
