@@ -175,6 +175,26 @@ func writeConfigParams(b *strings.Builder, cfg *ModelConfig, isEmbedding bool) {
 			}
 		case "draft-mtp":
 			b.WriteString("spec-type = draft-mtp\n")
+			// Separate drafter head (gemma-4); empty for self-speculation MTP.
+			if cfg.MtpPath != "" && !cfg.MtpDisabled {
+				b.WriteString(fmt.Sprintf("model-draft = %s\n", cfg.MtpPath))
+				if cfg.DraftCtxSize > 0 {
+					b.WriteString(fmt.Sprintf("ctx-size-draft = %d\n", cfg.DraftCtxSize))
+				}
+				if cfg.DraftGPULayers > 0 {
+					b.WriteString(fmt.Sprintf("gpu-layers-draft = %d\n", cfg.DraftGPULayers))
+				}
+				if cfg.DraftDevice != "" {
+					b.WriteString(fmt.Sprintf("device-draft = %s\n", cfg.DraftDevice))
+				}
+				if cfg.DraftCPUMoE > 0 {
+					b.WriteString(fmt.Sprintf("n-cpu-moe-draft = %d\n", cfg.DraftCPUMoE))
+				}
+				if cfg.DraftKVCacheQuant != "" {
+					b.WriteString(fmt.Sprintf("cache-type-k-draft = %s\n", cfg.DraftKVCacheQuant))
+					b.WriteString(fmt.Sprintf("cache-type-v-draft = %s\n", cfg.DraftKVCacheQuant))
+				}
+			}
 			if cfg.DraftMax > 0 {
 				b.WriteString(fmt.Sprintf("spec-draft-n-max = %d\n", cfg.DraftMax))
 			}

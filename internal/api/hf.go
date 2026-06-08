@@ -256,6 +256,17 @@ func (s *Server) onDownloadComplete(downloadID, modelID, filename string, sizeBy
 		return
 	}
 
+	meta, _ := models.ParseGGUFMeta(filePath)
+
+	// MTP drafter heads (e.g. gemma-4's gemma4-assistant) aren't runnable
+	// models — they load via --model-draft. Don't register; auto-associate
+	// with sibling main models like we do for mmproj.
+	if meta != nil && models.IsMTPHeadArch(meta.Architecture) {
+		slog.Info("MTP drafter head downloaded, associating with sibling models", "file", filePath)
+		s.registry.AutoDetectMTP()
+		return
+	}
+
 	safeFilename := strings.ReplaceAll(strings.TrimSuffix(filename, ".gguf"), "/", "--")
 	m := &models.Model{
 		ID:           fmt.Sprintf("%s--%s", safeName, safeFilename),
@@ -268,8 +279,8 @@ func (s *Server) onDownloadComplete(downloadID, modelID, filename string, sizeBy
 		DownloadedAt: time.Now(),
 	}
 
-	// Parse GGUF metadata for architecture-aware VRAM estimation
-	if meta, err := models.ParseGGUFMeta(filePath); err == nil {
+	// Architecture-aware VRAM estimation from the GGUF header parsed above.
+	if meta != nil {
 		m.Arch = meta.Architecture
 		m.NLayers = meta.NLayers
 		m.NEmbd = meta.NEmbd
@@ -290,5 +301,13 @@ func (s *Server) onDownloadComplete(downloadID, modelID, filename string, sizeBy
 			slog.Info("auto-associated mmproj", "model", m.ID, "mmproj", mmproj)
 		}
 	}
-}
 
+	// Check if a separate MTP drafter head already exists nearby
+	if mtp := models.FindMTP(filePath); mtp != "" {
+		if cfg, err := s.registry.GetConfig(m.ID); err == nil && cfg.MtpPath == "" {
+			cfg.MtpPath = mtp
+			s.registry.SetConfig(m.ID, cfg)
+			slog.Info("auto-associated MTP head", "model", m.ID, "mtp", mtp)
+		}
+	}
+}

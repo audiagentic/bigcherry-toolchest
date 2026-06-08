@@ -555,11 +555,13 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 
 		maxContext := 0
 		detectedMMProj := ""
+		detectedMTP := ""
 		isEmbedding := false
 		var draftCandidates []models.DraftCandidate
 		if model != nil {
 			maxContext = model.ContextLength
 			detectedMMProj = models.FindMMProj(model.FilePath)
+			detectedMTP = models.FindMTP(model.FilePath)
 			isEmbedding = models.IsEmbeddingModel(model.ModelID) || models.IsEmbeddingModel(model.ID)
 			if !isEmbedding {
 				draftCandidates = s.registry.FindDraftCandidates(id)
@@ -632,6 +634,7 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			EffectiveFlags      string
 			MaxContext          int
 			HasMMProj           bool
+			HasMTP              bool
 			HasBuiltinVision    bool
 			IsEmbedding         bool
 			DraftCandidates     []models.DraftCandidate
@@ -645,6 +648,7 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			EffectiveFlags:      cfg.EffectiveFlagsFor(isEmbedding),
 			MaxContext:          maxContext,
 			HasMMProj:           cfg.MmprojPath != "" || detectedMMProj != "",
+			HasMTP:              cfg.MtpPath != "" || detectedMTP != "",
 			HasBuiltinVision:    hasBuiltinVision,
 			IsEmbedding:         isEmbedding,
 			DraftCandidates:     draftCandidates,
@@ -717,6 +721,12 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 			// Default-false on a missing checkbox means "disabled", which is
 			// exactly the unchecked state.
 			cfg.MmprojDisabled = r.FormValue("mmproj_enabled") != "on"
+		}
+		if r.Form.Has("mtp_path") {
+			cfg.MtpPath = r.FormValue("mtp_path")
+			// Inverted storage, same as mmproj: form sends mtp_enabled=on when
+			// checked; a missing checkbox means disabled.
+			cfg.MtpDisabled = r.FormValue("mtp_enabled") != "on"
 		}
 		// Parse aliases (comma-separated, trimmed)
 		if aliasStr := strings.TrimSpace(r.FormValue("aliases")); aliasStr != "" {

@@ -179,7 +179,7 @@
                 <dd>Uses a separate smaller model of the same architecture to propose tokens. Highest and most consistent speedups (1.5-2.5x typical). Requires a compatible model — download one with the same architecture but smaller size (e.g., 0.5B-1B) and it will appear in the dropdown. Uses extra VRAM for the draft model.</dd>
 
                 <dt><strong>MTP (Multi-Token Prediction)</strong></dt>
-                <dd>Self-speculation built into the model — the same GGUF carries an MTP head that drafts tokens for itself, so no separate draft model is needed. Used by Qwen3.6-MTP and DeepSeek-V3-MTP releases. Typical speedup 1.5-2x with zero extra VRAM. <strong>Limitations:</strong> requires the main model to be MTP-enabled (look for "MTP" in the filename), is incompatible with <em>parallel &gt; 1</em>, and does not work with <code>--mmproj</code> vision projectors.</dd>
+                <dd>Multi-token prediction comes in two flavors, both selected here. <strong>Self-speculation</strong> (Qwen3.6-MTP, DeepSeek-V3-MTP): the same GGUF carries an MTP head that drafts tokens for itself — no separate file needed. <strong>Separate drafter</strong> (gemma-4): ships an "assistant" head as its own GGUF (in an <code>MTP/</code> subfolder); llama-toolchest auto-detects it and loads it via <code>--model-draft</code>. Typical speedup 1.5-3x with little or no extra VRAM. <strong>Notes:</strong> typically needs <em>parallel = 1</em>; gemma-4's <code>gemma4-assistant</code> arch requires a llama.cpp build of <strong>b9549 or newer</strong> (Gemma-4 MTP merged 2026-06-07) — build the latest from the Builds tab if an older one is in use.</dd>
 
                 <dt><strong>N-gram Simple</strong></dt>
                 <dd>Searches the generation history for matching token patterns and reuses what followed. Zero overhead, no extra VRAM. Works best when the model repeats patterns (code refactoring, structured output). No benefit for entirely novel text.</dd>
@@ -257,6 +257,18 @@
             </select>
         </label>
         {{end}}
+        {{if and (eq .Config.SpecType "draft-mtp") .HasMTP}}
+        <label title="A separate MTP drafter-head GGUF (e.g. gemma-4's gemma4-assistant), loaded via --model-draft. Auto-detected from the model's MTP/ subdirectory. Leave blank for self-speculation MTP models (Qwen3.6, DeepSeek-V3) whose head is baked into the main GGUF.">
+            MTP Drafter Head
+            <input type="text" name="mtp_path" value="{{.Config.MtpPath}}"
+                   placeholder="Auto-detected, or blank for self-speculation MTP">
+        </label>
+        <label title="Uncheck to launch without the separate MTP head while keeping the path saved.">
+            Load MTP Head
+            <input type="checkbox" name="mtp_enabled" role="switch"
+                   {{if not .Config.MtpDisabled}}checked{{end}}>
+        </label>
+        {{end}}
     </div>
     {{if ne .Config.SpecType ""}}
     <div class="grid">
@@ -278,8 +290,8 @@
         </label>
     </div>
     {{end}}
-    {{if eq .Config.SpecType "draft"}}
-    <small><strong>Draft model resources</strong> — leave blank to inherit llama-server defaults. Set these when the draft model needs its own GPU offload, context, or cache type.</small>
+    {{if or (eq .Config.SpecType "draft") (and (eq .Config.SpecType "draft-mtp") .HasMTP)}}
+    <small><strong>Draft model resources</strong> — leave blank to inherit llama-server defaults. Set these when the draft/MTP head needs its own GPU offload, context, or cache type (e.g. <code>--device-draft CUDA0</code> on multi-GPU).</small>
     <div class="grid">
         <label title="Context size for the draft model. Default: inherits from main ctx-size.">
             Draft Ctx Size
@@ -315,12 +327,13 @@
     </div>
     {{end}}
     {{if eq .Config.SpecType "draft-mtp"}}
-    {{if or (gt .Config.Parallel 1) (and (ne .Config.MmprojPath "") (not .Config.MmprojDisabled))}}
-    <small style="color:var(--pico-del-color)"><strong>⚠ MTP incompatibility:</strong>
-        {{if gt .Config.Parallel 1}}MTP requires parallel = 1 (currently {{.Config.Parallel}}). {{end}}
-        {{if and (ne .Config.MmprojPath "") (not .Config.MmprojDisabled)}}MTP does not work with an mmproj vision projector. {{end}}
-        The server may fail to start until this is resolved.
+    {{if gt .Config.Parallel 1}}
+    <small style="color:var(--pico-del-color)"><strong>⚠ MTP + parallel:</strong>
+        MTP typically requires parallel = 1 (currently {{.Config.Parallel}}). If the server fails to start, set parallel to 1.
     </small>
+    {{end}}
+    {{if .HasMTP}}
+    <small>gemma-4's separate <code>gemma4-assistant</code> head needs a llama.cpp build of <strong>b9549 or newer</strong>. Older builds report <em>"model type gemma4_assistant not supported"</em> — rebuild from the Builds tab if needed.</small>
     {{end}}
     {{end}}
     {{if and (ne .Config.SpecType "") (ne .Config.SpecType "draft") (ne .Config.SpecType "draft-mtp")}}
