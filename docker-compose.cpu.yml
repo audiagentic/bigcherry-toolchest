@@ -8,6 +8,12 @@ services:
         # quick path uses this to invalidate just the package-install
         # layer when a newer release is available.
         LLAMA_TOOLCHEST_VERSION: "${LLAMA_TOOLCHEST_VERSION:-latest}"
+    # Pin the built image name so it matches the Quadlet unit (generate_quadlet
+    # in setup.sh). Without this, compose tags the build as
+    # <project>_<service> (localhost/llama-toolchest_llama-toolchest) and the
+    # systemd service tries to pull localhost/llama-toolchest:latest from a
+    # registry, failing with exit 125.
+    image: localhost/llama-toolchest:latest
     container_name: llama-toolchest
     ports:
       - "${LLAMA_TOOLCHEST_PORT:-3000}:3000"   # llama-toolchest management UI
