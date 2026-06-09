@@ -1073,6 +1073,21 @@ func (r *Registry) load() {
 	if r.data.Configs == nil {
 		r.data.Configs = make(map[string]*ModelConfig)
 	}
+
+	// Re-derive Quant from the filename for every registered model. The field
+	// is persisted, but ScanModels skips already-known paths, so entries added
+	// before a ParseQuant improvement keep their stale value (e.g. MXFP4 frozen
+	// as "unknown", or UD-Q2_K_XL truncated to Q2_K). The Search HF tab parses
+	// live and stays correct; the Models tab reads this field, so backfill it
+	// on load to keep both tabs consistent and self-healing.
+	for _, m := range r.data.Models {
+		if m.Filename == "" {
+			continue
+		}
+		if q := ParseQuant(m.Filename); q != m.Quant {
+			m.Quant = q
+		}
+	}
 }
 
 func (r *Registry) save() {
