@@ -635,6 +635,143 @@ func (r *Registry) FindOrphans() []*Model {
 	return orphans
 }
 
+// IncompleteRegistered returns registered multi-shard models whose primary file
+// exists but whose shard set is incomplete (one or more shard files missing).
+// These are the silently-broken downloads: ScanModels registers a model off its
+// first shard, and FindOrphans only stats that first shard, so a model missing
+// later shards looks healthy until it fails to load. Single-file models, and
+// models whose primary file is entirely missing (those are orphans — see
+// FindOrphans), are not reported here.
+func (r *Registry) IncompleteRegistered() []*Model {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var incomplete []*Model
+	for _, m := range r.data.Models {
+		// Primary file missing → orphan, not incomplete.
+		if _, err := os.Stat(m.FilePath); err != nil {
+			continue
+		}
+		shards := findShards(filepath.Dir(m.FilePath), filepath.Base(m.FilePath))
+		if len(shards) < 2 {
+			continue // single-file model with its file present → complete
+		}
+		for _, shard := range shards {
+			if _, err := os.Stat(shard); os.IsNotExist(err) {
+				incomplete = append(incomplete, m)
+				break
+			}
+		}
+	}
+	return incomplete
+}
+
+// OrphanPart describes a partially-downloaded model that has on-disk `.part`
+// files but no registry entry — a download that failed before completing and so
+// never appears in the model list. Filename is a shard member (the first shard
+// for multi-part sets, or the bare filename) suitable for passing back to the
+// downloader, which resumes from the existing `.part` data.
+type OrphanPart struct {
+	ModelID     string `json:"model_id"`
+	Filename    string `json:"filename"`
+	BytesOnDisk int64  `json:"bytes_on_disk"`
+	PartCount   int    `json:"part_count"`
+}
+
+// OrphanParts scans the models directory for `.part` files that don't belong to
+// any registered model, grouping multi-shard partials into a single entry. The
+// returned entries can be resumed via the normal download path. Partials that
+// belong to a registered-but-incomplete model are excluded — those surface as a
+// per-card indicator via IncompleteRegistered instead.
+func (r *Registry) OrphanParts() []OrphanPart {
+	modelsDir := r.modelsDir
+	if _, err := os.Stat(modelsDir); err != nil {
+		return nil
+	}
+
+	// filepath.Walk won't descend a symlinked dir; resolve then remap returned
+	// paths back under modelsDir (same approach as ScanModels).
+	walkRoot := modelsDir
+	if resolved, err := filepath.EvalSymlinks(modelsDir); err == nil && resolved != modelsDir {
+		walkRoot = resolved
+	}
+
+	// All shard paths of every registered model, so a `.part` that's really a
+	// missing shard of a registered model isn't double-reported here.
+	r.mu.RLock()
+	registered := make(map[string]bool)
+	for _, m := range r.data.Models {
+		for _, sh := range findShards(filepath.Dir(m.FilePath), filepath.Base(m.FilePath)) {
+			registered[sh] = true
+		}
+	}
+	r.mu.RUnlock()
+
+	type group struct {
+		modelID  string
+		filename string   // first shard / bare filename to resume with
+		set      []string // full shard paths under modelsDir
+		parts    int
+	}
+	groups := make(map[string]*group)
+
+	filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".part") {
+			return nil
+		}
+		// Remap back under modelsDir so derived IDs match registry conventions.
+		if walkRoot != modelsDir {
+			if rel, relErr := filepath.Rel(walkRoot, path); relErr == nil {
+				path = filepath.Join(modelsDir, rel)
+			}
+		}
+		finalPath := strings.TrimSuffix(path, ".part")
+		if registered[finalPath] {
+			return nil // belongs to a registered (incomplete) model
+		}
+		rel, relErr := filepath.Rel(modelsDir, finalPath)
+		if relErr != nil {
+			return nil
+		}
+		parts := strings.SplitN(rel, string(filepath.Separator), 2)
+		if len(parts) < 2 {
+			return nil // .part directly under modelsDir — no owning model dir
+		}
+		modelID := strings.ReplaceAll(parts[0], "--", "/")
+		dir := filepath.Dir(finalPath)
+		shards := findShards(dir, filepath.Base(finalPath))
+		firstName := filepath.Base(shards[0])
+		key := dir + "::" + firstName
+		g := groups[key]
+		if g == nil {
+			g = &group{modelID: modelID, filename: firstName, set: shards}
+			groups[key] = g
+		}
+		g.parts++
+		return nil
+	})
+
+	var out []OrphanPart
+	for _, g := range groups {
+		var bytes int64
+		for _, sh := range g.set {
+			if info, err := os.Stat(sh); err == nil {
+				bytes += info.Size()
+			} else if pinfo, perr := os.Stat(sh + ".part"); perr == nil {
+				bytes += pinfo.Size()
+			}
+		}
+		out = append(out, OrphanPart{
+			ModelID:     g.modelID,
+			Filename:    g.filename,
+			BytesOnDisk: bytes,
+			PartCount:   g.parts,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ModelID < out[j].ModelID })
+	return out
+}
+
 // ScanModels walks the models directory for GGUF files not already in the
 // registry and adds them. Returns the number of new models found.
 func (r *Registry) ScanModels() int {

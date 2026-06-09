@@ -1,5 +1,5 @@
 {{define "model_card"}}
-<article class="model-card{{if .IsOrphan}} model-card-orphan{{end}}"
+<article class="model-card{{if .IsOrphan}} model-card-orphan{{end}}{{if .IsIncomplete}} model-card-incomplete{{end}}"
          id="model-card-{{cssID .ID}}"
          data-search="{{.SearchText}}">
     <div class="model-card-row">
@@ -7,9 +7,9 @@
             <span style="display: inline-flex; align-items: center; gap: 0.25rem;">
                 <input type="checkbox" role="switch" style="margin: 0;"
                        {{if .IsEnabled}}checked{{end}}
-                       {{if .IsOrphan}}disabled{{end}}
-                       title="{{if .IsOrphan}}Model file is missing — cannot be enabled{{else}}Enable this model for the inference server{{end}}"
-                       {{if not .IsOrphan}}
+                       {{if or .IsOrphan .IsIncomplete}}disabled{{end}}
+                       title="{{if .IsOrphan}}Model file is missing — cannot be enabled{{else if .IsIncomplete}}Download is incomplete — resume it before enabling{{else}}Enable this model for the inference server{{end}}"
+                       {{if not (or .IsOrphan .IsIncomplete)}}
                        hx-put="/api/models/{{.ID}}/enable"
                        hx-target="closest .model-card"
                        hx-swap="outerHTML"
@@ -27,6 +27,7 @@
             {{if .SupportsTools}} <mark style="padding:0 0.3rem;font-size:0.75rem;">tools</mark>{{end}}
             {{if .GPULabel}} <mark style="padding:0 0.3rem;font-size:0.75rem;background:var(--pico-muted-border-color);color:var(--pico-color);">{{.GPULabel}}</mark>{{end}}
             {{if .IsOrphan}} <del>missing</del>{{end}}
+            {{if .IsIncomplete}} <mark style="padding:0 0.3rem;font-size:0.75rem;background:var(--pico-del-color);color:var(--pico-card-background-color);">incomplete</mark>{{end}}
         </div>
         <div class="model-card-quant"><kbd>{{.Quant}}</kbd></div>
         <div class="model-card-vram" id="vram-{{.ID}}" title="Estimated VRAM at the configured context size — llama.cpp pre-allocates the full KV cache at load time, so this is what the model actually needs to load">{{printf "%.1f" .VRAMGB}} GB</div>
@@ -40,6 +41,24 @@
                     hx-swap="outerHTML">
                 Remove
             </button>
+            {{else if .IsIncomplete}}
+            <div role="group">
+                <button type="button" class="outline"
+                        title="Resume the download — picks up from the files already on disk"
+                        hx-post="/api/hf/download"
+                        hx-vals='{"model_id":"{{.ModelID}}","filename":"{{.ResumeFilename}}","size":"0"}'
+                        hx-target="#model-config-{{cssID .ID}}"
+                        hx-swap="innerHTML">
+                    Resume
+                </button>
+                <button type="button" class="outline secondary"
+                        hx-delete="/api/models/{{.ID}}"
+                        hx-confirm="Remove this model and delete its partial files?"
+                        hx-target="closest .model-card"
+                        hx-swap="outerHTML">
+                    Remove
+                </button>
+            </div>
             {{else}}
             <div role="group">
                 <button type="button" class="outline"

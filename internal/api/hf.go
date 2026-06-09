@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -232,6 +233,104 @@ func (s *Server) handleHFActiveDownloads(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondJSON(w, active)
+}
+
+// domID sanitizes a string for use as an HTML id / CSS selector fragment.
+func domID(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, s)
+}
+
+// handleIncompleteDownloads renders the "Incomplete downloads" panel: failed or
+// partial downloads that left `.part` files on disk but never registered as
+// models, each offering Resume (reuses the normal download path, which picks up
+// from the existing partial) and Discard. Mirrors handleHFActiveDownloads.
+func (s *Server) handleIncompleteDownloads(w http.ResponseWriter, r *http.Request) {
+	parts := s.registry.OrphanParts()
+
+	if isHTMX(r) {
+		respondHTML(w)
+		if len(parts) == 0 {
+			return // empty response — nothing to show
+		}
+		fmt.Fprint(w, `<article style="padding: 0.5rem 0.75rem; margin: 0.5rem 0;">
+			<strong style="font-size: 0.9rem;">Incomplete downloads</strong>`)
+		for _, p := range parts {
+			id := domID(p.ModelID + "--" + p.Filename)
+			onDiskGB := models.BytesToGB(p.BytesOnDisk)
+			fmt.Fprintf(w, `<div style="padding: 0.25rem 0; font-size: 0.85rem; border-top: 1px solid var(--pico-muted-border-color);">
+				<div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
+					<span><strong>%s</strong> — <small>%s</small> <small>(%.1f GB on disk, %d partial file(s))</small></span>
+					<span role="group" style="margin:0; flex:0 0 auto;">
+						<button type="button" class="outline"
+								style="margin:0; padding:0.15rem 0.6rem; font-size:0.8rem;"
+								hx-post="/api/hf/download"
+								hx-vals='{"model_id":"%s","filename":"%s","size":"0"}'
+								hx-target="#incdl-%s"
+								hx-swap="innerHTML">Resume</button>
+						<button type="button" class="outline secondary"
+								style="margin:0; padding:0.15rem 0.6rem; font-size:0.8rem;"
+								hx-delete="/api/hf/incomplete"
+								hx-vals='{"model_id":"%s","filename":"%s"}'
+								hx-confirm="Delete the partial files for %s? This cannot be undone."
+								hx-target="#incdl-%s"
+								hx-swap="innerHTML">Discard</button>
+					</span>
+				</div>
+				<div id="incdl-%s"></div>
+			</div>`,
+				p.ModelID, p.Filename, onDiskGB, p.PartCount,
+				p.ModelID, p.Filename, id,
+				p.ModelID, p.Filename, p.ModelID, id,
+				id)
+		}
+		fmt.Fprint(w, `</article>`)
+		return
+	}
+
+	respondJSON(w, parts)
+}
+
+// handleIncompleteDiscard deletes the on-disk files (completed shards and
+// `.part` fragments) for an orphan partial download identified by model_id +
+// filename. Paths are constrained to the models directory.
+func (s *Server) handleIncompleteDiscard(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	modelID := r.FormValue("model_id")
+	filename := r.FormValue("filename")
+	if modelID == "" || filename == "" {
+		http.Error(w, "model_id and filename required", http.StatusBadRequest)
+		return
+	}
+
+	root := s.cfg.ModelsPath()
+	safeName := strings.ReplaceAll(modelID, "/", "--")
+	modelDir := filepath.Join(root, safeName)
+
+	removed := 0
+	for _, fn := range huggingface.ExpandShards(filename) {
+		final := filepath.Join(modelDir, fn)
+		// Containment guard: never touch anything outside the models dir.
+		if rel, err := filepath.Rel(root, final); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		for _, path := range []string{final, final + ".part"} {
+			if err := os.Remove(path); err == nil {
+				removed++
+			}
+		}
+	}
+	slog.Info("discarded incomplete download", "model", modelID, "filename", filename, "files_removed", removed)
+
+	// Empty response so the per-row target clears; the panel re-polls and drops
+	// the row on its next refresh.
+	respondHTML(w)
 }
 
 func (s *Server) handleHFDownloadCancel(w http.ResponseWriter, r *http.Request) {
