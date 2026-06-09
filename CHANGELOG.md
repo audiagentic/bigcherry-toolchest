@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.10.2](https://github.com/tmac1973/llama-toolchest/compare/v2.10.1...v2.10.2) (2026-06-09)
+
+
+### Bug Fixes
+
+* **quant:** re-derive persisted quant on registry load ([b7a2fcd](https://github.com/tmac1973/llama-toolchest/commit/b7a2fcd7b9fe24c46aa8dc84f824ca6ee1be07b6))
+* **quant:** re-derive persisted quant on registry load ([d36d818](https://github.com/tmac1973/llama-toolchest/commit/d36d818e5e56311eff0e0c6469287b0a83b7aeb3))
+
 ## [2.10.1](https://github.com/tmac1973/llama-toolchest/compare/v2.10.0...v2.10.1) (2026-06-09)
 
 
