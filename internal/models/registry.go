@@ -1024,8 +1024,18 @@ func findShards(dir, filename string) []string {
 	return shards
 }
 
-// ParseQuant extracts quantization type from a GGUF filename.
-// Exported so it can be shared across packages.
+// quantRe matches a quantization token in a normalized (uppercased,
+// dashes->underscores) GGUF filename, with an optional "UD_" ultra-dynamic
+// prefix captured separately. The body alternatives are written so the greedy
+// optional suffix groups absorb variants generically (e.g. Q2_K_XL, Q3_K_L),
+// which the previous hand-maintained list dropped. Ordering keeps longer
+// tokens ahead of their prefixes where alternation could otherwise short-cut
+// (e.g. BF16 before F16).
+var quantRe = regexp.MustCompile(`(UD_)?(MXFP4|BF16|F16|F32|TQ[1-4]_[01]|IQ[1-4]_(?:XXS|XS|NL|S|M|L)|Q[2-8]_K(?:_(?:XL|XS|S|M|L))?|Q[2-8]_[01])`)
+
+// ParseQuant extracts the quantization type from a GGUF filename. It preserves
+// the "UD_" (Unsloth ultra-dynamic) prefix when present so UD quants are
+// labelled consistently. Exported so it can be shared across packages.
 func ParseQuant(filename string) string {
 	name := strings.TrimSuffix(filepath.Base(filename), ".gguf")
 	name = strings.TrimSuffix(name, ".GGUF")
@@ -1038,32 +1048,11 @@ func ParseQuant(filename string) string {
 	// Normalize dashes to underscores so "UD-Q8_K_XL" matches "UD_Q8_K_XL"
 	upper := strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
 
-	// Longest match first to avoid partial matches (e.g., Q8_K_XL before Q8_K)
-	quants := []string{
-		// Ultra-dynamic
-		"UD_Q8_K_XL", "UD_Q6_K_XL", "UD_Q4_K_XL",
-		// Ternary / ultra-low bit
-		"TQ1_0", "TQ2_0",
-		// Importance-weighted quants
-		"IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M",
-		"IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M", "IQ4_XS", "IQ4_NL",
-		// K-quants (longest suffixes first)
-		"Q2_K_S", "Q2_K",
-		"Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K_XL", "Q3_K",
-		"Q4_K_S", "Q4_K_M", "Q4_K_L", "Q4_K_XL", "Q4_K", "Q4_0", "Q4_1",
-		"Q5_K_S", "Q5_K_M", "Q5_K_L", "Q5_K_XL", "Q5_K", "Q5_0", "Q5_1",
-		"Q6_K_L", "Q6_K_XL", "Q6_K",
-		"Q8_K_XL", "Q8_K_L", "Q8_K", "Q8_0", "Q8_1",
-		// Full precision
-		"F16", "F32", "BF16",
+	m := quantRe.FindStringSubmatch(upper)
+	if m == nil {
+		return "unknown"
 	}
-
-	for _, q := range quants {
-		if strings.Contains(upper, q) {
-			return q
-		}
-	}
-	return "unknown"
+	return m[1] + m[2] // m[1] is "UD_" or "", m[2] is the quant body
 }
 
 func (r *Registry) registryPath() string {
