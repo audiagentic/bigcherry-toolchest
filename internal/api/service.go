@@ -492,9 +492,16 @@ func (s *Server) handleModelEnable(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+		isIncomplete := false
+		for _, im := range s.registry.IncompleteRegistered() {
+			if im.ID == id {
+				isIncomplete = true
+				break
+			}
+		}
 		w.Header().Set("HX-Trigger-After-Swap", `{"gpuMapChanged":true}`)
 		respondHTML(w)
-		s.renderModelCard(w, m, s.routerKnownStates(), isOrphan)
+		s.renderModelCard(w, m, s.routerKnownStates(), isOrphan, isIncomplete)
 		return
 	}
 

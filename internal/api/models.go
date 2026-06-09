@@ -327,7 +327,7 @@ func (s *Server) routerKnownStates() map[string]string {
 }
 
 // renderModelCard writes one model_card partial.
-func (s *Server) renderModelCard(w http.ResponseWriter, m *models.Model, routerKnown map[string]string, isOrphan bool) {
+func (s *Server) renderModelCard(w http.ResponseWriter, m *models.Model, routerKnown map[string]string, isOrphan, isIncomplete bool) {
 	// Look up router state under any of the names the router might know this
 	// model by. The router's primary ID is the auto-discovery section name
 	// (RouterName), but it may also surface m.ID or PublicName via aliases.
@@ -381,6 +381,8 @@ func (s *Server) renderModelCard(w http.ResponseWriter, m *models.Model, routerK
 		ServiceState   string
 		VRAMGB         float64
 		IsOrphan       bool
+		IsIncomplete   bool
+		ResumeFilename string
 		SearchText     string
 	}{
 		Model:          *m,
@@ -394,6 +396,8 @@ func (s *Server) renderModelCard(w http.ResponseWriter, m *models.Model, routerK
 		ServiceState:   state,
 		VRAMGB:         vramGB,
 		IsOrphan:       isOrphan,
+		IsIncomplete:   isIncomplete,
+		ResumeFilename: m.Filename,
 		SearchText:     searchText,
 	}
 	s.renderPartial(w, "model_card", data)
@@ -408,6 +412,11 @@ func (s *Server) renderModelList(w http.ResponseWriter, r *http.Request, modelLi
 	orphanSet := make(map[string]bool)
 	for _, m := range s.registry.FindOrphans() {
 		orphanSet[m.ID] = true
+	}
+
+	incompleteSet := make(map[string]bool)
+	for _, m := range s.registry.IncompleteRegistered() {
+		incompleteSet[m.ID] = true
 	}
 
 	sorted := make([]*models.Model, len(modelList))
@@ -429,7 +438,7 @@ func (s *Server) renderModelList(w http.ResponseWriter, r *http.Request, modelLi
 	w.Write([]byte(`<div class="model-card-list">`))
 	w.Write([]byte(`<div class="model-card-header"><span></span><span>Model</span><span>Quant</span><span title="Estimated VRAM at the configured context size">VRAM Est.</span><span>Size</span><span></span></div>`))
 	for _, m := range sorted {
-		s.renderModelCard(w, m, routerKnown, orphanSet[m.ID])
+		s.renderModelCard(w, m, routerKnown, orphanSet[m.ID], incompleteSet[m.ID])
 	}
 	w.Write([]byte(`</div>`))
 }
