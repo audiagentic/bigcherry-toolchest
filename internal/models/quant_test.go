@@ -1,6 +1,10 @@
 package models
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseQuant(t *testing.T) {
 	cases := []struct {
@@ -44,6 +48,43 @@ func TestParseQuant(t *testing.T) {
 	for _, c := range cases {
 		if got := ParseQuant(c.filename); got != c.want {
 			t.Errorf("ParseQuant(%q) = %q, want %q", c.filename, got, c.want)
+		}
+	}
+}
+
+// TestLoadBackfillsStaleQuant verifies that load() re-derives the persisted
+// Quant field from the filename. Models registered before a ParseQuant
+// improvement keep their stale value (ScanModels skips known paths), so load
+// must backfill it for the Models tab to match the live-parsed Search HF tab.
+func TestLoadBackfillsStaleQuant(t *testing.T) {
+	dir := t.TempDir()
+	cfgDir := filepath.Join(dir, "config")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Persist a registry whose MXFP4 model was frozen as "unknown" by the old
+	// hand-maintained list, and a UD model truncated to its base quant.
+	const stale = `{
+  "models": {
+    "a": {"id": "a", "filename": "gpt-oss-20b-MXFP4.gguf", "quant": "unknown"},
+    "b": {"id": "b", "filename": "model-UD-Q2_K_XL.gguf", "quant": "Q2_K"},
+    "c": {"id": "c", "filename": "model-Q8_0.gguf", "quant": "Q8_0"}
+  }
+}`
+	if err := os.WriteFile(filepath.Join(cfgDir, "models.json"), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewRegistry(dir, filepath.Join(dir, "models"))
+
+	want := map[string]string{"a": "MXFP4", "b": "UD_Q2_K_XL", "c": "Q8_0"}
+	for id, q := range want {
+		m, err := r.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", id, err)
+		}
+		if m.Quant != q {
+			t.Errorf("model %q Quant = %q, want %q", id, m.Quant, q)
 		}
 	}
 }
