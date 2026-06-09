@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.10.1](https://github.com/tmac1973/llama-toolchest/compare/v2.10.0...v2.10.1) (2026-06-09)
+
+
+### Bug Fixes
+
+* **compose:** pin image name so Quadlet unit can find the built image ([cc4b05f](https://github.com/tmac1973/llama-toolchest/commit/cc4b05f67a3c1a86a81b270c70012ec189dd67d3))
+* **compose:** pin image name so Quadlet unit can find the built image ([d1cf27d](https://github.com/tmac1973/llama-toolchest/commit/d1cf27d4430a3f7f91a245f1dc1ea02b8b5969b1))
+* **quant:** parse UD prefix and suffixes consistently, recognize MXFP4 ([feca9fc](https://github.com/tmac1973/llama-toolchest/commit/feca9fca0b2a7c3bab22d604a456492c93000896))
+* **quant:** parse UD prefix and suffixes consistently, recognize MXFP4 ([3df08ab](https://github.com/tmac1973/llama-toolchest/commit/3df08ab9c14e0a5838c4c820e979217df915a12d))
+
 ## [2.10.0](https://github.com/tmac1973/llama-toolchest/compare/v2.9.0...v2.10.0) (2026-06-08)
 
 
