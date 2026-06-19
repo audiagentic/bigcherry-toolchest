@@ -42,6 +42,25 @@ sudoedit /etc/llama-toolchest/llama-toolchest.yaml          # set data_dir to /v
 sudo systemctl enable --now llama-toolchest
 ```
 
+## Where the config is read from
+
+On startup the binary loads the first config file it finds, in this order:
+
+1. `$LLAMA_TOOLCHEST_CONFIG` — explicit override (set it in a systemd drop-in to force a specific path)
+2. `$XDG_CONFIG_HOME/llama-toolchest/llama-toolchest.yaml` (if `XDG_CONFIG_HOME` is set)
+3. `~/.config/llama-toolchest/llama-toolchest.yaml` — user-scope
+4. `/etc/llama-toolchest/llama-toolchest.yaml` — system-scope
+
+A user config takes precedence over the system one when both exist. If none
+exist, built-in defaults are used. So the system-scope flow above works with
+the packaged unit as-is — no `--config` flag or env var needed. To pin a
+non-standard location anyway:
+
+```bash
+sudo systemctl edit llama-toolchest    # add under [Service]:
+# Environment=LLAMA_TOOLCHEST_CONFIG=/path/to/llama-toolchest.yaml
+```
+
 ## GPU SDKs
 
 The package doesn't pull GPU SDKs — install them yourself for the backend you want to compile against:
