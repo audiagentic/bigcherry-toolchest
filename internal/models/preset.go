@@ -246,17 +246,100 @@ func writeConfigParams(b *strings.Builder, cfg *ModelConfig, isEmbedding bool) {
 		b.WriteString(fmt.Sprintf("repeat-penalty = %g\n", *cfg.RepeatPenalty))
 	}
 
-	// Extra flags
-	if cfg.ExtraFlags != "" {
-		for _, flag := range strings.Fields(cfg.ExtraFlags) {
-			flag = strings.TrimLeft(flag, "-")
-			if parts := strings.SplitN(flag, "=", 2); len(parts) == 2 {
-				b.WriteString(fmt.Sprintf("%s = %s\n", parts[0], parts[1]))
+	// Extra flags. Parse shell-style so "--flag value" (space-separated) and
+	// quoted values containing spaces survive intact. The old strings.Fields
+	// split shredded "--reasoning-budget 4096 --msg \"a b c\"" into a pile of
+	// bogus "4096 = true" / "b = true" keys (issue #67).
+	for _, kv := range parseExtraFlags(cfg.ExtraFlags) {
+		b.WriteString(fmt.Sprintf("%s = %s\n", kv.key, kv.value))
+	}
+}
+
+type extraFlag struct {
+	key   string
+	value string
+}
+
+// parseExtraFlags tokenizes a raw extra-flags string the way a shell would —
+// honoring single and double quotes so values containing spaces stay together —
+// then pairs each "--flag" with its value. Both "--flag value" and
+// "--flag=value" are accepted, and a flag with no following value becomes
+// "true" (a boolean switch). Values are written verbatim into the INI; the
+// llama.cpp preset parser reads the rest of the line, so spaces are fine.
+func parseExtraFlags(raw string) []extraFlag {
+	tokens := tokenizeFlags(raw)
+	var out []extraFlag
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if !strings.HasPrefix(tok, "-") {
+			// A value with no preceding flag — nothing sensible to do, skip.
+			continue
+		}
+		key := strings.TrimLeft(tok, "-")
+		if key == "" {
+			continue
+		}
+		if eq := strings.IndexByte(key, '='); eq >= 0 {
+			out = append(out, extraFlag{key[:eq], key[eq+1:]})
+			continue
+		}
+		// A following non-flag token is this flag's value. Negative numbers
+		// (e.g. "-1") count as values, not flags.
+		if i+1 < len(tokens) && !looksLikeFlag(tokens[i+1]) {
+			out = append(out, extraFlag{key, tokens[i+1]})
+			i++
+			continue
+		}
+		out = append(out, extraFlag{key, "true"})
+	}
+	return out
+}
+
+// looksLikeFlag reports whether a token introduces a new flag rather than
+// being a value. A leading dash followed by a digit or dot (e.g. "-1",
+// "-.5") is treated as a negative-number value.
+func looksLikeFlag(tok string) bool {
+	if len(tok) < 2 || tok[0] != '-' {
+		return false
+	}
+	c := tok[1]
+	return !(c >= '0' && c <= '9') && c != '.'
+}
+
+// tokenizeFlags splits a command-line string into tokens, honoring single and
+// double quotes (which are removed, their contents kept as part of the token).
+// Whitespace outside quotes separates tokens.
+func tokenizeFlags(raw string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inToken := false
+	var quote rune // 0 when not inside quotes
+	for _, r := range raw {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
 			} else {
-				b.WriteString(fmt.Sprintf("%s = true\n", flag))
+				cur.WriteRune(r)
 			}
+		case r == '\'' || r == '"':
+			quote = r
+			inToken = true
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			if inToken {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			inToken = true
 		}
 	}
+	if inToken {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
 }
 
 // RouterName returns the model name that the llama.cpp router uses for

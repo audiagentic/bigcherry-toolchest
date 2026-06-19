@@ -65,6 +65,117 @@ func TestGeneratePresetINIAliasesIncludeDirnameOnlyWhenUnique(t *testing.T) {
 	}
 }
 
+// TestParseExtraFlags pins down the extra-flags parsing fixed for issue #67.
+// strings.Fields used to split on every space, turning "--reasoning-budget
+// 4096" into the bogus keys "4096 = true" and shredding quoted messages.
+func TestParseExtraFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []extraFlag
+	}{
+		{
+			name: "space-separated flag and value",
+			raw:  "--reasoning-budget 4096",
+			want: []extraFlag{{"reasoning-budget", "4096"}},
+		},
+		{
+			name: "equals form",
+			raw:  "--reasoning-budget=4096",
+			want: []extraFlag{{"reasoning-budget", "4096"}},
+		},
+		{
+			name: "double-quoted value with spaces",
+			raw:  `--reasoning-budget-message "... thinking budget exceeded, let's answer now."`,
+			want: []extraFlag{{"reasoning-budget-message", "... thinking budget exceeded, let's answer now."}},
+		},
+		{
+			name: "single-quoted value with spaces",
+			raw:  `--reasoning-budget-message 'thinking budget exceeded'`,
+			want: []extraFlag{{"reasoning-budget-message", "thinking budget exceeded"}},
+		},
+		{
+			name: "equals with quoted value",
+			raw:  `--reasoning-budget-message="a b c"`,
+			want: []extraFlag{{"reasoning-budget-message", "a b c"}},
+		},
+		{
+			name: "boolean switch",
+			raw:  "--jinja",
+			want: []extraFlag{{"jinja", "true"}},
+		},
+		{
+			name: "negative number value",
+			raw:  "--some-flag -1",
+			want: []extraFlag{{"some-flag", "-1"}},
+		},
+		{
+			name: "the full issue #67 case",
+			raw:  `--reasoning-budget 4096 --reasoning-budget-message "... thinking budget exceeded, let's answer now."`,
+			want: []extraFlag{
+				{"reasoning-budget", "4096"},
+				{"reasoning-budget-message", "... thinking budget exceeded, let's answer now."},
+			},
+		},
+		{
+			name: "empty",
+			raw:  "",
+			want: nil,
+		},
+		{
+			name: "multiple booleans then valued flag",
+			raw:  "--flash-attn --jinja --ctx-size 4096",
+			want: []extraFlag{
+				{"flash-attn", "true"},
+				{"jinja", "true"},
+				{"ctx-size", "4096"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseExtraFlags(tt.raw)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseExtraFlags(%q) = %+v; want %+v", tt.raw, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("parseExtraFlags(%q)[%d] = %+v; want %+v", tt.raw, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestGeneratePresetINIExtraFlagsWithSpaces is the end-to-end guard for
+// issue #67: a quoted extra-flag value with spaces must land as a single
+// INI line, not a cascade of "word = true" entries.
+func TestGeneratePresetINIExtraFlagsWithSpaces(t *testing.T) {
+	mods := []*Model{
+		{ID: "u--R-GGUF--R-Q8_0", ModelID: "u/R-GGUF", Quant: "Q8_0", FilePath: "/data/models/u--R-GGUF/R-Q8_0.gguf"},
+	}
+	cfgs := map[string]*ModelConfig{
+		"u--R-GGUF--R-Q8_0": {
+			Enabled:    true,
+			ExtraFlags: `--reasoning-budget 4096 --reasoning-budget-message "... thinking budget exceeded, let's answer now."`,
+		},
+	}
+	out := GeneratePresetINI("/data/models", mods, cfgs)
+
+	if !strings.Contains(out, "reasoning-budget = 4096\n") {
+		t.Errorf("expected 'reasoning-budget = 4096'; got:\n%s", out)
+	}
+	if !strings.Contains(out, "reasoning-budget-message = ... thinking budget exceeded, let's answer now.\n") {
+		t.Errorf("expected the message on one line; got:\n%s", out)
+	}
+	// None of the shredded keys from the old strings.Fields behavior.
+	for _, bogus := range []string{"4096 = true", "budget = true", "now.\" = true", "let's = true"} {
+		if strings.Contains(out, bogus) {
+			t.Errorf("found shredded key %q in output:\n%s", bogus, out)
+		}
+	}
+}
+
 // sectionBody returns the lines of the given INI section, up to (but not
 // including) the next section header.
 func sectionBody(ini, section string) string {
