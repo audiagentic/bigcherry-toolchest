@@ -124,7 +124,7 @@ func (m *Manager) Start(cfg RouterConfig) error {
 	// The variable name differs per OS; on Windows we prepend to PATH instead
 	// of setting a separate var, since that's how Windows resolves DLLs.
 	binDir := filepath.Dir(cfg.BinaryPath)
-	cmd.Env = appendLibraryPath(os.Environ(), binDir)
+	cmd.Env = pinCUDADeviceOrder(appendLibraryPath(os.Environ(), binDir))
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -451,6 +451,22 @@ func (m *Manager) CheckHealth() bool {
 // set so the child process can find shared libraries co-located with the
 // binary. On Linux this is LD_LIBRARY_PATH, on macOS DYLD_LIBRARY_PATH, on
 // Windows we prepend to PATH (since that's how the loader finds DLLs).
+// pinCUDADeviceOrder forces llama-server's CUDA backend to enumerate GPUs in
+// PCI bus order, matching nvidia-smi (whose indices drive the web UI's "GPU N"
+// labels and the --main-gpu / --tensor-split values we generate). Without this
+// the CUDA runtime defaults to CUDA_DEVICE_ORDER=FASTEST_FIRST — a perf-based
+// ordering that diverges from nvidia-smi on heterogeneous multi-GPU boxes, so
+// "GPU 0" in the UI could map to a different physical card in llama-server
+// (issue #68). A user-provided CUDA_DEVICE_ORDER is left untouched.
+func pinCUDADeviceOrder(env []string) []string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "CUDA_DEVICE_ORDER=") {
+			return env
+		}
+	}
+	return append(env, "CUDA_DEVICE_ORDER=PCI_BUS_ID")
+}
+
 func appendLibraryPath(env []string, dir string) []string {
 	switch runtime.GOOS {
 	case "darwin":
