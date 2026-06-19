@@ -181,21 +181,70 @@ func readVRAMSysfs(gpuIdx int) (usedMB, totalMB int) {
 }
 
 func readGPUNameSysfs(gpuIdx int) string {
-	// Try to get marketing name from rocminfo cache or use a generic name
 	if out, err := exec.Command("rocminfo").Output(); err == nil {
-		var currentAgent int
-		for _, line := range strings.Split(string(out), "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "Marketing Name:") {
-				name := strings.TrimSpace(strings.TrimPrefix(line, "Marketing Name:"))
-				if name != "" && !strings.HasPrefix(name, "AMD Ryzen") && !strings.HasPrefix(name, "AMD EPYC") {
-					if currentAgent == gpuIdx {
-						return name
-					}
-					currentAgent++
-				}
-			}
+		names := parseROCmGPUNames(string(out))
+		if gpuIdx >= 0 && gpuIdx < len(names) {
+			return names[gpuIdx]
 		}
 	}
 	return fmt.Sprintf("AMD GPU %d", gpuIdx)
+}
+
+// parseROCmGPUNames extracts the marketing names of GPU agents from rocminfo
+// output, in agent order. rocminfo lists every HSA agent — including the host
+// CPU — under "Agent N" blocks, each carrying a "Device Type:" (CPU or GPU)
+// and a "Marketing Name:". Only GPU agents are returned.
+//
+// The previous approach blacklisted marketing names starting with "AMD Ryzen"
+// or "AMD EPYC" to skip the CPU agent. That let any other CPU leak through and
+// get labelled as GPU 0 — e.g. an Intel Xeon host showed up as "GPU 0 Intel(R)
+// Xeon(R) W-2225 CPU" (issue #68). Keying off "Device Type: GPU" is robust to
+// the CPU vendor.
+//
+// When a GPU agent reports no marketing name, its "Name:" (e.g. "gfx1100") is
+// used as a fallback so the entry is never blank.
+func parseROCmGPUNames(out string) []string {
+	type agent struct {
+		name      string
+		marketing string
+		isGPU     bool
+	}
+	var agents []agent
+	cur := -1
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Agent "):
+			agents = append(agents, agent{})
+			cur = len(agents) - 1
+		case cur < 0:
+			// Header lines before the first agent block.
+			continue
+		case strings.HasPrefix(line, "Marketing Name:"):
+			agents[cur].marketing = strings.TrimSpace(strings.TrimPrefix(line, "Marketing Name:"))
+		case strings.HasPrefix(line, "Name:"):
+			// Record only the first "Name:" of a block (the agent name);
+			// later Name fields belong to nested pool/cache entries.
+			if agents[cur].name == "" {
+				agents[cur].name = strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
+			}
+		case strings.HasPrefix(line, "Device Type:"):
+			if strings.Contains(line, "GPU") {
+				agents[cur].isGPU = true
+			}
+		}
+	}
+
+	var names []string
+	for _, a := range agents {
+		if !a.isGPU {
+			continue
+		}
+		if a.marketing != "" {
+			names = append(names, a.marketing)
+		} else {
+			names = append(names, a.name)
+		}
+	}
+	return names
 }
