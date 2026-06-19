@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.11.0](https://github.com/tmac1973/llama-toolchest/compare/v2.10.2...v2.11.0) (2026-06-19)
+
+
+### Features
+
+* **models:** surface incomplete downloads with in-place resume ([701221c](https://github.com/tmac1973/llama-toolchest/commit/701221c87f946aa78490807ca6b5792bac623314))
+
+
+### Bug Fixes
+
+* **config:** discover system config at /etc/llama-toolchest ([d332764](https://github.com/tmac1973/llama-toolchest/commit/d3327640252dd9250f36d8fa921e3d5755a23c51))
+* correct GPU detection — name by Device Type + pin CUDA order ([#68](https://github.com/tmac1973/llama-toolchest/issues/68)) ([7c6081e](https://github.com/tmac1973/llama-toolchest/commit/7c6081ee9c345908db358eb909c2b302903baad8))
+* discover system config at /etc/llama-toolchest ([#61](https://github.com/tmac1973/llama-toolchest/issues/61)) ([62e4868](https://github.com/tmac1973/llama-toolchest/commit/62e48688c190d50af51e825ad9bdb6435ed4a144))
+* **monitor:** label ROCm GPUs by Device Type, not CPU-name blacklist ([aeaf79c](https://github.com/tmac1973/llama-toolchest/commit/aeaf79c331fadd113909771e2968895fc1be19cd))
+* parse extra flags shell-style to preserve spaces ([#67](https://github.com/tmac1973/llama-toolchest/issues/67)) ([529a379](https://github.com/tmac1973/llama-toolchest/commit/529a3791928534cb22fb3c4d487c84fd8979253d))
+* **preset:** parse extra flags shell-style to preserve spaces ([c4be663](https://github.com/tmac1973/llama-toolchest/commit/c4be6637f1c3b120361270d0c0a5a1d92e5977f0))
+* **process:** pin CUDA_DEVICE_ORDER=PCI_BUS_ID for llama-server ([6d0fbd0](https://github.com/tmac1973/llama-toolchest/commit/6d0fbd0f9cc422998b1cab8e1b50bc997d9f7d15))
+
 ## [2.10.2](https://github.com/tmac1973/llama-toolchest/compare/v2.10.1...v2.10.2) (2026-06-09)
 
 
