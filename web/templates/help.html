@@ -82,7 +82,7 @@
 
     <h2 id="quickstart">Quickstart</h2>
     <ol>
-        <li><strong>Build llama.cpp.</strong> Go to <a href="/builds">Builds</a>, pick a profile that matches your hardware (CUDA, ROCm, CPU), and start a build. Builds are cached and reused.</li>
+        <li><strong>Build llama.cpp.</strong> Go to <a href="/builds">Builds</a>, pick a profile that matches your hardware (CUDA, ROCm, Vulkan, CPU), and start a build. Builds are cached and reused.</li>
         <li><strong>Download a model.</strong> On <a href="/models/browse">Search HF</a>, search for a GGUF repo (e.g. <code>unsloth/Qwen3.5-4B-GGUF</code>) and download a quant (<code>Q4_K_M</code> is a good balance for most).</li>
         <li><strong>Enable it.</strong> On <a href="/models">Models</a>, flip the "On" switch for the model(s) you want the server to serve.</li>
         <li><strong>Tune for VRAM.</strong> Click <em>Configure</em> on a model to adjust what matters most: <em>Context Size</em> (smaller = less KV cache = less VRAM) and <em>KV Cache Quant</em> (<code>q8_0</code> roughly halves KV memory with little quality cost). Watch the <em>VRAM Est.</em> column update so you can see the model fit.</li>
@@ -143,10 +143,13 @@
     <p>llama.cpp must be compiled against your hardware. The Builds tab checks out a ref from <code>ggml-org/llama.cpp</code>, configures cmake for a backend profile, builds, and keeps the resulting <code>llama-server</code> binary. Multiple builds can coexist — you pick the active one on the Server tab.</p>
 
     <h3>Profiles</h3>
+    <p>The <em>Profile</em> dropdown only lists backends detected on this system — the SDK or driver for a backend must be present for it to appear (no CUDA toolkit → no CUDA option, and so on).</p>
     <dl>
-        <dt>CPU</dt><dd>Portable build with no GPU acceleration.</dd>
-        <dt>CUDA</dt><dd>NVIDIA GPUs. Requires the CUDA toolkit in the container.</dd>
-        <dt>ROCm</dt><dd>AMD GPUs. Requires ROCm. Pick an arch that matches your card (e.g. <code>gfx1201</code> for Radeon R9700).</dd>
+        <dt>CUDA</dt><dd>NVIDIA GPUs. Requires the CUDA toolkit.</dd>
+        <dt>ROCm</dt><dd>AMD GPUs. Requires ROCm. The GPU arch is auto-detected from <code>rocminfo</code> when possible (e.g. <code>gfx1201</code> for Radeon R9700); you can override it.</dd>
+        <dt>Vulkan</dt><dd>Vendor-neutral GPU acceleration (AMD, NVIDIA, Intel) through the Vulkan driver — handy when you don't have a vendor SDK installed. <strong>Host-mode only:</strong> Vulkan isn't offered when running inside a container, since that requires host driver/ICD passthrough the container doesn't manage.</dd>
+        <dt>Metal</dt><dd>Apple GPUs. Only appears when running on macOS.</dd>
+        <dt>CPU</dt><dd>Portable build with no GPU acceleration. Always available.</dd>
     </dl>
 
     <h3>Ref selection</h3>
@@ -166,6 +169,9 @@
 
     <h3>VRAM Est. column</h3>
     <p>Shows <em>base</em> (weights + small overhead) and <em>peak</em> (weights + full KV cache at configured context size). The GPU allocation map uses the peak number so the bars reflect actual VRAM use when a model is loaded.</p>
+
+    <h3>Incomplete &amp; missing files</h3>
+    <p>If a download was interrupted, the model carries an <code>incomplete</code> badge and a <strong>Resume</strong> button that picks up from the bytes already on disk; it can't be enabled until the download finishes. A pending-download tracker also sits at the top of the Models page. If a model's GGUF has gone missing from disk entirely, it's flagged as an orphan and likewise can't be enabled — remove it or re-download.</p>
 
     <h2 id="model-config">Model config (Configure dialog)</h2>
 
@@ -194,7 +200,7 @@
     <p>Predict multiple tokens per step for a speedup with no quality change. <em>Draft Model</em> uses a smaller same-architecture model as the drafter (largest and most consistent speedup). N-gram modes use pattern matching with no extra model — best for repetitive workloads. Click the <strong>?</strong> button in the Configure dialog for per-mode details.</p>
 
     <h3>Sampling</h3>
-    <p>Temperature, top-p, top-k, min-p, penalties — applied per-request with no restart needed. Leave blank to use server defaults.</p>
+    <p>Temperature, top-p, top-k, min-p, penalties — applied per-request with no restart needed. Leave blank to use server defaults. When the model's HuggingFace page publishes recommended sampling settings, a <em>Preset</em> dropdown offers them — pick one to fill in the fields, then tweak as you like.</p>
 
     <h3>Extra Flags</h3>
     <p>Free-form llama-server flags appended verbatim. Use for anything not exposed in the UI.</p>
@@ -251,12 +257,14 @@
 
     <h2 id="settings">Settings</h2>
     <dl>
-        <dt>Auto-start</dt><dd>Start the llama-server automatically when the container boots.</dd>
+        <dt>Auto-start</dt><dd>Start the llama-server automatically on startup (container boot or service start), using the selected build and model configs.</dd>
         <dt>Server URL</dt><dd>The externally-reachable base URL of this web UI — used for the clickable API endpoint and Chat UI links. Change this if you access the UI from another host.</dd>
         <dt>OpenAI-Compatible Proxy</dt><dd>The <code>/v1</code> endpoint exposed to clients. <em>Test Connection</em> verifies the llama-server is reachable.</dd>
         <dt>API Key</dt><dd>Optional Bearer token required for <code>/v1/*</code> requests. Leave blank for an open proxy.</dd>
         <dt>HF Token</dt><dd>Required to download gated models.</dd>
-        <dt>Theme</dt><dd>UI color scheme. Saved per-browser in localStorage.</dd>
+        <dt>Theme</dt><dd>UI color scheme (Dark, Light, Terminal Green, Terminal Amber, Cyberpunk). Saved per-browser in localStorage.</dd>
+        <dt>Data directory</dt><dd>Where builds, registry state, and (by default) models live. Shown for reference — it's set at install time in the config YAML, not editable here.</dd>
+        <dt>Models directory</dt><dd>Optional override for where GGUF files live and where new downloads land. Blank uses <code>&lt;data dir&gt;/models</code>. Must be an absolute path to an existing directory; restart the service after changing it.</dd>
     </dl>
 
     <h2 id="api">Using the API</h2>
