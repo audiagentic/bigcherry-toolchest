@@ -20,6 +20,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
+# ProtectSystem=full makes /etc read-only; carve out the config dir so the
+# Settings page can save back to /etc/llama-toolchest/llama-toolchest.yaml.
+# The leading "-" tolerates the dir being absent.
+ReadWritePaths=-/etc/llama-toolchest
 
 [Install]
 WantedBy=multi-user.target
