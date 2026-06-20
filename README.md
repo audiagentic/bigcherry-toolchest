@@ -17,7 +17,7 @@ A web-based management interface for [llama.cpp](https://github.com/ggerganov/ll
 - **Vision / multimodal** — Auto-detect and pair `mmproj` files. Send images via the OpenAI chat API (requires OpenSSL build).
 - **Embedding models** — Curated one-click downloads (nomic-embed, bge, mxbai-embed, snowflake-arctic-embed) with automatic `--embeddings` injection.
 - **Speculative decoding** — Pair a small draft model with a large model; draft picker auto-filters by architecture.
-- **Capability detection** — Tool calling and vision detection from GGUF metadata, surfaced as badges and via `/api/models/{id}/info`.
+- **Capability detection** — Tool calling, vision, and reasoning-mode detection from GGUF metadata, surfaced as badges and via the `capabilities` block on `/api/service/loaded-models` (single-round-trip auto-discovery).
 - **VRAM estimation** — Architecture-aware estimates from GGUF metadata, accounting for KV cache size and quantization.
 - **Benchmarks** — Run llama-bench presets per model, compare runs, and export results.
 - **OpenAI-compatible API** — Chat completions (streaming, tool calling, JSON schema), completions, embeddings, model listing. Optional Bearer auth.
@@ -285,8 +285,68 @@ A few useful ones:
 - `GET /api/ps` — loaded models with status (Ollama-style)
 - `GET /api/models/{id}/info` — enriched metadata with capabilities (tools, vision)
 - `GET /api/models/{id}/vram-estimate` — VRAM estimate for a given config
-- `GET /api/service/loaded-models` — models available to the router
+- `GET /api/service/loaded-models` — models available to the router, each with a `capabilities` block (see below)
 - `GET /api/monitor/stream` — GPU/CPU/memory metrics over SSE
+
+#### Capability discovery (`capabilities`)
+
+`GET /api/service/loaded-models` returns a top-level `schema_version` and folds a
+`capabilities` object into every model entry, so a client can auto-configure
+itself from a single round-trip — no per-model `/info` fan-out and no model-name
+heuristics. The object is a stable contract: keys use explicit `null`/`false`
+rather than being omitted, so "known absent" is distinguishable from "server too
+old to report". `schema_version` is bumped only on breaking changes.
+
+```jsonc
+{
+  "schema_version": 1,
+  "running": true,
+  "models": [
+    {
+      "id": "Qwen3-32B",
+      "status": "loaded",
+      "public_name": "unsloth-Qwen3-32B.Q8_K_XL",
+      "registry_id": "unsloth--Qwen3-32B-GGUF--...",
+      "capabilities": {
+        "schema_version": 1,
+
+        // context — compact requests on context_per_request, never context_length
+        "context_size": 32768,          // served runtime n_ctx (0 → trained max)
+        "context_length": 131072,       // model's trained max (informational)
+        "parallel": 4,                  // slot count (1 = no extra slots)
+        "context_per_request": 8192,    // context_size / max(parallel, 1)
+
+        // modalities / tools
+        "vision": false,
+        "tools": true,
+        "embedding": false,
+
+        // reasoning / thinking — detected from the chat template
+        "reasoning": {
+          "supported": true,
+          "default_enabled": true,
+          "toggle": "chat_template_kwargs", // or "reasoning_effort" | "none"
+          "kwarg": "enable_thinking"        // key when toggle == chat_template_kwargs, else ""
+        },
+
+        // recommended sampling — per-model override wins, else the model card
+        "sampling": {
+          "source": "generation_config.json",
+          "source_url": null,
+          "default": { "temperature": 0.6, "top_p": 0.95, "top_k": 20,
+                       "min_p": null, "presence_penalty": null, "repeat_penalty": null },
+          "presets": [ /* SamplingPreset list, verbatim */ ]
+        },
+
+        "max_output_tokens": null         // null = no server-imposed cap
+      }
+    }
+  ]
+}
+```
+
+The same `parallel` and `context_per_request` values are also added to the
+`config` map in `GET /api/models/{id}/info` (the detailed per-model view).
 
 ## License
 

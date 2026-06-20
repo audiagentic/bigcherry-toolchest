@@ -19,6 +19,13 @@ type GGUFMeta struct {
 	SupportsTools bool   `json:"supports_tools"` // chat template references tools
 	HasVision     bool   `json:"has_vision"`     // model has a built-in vision encoder
 
+	// Reasoning / thinking mode detected from the chat template (see
+	// detectReasoning). Reasoning is the assembled capability; ReasoningChecked
+	// records that detection ran, so a false Supported on an old registry record
+	// can be told apart from "never inspected" during backfill.
+	Reasoning        ReasoningCapability `json:"reasoning"`
+	ReasoningChecked bool                `json:"reasoning_checked"`
+
 	// KV-cache scaling factors, precomputed per-layer to capture grouped-query
 	// attention (which can vary per layer) and sliding-window attention. The KV
 	// cache at context C is: (C·KVFullPerTok + min(C,SlidingWindow)·KVSWAPerTok)
@@ -39,6 +46,8 @@ func (meta *GGUFMeta) ApplyTo(m *Model) {
 	m.ContextLength = meta.ContextLength
 	m.SupportsTools = meta.SupportsTools
 	m.HasBuiltinVision = meta.HasVision
+	m.Reasoning = meta.Reasoning
+	m.ReasoningChecked = meta.ReasoningChecked
 	m.KVFullPerTok = meta.KVFullPerTok
 	m.KVSWAPerTok = meta.KVSWAPerTok
 	m.SlidingWindow = meta.SlidingWindow
@@ -130,6 +139,8 @@ func ParseGGUFMeta(path string) (*GGUFMeta, error) {
 		case key == "tokenizer.chat_template" && valueType == ggufTypeString:
 			if v, err := readGGUFString(f); err == nil {
 				meta.SupportsTools = strings.Contains(v, "tools")
+				meta.Reasoning = detectReasoning(v)
+				meta.ReasoningChecked = true
 			}
 			continue
 
@@ -212,6 +223,16 @@ func ParseGGUFMeta(path string) (*GGUFMeta, error) {
 	}
 
 	computeKVScaling(meta, headCountKV, kvHeadCounts, keyLen, valLen, keyLenSWA, valLenSWA, slidingWindow, swaPattern)
+
+	// A successful parse means reasoning was evaluated even if no chat template
+	// was present — in which case Reasoning stays the unsupported zero value.
+	// Normalize the empty toggle to the explicit "none" so the API contract
+	// never emits a blank mechanism.
+	meta.ReasoningChecked = true
+	if meta.Reasoning.Toggle == "" {
+		meta.Reasoning.Toggle = ReasoningToggleNone
+	}
+
 	return meta, nil
 }
 
