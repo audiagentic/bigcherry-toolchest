@@ -238,17 +238,19 @@ func (s *Server) handleLoadedModels(w http.ResponseWriter, r *http.Request) {
 // can correlate with /v1/models without parsing HTML glyphs.
 func (s *Server) renderLoadedModelsJSON(w http.ResponseWriter) {
 	type loadedModel struct {
-		ID         string   `json:"id"`                    // router section ID (the name /models/load accepts)
-		Status     string   `json:"status"`                // "loaded", "loading", "unloaded"
-		Aliases    []string `json:"aliases,omitempty"`     // every other name the router will accept
-		PublicName string   `json:"public_name,omitempty"` // canonical OpenAI-style ID (matches /v1/models)
-		RegistryID string   `json:"registry_id,omitempty"` // long internal ID (matches /api/models/)
+		ID           string         `json:"id"`                    // router section ID (the name /models/load accepts)
+		Status       string         `json:"status"`                // "loaded", "loading", "unloaded"
+		Aliases      []string       `json:"aliases,omitempty"`     // every other name the router will accept
+		PublicName   string         `json:"public_name,omitempty"` // canonical OpenAI-style ID (matches /v1/models)
+		RegistryID   string         `json:"registry_id,omitempty"` // long internal ID (matches /api/models/)
+		Capabilities map[string]any `json:"capabilities,omitempty"`
 	}
 
 	out := struct {
-		Running bool          `json:"running"`
-		Models  []loadedModel `json:"models"`
-	}{Models: []loadedModel{}}
+		SchemaVersion int           `json:"schema_version"`
+		Running       bool          `json:"running"`
+		Models        []loadedModel `json:"models"`
+	}{SchemaVersion: CapabilitiesSchemaVersion, Models: []loadedModel{}}
 
 	if !s.process.IsRunning() {
 		respondJSON(w, out)
@@ -269,20 +271,23 @@ func (s *Server) renderLoadedModelsJSON(w http.ResponseWriter) {
 			Status:  rm.Status.Value,
 			Aliases: rm.Aliases,
 		}
-		// Find the registry model behind this router entry so we can
-		// surface its canonical IDs. Match by router-section name first,
-		// then by alias (the router's primary ID may not equal m.ID).
-		if reg, _ := s.findModelByAny(rm.ID); reg != nil {
-			entry.RegistryID = reg.ID
-			entry.PublicName = reg.PublicName()
-		} else {
+		// Find the registry model behind this router entry so we can surface
+		// its canonical IDs and capability block. Match by router-section name
+		// first, then by alias (the router's primary ID may not equal m.ID).
+		// Folding capabilities in here lets a client auto-configure from this
+		// single request instead of fanning out to /info per model.
+		reg, cfg := s.findModelByAny(rm.ID)
+		if reg == nil {
 			for _, a := range rm.Aliases {
-				if reg, _ := s.findModelByAny(a); reg != nil {
-					entry.RegistryID = reg.ID
-					entry.PublicName = reg.PublicName()
+				if reg, cfg = s.findModelByAny(a); reg != nil {
 					break
 				}
 			}
+		}
+		if reg != nil {
+			entry.RegistryID = reg.ID
+			entry.PublicName = reg.PublicName()
+			entry.Capabilities = s.buildCapabilities(reg, cfg)
 		}
 		out.Models = append(out.Models, entry)
 	}

@@ -78,6 +78,12 @@ type Model struct {
 	SupportsTools    bool   `json:"supports_tools,omitempty"`     // chat template handles tools
 	HasBuiltinVision bool   `json:"has_builtin_vision,omitempty"` // vision encoder baked into model
 
+	// Reasoning / thinking mode detected from the chat template at parse time.
+	// ReasoningChecked distinguishes a genuine "no reasoning" from a record
+	// parsed before detection existed (BackfillGGUFMeta re-parses the latter).
+	Reasoning        ReasoningCapability `json:"reasoning,omitempty"`
+	ReasoningChecked bool                `json:"reasoning_checked,omitempty"`
+
 	// KV-cache scaling factors (see GGUFMeta). Persisted so VRAM estimates
 	// don't re-parse the GGUF on every render. Zero on records parsed before
 	// these existed — BackfillGGUFMeta repopulates them, and KVCacheGB falls
@@ -127,6 +133,10 @@ type ModelConfig struct {
 
 	Aliases    []string `json:"aliases,omitempty"` // user-defined friendly names
 	ExtraFlags string   `json:"extra_flags"`
+
+	// ReasoningOverride lets a user correct or supply reasoning capability when
+	// chat-template auto-detection is wrong or absent. nil = use detection.
+	ReasoningOverride *ReasoningCapability `json:"reasoning,omitempty"`
 
 	// Sampling parameters — nil means use llama.cpp server default.
 	Temperature     *float64 `json:"temperature,omitempty"`
@@ -542,8 +552,11 @@ func (r *Registry) BackfillGGUFMeta() {
 		// Records parsed before KV scaling factors existed have layers but no
 		// per-token factors — re-parse once to repopulate them.
 		needsKV := m.NLayers > 0 && m.KVFullPerTok == 0 && m.KVSWAPerTok == 0
+		// Records parsed before reasoning detection existed have no reasoning
+		// verdict — re-parse once to inspect the chat template.
+		needsReasoning := m.NLayers > 0 && !m.ReasoningChecked
 
-		if !needsFull && !needsVision && !needsKV {
+		if !needsFull && !needsVision && !needsKV && !needsReasoning {
 			continue
 		}
 		meta, err := ParseGGUFMeta(m.FilePath)
@@ -576,6 +589,13 @@ func (r *Registry) BackfillGGUFMeta() {
 				slog.Info("backfilled KV scaling", "model", m.ID,
 					"kv_full_per_tok", meta.KVFullPerTok, "kv_swa_per_tok", meta.KVSWAPerTok,
 					"sliding_window", meta.SlidingWindow)
+			}
+			if needsReasoning && meta.ReasoningChecked {
+				m.Reasoning = meta.Reasoning
+				m.ReasoningChecked = true
+				changed = true
+				slog.Info("backfilled reasoning capability", "model", m.ID,
+					"supported", meta.Reasoning.Supported, "toggle", meta.Reasoning.Toggle)
 			}
 		}
 	}
