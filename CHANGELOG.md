@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.12.0](https://github.com/tmac1973/llama-toolchest/compare/v2.11.0...v2.12.0) (2026-06-20)
+
+
+### Features
+
+* **api:** expose model capabilities for client auto-discovery ([241a9f4](https://github.com/tmac1973/llama-toolchest/commit/241a9f4465e65a6b68eaad5d2a3c0288bc2e373c))
+* expose model capabilities for client auto-discovery ([107ea5a](https://github.com/tmac1973/llama-toolchest/commit/107ea5ab46fd32744aa16843e4ef8d41a71df8d1))
+
 ## [2.11.0](https://github.com/tmac1973/llama-toolchest/compare/v2.10.2...v2.11.0) (2026-06-19)
 
 
