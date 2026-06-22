@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.13.0](https://github.com/tmac1973/llama-toolchest/compare/v2.12.0...v2.13.0) (2026-06-22)
+
+
+### Features
+
+* optional secure deploy (Caddy reverse proxy) + scriptable installer ([622ec3d](https://github.com/tmac1973/llama-toolchest/commit/622ec3d785b6ebb6823afdc2d5b0c0fc93c65f15))
+* **setup:** optional secure deploy (Caddy reverse proxy) + scriptable installer ([1bbcfa5](https://github.com/tmac1973/llama-toolchest/commit/1bbcfa5409e53d7fe40636b65c71a38cb134a9fb))
+
 ## [2.12.0](https://github.com/tmac1973/llama-toolchest/compare/v2.11.0...v2.12.0) (2026-06-20)
 
 
