@@ -156,12 +156,22 @@ auto_start: false           # Start the inference router on container startup
 
 To persist models on the host filesystem (so they survive `docker volume rm`), set `LLAMA_TOOLCHEST_MODELS_DIR=/path/to/models` in `.env` before running `setup.sh`. Existing models in the volume won't be visible after switching — move them first.
 
+`external_url` and `llama_port` can also be set from the environment (`LLAMA_TOOLCHEST_EXTERNAL_URL`, `LLAMA_TOOLCHEST_LLAMA_PORT`), which overrides the YAML — handy for container deploys that inject values via compose.
+
+### Securing with HTTPS + a login
+
+By default the UI, management API, and inference ports are served over plain HTTP with no authentication. For deployments reachable beyond a trusted LAN, `./setup.sh install --secure` puts a [Caddy](https://caddyserver.com) reverse proxy in front for HTTPS (self-signed or Let's Encrypt) and a single admin login. It's interactive, or fully scriptable with flags. See **[docs/secure.md](docs/secure.md)**.
+
+> ⚠️ The bundled Caddy config is a best-effort starting point, provided as-is — you are responsible for auditing it for your own threat model.
+
 ## Ports
 
 | Port | Service |
 |------|---------|
 | 3000 | Management UI + OpenAI proxy (`/v1`) |
 | 8080 | llama.cpp router + built-in chat UI |
+
+In a [secure install](docs/secure.md), Caddy fronts these on `443` (UI/API/`/v1`) and `8080` (chat UI) with `80` redirecting to HTTPS, and the app itself is bound to loopback.
 
 ## GPU Backend Notes
 

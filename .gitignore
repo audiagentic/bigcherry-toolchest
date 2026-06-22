@@ -4,5 +4,8 @@ dist/
 /agent
 *.pid
 .env
+# Rendered from Caddyfile.template by `setup.sh install --secure`; contains the
+# admin bcrypt hash, so it must never be committed. The template is tracked.
+/Caddyfile
 .claude/
 debug_output.txt

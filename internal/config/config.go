@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
@@ -53,8 +54,29 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	applyEnvOverrides(cfg)
 	salvageModelsDir(cfg)
 	return cfg, nil
+}
+
+// applyEnvOverrides lets a few deployment-critical fields be set from the
+// environment, overriding the YAML. This exists so a containerized deploy can
+// inject values through compose `environment:` without editing the config file
+// baked into the image's /data volume — notably ExternalURL, which a reverse
+// proxy (see docs/secure.md) must set so the UI's chat/API links render with
+// the externally reachable scheme and host. Empty/unset env vars are ignored,
+// so they never clobber a YAML value.
+func applyEnvOverrides(cfg *Config) {
+	if v := os.Getenv("LLAMA_TOOLCHEST_EXTERNAL_URL"); v != "" {
+		cfg.ExternalURL = v
+	}
+	if v := os.Getenv("LLAMA_TOOLCHEST_LLAMA_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.LlamaPort = n
+		} else {
+			slog.Warn("ignoring non-numeric LLAMA_TOOLCHEST_LLAMA_PORT", "value", v)
+		}
+	}
 }
 
 // salvageModelsDir blanks ModelsDir if it points to a path that doesn't exist

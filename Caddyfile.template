@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  llama-toolchest — Caddy reverse proxy: HTTPS + single-admin Basic Auth
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  ⚠️  BEST-EFFORT SECURITY — PLEASE READ
+#
+#      This configuration is provided as a convenience starting point, AS-IS
+#      and WITHOUT WARRANTY. It has NOT been hardened for any specific threat
+#      model. YOU are responsible for reviewing and auditing it before relying
+#      on it — including (but not limited to): TLS/cipher policy, the
+#      authentication mechanism and its strength, which ports are exposed, rate
+#      limiting, request-size limits, logging/PII, and your host firewall and
+#      network policy. If this server is reachable from an untrusted network,
+#      treat the security of the deployment as your responsibility.
+#
+#      See docs/secure.md for the threat model this does and does NOT address.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#  This file is a TEMPLATE. `setup.sh install --secure` renders it to ./Caddyfile,
+#  replacing the placeholder tokens (each written as AT-AT NAME AT-AT) with:
+#    GLOBAL        global options block (ACME email for Let's Encrypt, or empty)
+#    SITE_ADDRESS  e.g. ":443" (self-signed / internal CA) or "llm.example.com"
+#    CHAT_ADDRESS  e.g. ":8080" or "llm.example.com:8080"
+#    AUTH_USER     admin username
+#    AUTH_HASH     bcrypt hash from: caddy hash-password
+#  To deploy by hand, copy this file to ./Caddyfile and substitute those tokens.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@@GLOBAL@@
+
+# Management UI + API + OpenAI-compatible inference proxy.
+@@SITE_ADDRESS@@ {
+	@@TLS@@
+	# /v1/* is the OpenAI-compatible API. It is INTENTIONALLY not behind Basic
+	# Auth: programmatic clients authenticate with the app's own Bearer
+	# api_key (set under Settings). A Basic-Auth challenge here would collide
+	# with the "Authorization: Bearer …" header those clients send.
+	@v1 path /v1 /v1/*
+	handle @v1 {
+		reverse_proxy llama-toolchest:3000
+	}
+
+	# Everything else — the web UI and the /api/* management endpoints —
+	# requires the single admin login.
+	handle {
+		basic_auth {
+			@@AUTH_USER@@ @@AUTH_HASH@@
+		}
+		reverse_proxy llama-toolchest:3000
+	}
+}
+
+# llama.cpp router chat UI (the in-app "Open Chat UI →" link points here),
+# behind the same admin login. Programmatic API clients should use the /v1
+# endpoint on the main site above, not this port.
+@@CHAT_ADDRESS@@ {
+	@@TLS@@
+	basic_auth {
+		@@AUTH_USER@@ @@AUTH_HASH@@
+	}
+	reverse_proxy llama-toolchest:8080
+}
