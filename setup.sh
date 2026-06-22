@@ -38,6 +38,22 @@ HOST_INSTALL_MODE="${HOST_INSTALL_MODE:-package}"  # for --host: "package" (down
 HOST_SDK_BACKENDS=()    # backends to install host SDKs for (--cuda/--rocm/--vulkan); empty means autodetect+prompt
 MIGRATE_DIRECTION=""    # "to-host" or "to-container" when command=migrate
 
+# ── Non-interactive + secure-install state ──
+# ASSUME_YES (--yes/-y): skip confirmations and never block on a prompt.
+# INTERACTIVE: computed in main() from whether stdin is a TTY.
+case "${ASSUME_YES:-}" in 1|true|yes|y|Y) ASSUME_YES=true ;; *) ASSUME_YES=false ;; esac
+INTERACTIVE=true
+# SECURE (--secure): deploy behind the bundled Caddy reverse proxy (HTTPS +
+# single-admin Basic Auth). Container mode only. See docs/secure.md.
+case "${SECURE:-}" in 1|true|yes) SECURE=true; SECURE_EXPLICIT=true ;; *) SECURE=false; SECURE_EXPLICIT="${SECURE_EXPLICIT:-false}" ;; esac
+TLS_MODE="${TLS_MODE:-}"        # self-signed | letsencrypt
+DOMAIN="${DOMAIN:-}"            # FQDN, required for letsencrypt
+ACME_EMAIL="${ACME_EMAIL:-}"    # account email for letsencrypt
+AUTH_USER="${AUTH_USER:-}"      # admin username (defaults to "admin" later)
+AUTH_HASH=""                    # bcrypt hash: from --auth-hash, or computed during install
+AUTH_PASS_FILE=""               # --auth-pass-file: path to a file holding the plaintext password
+AUTH_PASS="${AUTH_PASS:-}"      # env-provided plaintext (hashed during install); never accepted on argv
+
 DISTRO_ID=""            # debian, ubuntu, fedora, arch, cachyos, opensuse-leap, etc.
 DISTRO_NAME=""          # Pretty name from os-release
 DISTRO_FAMILY=""        # debian, fedora, arch, suse
@@ -616,20 +632,127 @@ container_exists() {
 is_port_held_by_our_container() {
     local port="$1"
     [[ -z "$CONTAINER_CMD" ]] && return 1
-    for cname in llamactl llama-toolchest; do
+    for cname in llamactl llama-toolchest llama-toolchest-caddy; do
         container_exists "$cname" || continue
         # `docker/podman port <c>` outputs lines like "3000/tcp -> 0.0.0.0:3001".
         # Match the trailing :PORT to confirm this container is the binder.
         local mappings
-        mappings="$($CONTAINER_CMD port "$cname" 2>/dev/null)" || continue
+        mappings="$($CONTAINER_CMD port "$cname" 2>/dev/null)" || mappings=""
         if echo "$mappings" | grep -qE ":${port}(\s|$)"; then
+            return 0
+        fi
+        # `port` can come back empty (host networking, pasta, a stopped
+        # container that still reserves the port via its userspace proxy). Fall
+        # back to the published-port list from inspect, where the host port
+        # shows up as "HostPort":"3000", so we still recognize our own
+        # container instead of flagging a foreign-process conflict.
+        if $CONTAINER_CMD inspect --format '{{json .HostConfig.PortBindings}}' "$cname" 2>/dev/null \
+            | grep -qE "\"${port}\""; then
             return 0
         fi
     done
     return 1
 }
 
+# describe_port_holder prints "name (pid N)" for whatever is listening on a TCP
+# port, or nothing if it can't tell. Used to make port-conflict errors
+# actionable instead of a cryptic "address already in use" after a long build.
+describe_port_holder() {
+    local port="$1" info
+    need_cmd ss || return 0
+    info="$(ss -tlnpH "sport = :${port}" 2>/dev/null | grep -oE '"[^"]+",pid=[0-9]+' | head -1)" || true
+    [[ -z "$info" ]] && return 0
+    local pname="${info%%\",pid=*}"; pname="${pname#\"}"
+    printf '%s (pid %s)' "$pname" "${info##*pid=}"
+}
+
+# preflight_port_check aborts BEFORE the (slow) image build if any host port the
+# new stack needs is occupied by something we don't manage — e.g. a host-mode
+# llama-toolchest running directly on the machine. Our own containers are
+# cleared by stop_existing_containers first, so anything left is a real
+# conflict. If it's our own host process, offer to stop it.
+preflight_port_check() {
+    local ports=()
+    if [[ "$SECURE" == true ]]; then
+        ports=("$LLAMA_TOOLCHEST_PORT" "${SECURE_APP_DEBUG_INF_PORT:-8081}" \
+               "${CADDY_HTTP_PORT:-80}" "${CADDY_HTTPS_PORT:-443}" "${CADDY_CHAT_PORT:-8080}")
+    else
+        ports=("$LLAMA_TOOLCHEST_PORT" "$LLAMA_TOOLCHEST_INFERENCE_PORT")
+    fi
+
+    local p holder conflict=false saw_host=false
+    for p in "${ports[@]}"; do
+        is_port_available "$p" && continue
+        holder="$(describe_port_holder "$p")"
+        err "Port ${p} is already in use${holder:+ by ${holder}}."
+        conflict=true
+        [[ "$holder" == llama-toolchest* || "$holder" == llamactl* ]] && saw_host=true
+    done
+    [[ "$conflict" == false ]] && return 0
+
+    echo ""
+    if [[ "$saw_host" == true ]] && host_is_installed; then
+        echo "  That's a llama-toolchest installed directly on the host. Running it"
+        echo "  alongside the container conflicts now AND again on every reboot"
+        echo "  (the host service stays enabled), so just stopping it isn't enough."
+        if prompt_confirm "Uninstall the host install (stop, disable, remove binary) and continue?"; then
+            host_uninstall
+            local still=false
+            for p in "${ports[@]}"; do is_port_available "$p" || still=true; done
+            [[ "$still" == false ]] && { ok "Host install removed; continuing."; return 0; }
+            err "Ports are still busy after removing the host install."
+        fi
+        echo "  Or remove it yourself, then re-run:  ./setup.sh uninstall --host"
+    else
+        echo "  Stop the process(es) above, or pick different ports, then re-run."
+    fi
+    fatal "Port conflict — not building until the ports are free."
+}
+
+# ensure_unprivileged_ports: rootless Podman cannot bind ports below the kernel's
+# net.ipv4.ip_unprivileged_port_start (default 1024), but the secure stack
+# publishes 80/443. Offer to lower that floor (persisted across reboots, which
+# autostart needs). Only relevant for rootless Podman in secure mode.
+ensure_unprivileged_ports() {
+    [[ "$SECURE" == true ]] || return 0
+    [[ "$CONTAINER_CMD" == "podman" && $EUID -ne 0 ]] || return 0
+    need_cmd sysctl || return 0
+
+    local min_port=65535 p
+    for p in "${CADDY_HTTP_PORT:-80}" "${CADDY_HTTPS_PORT:-443}" "${CADDY_CHAT_PORT:-8080}"; do
+        (( p < min_port )) && min_port="$p"
+    done
+
+    local current
+    current="$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo 1024)"
+    (( min_port >= current )) && return 0   # already permitted
+
+    echo ""
+    warn "Rootless Podman can't bind privileged port ${min_port} (kernel floor is ${current})."
+    echo "  The secure stack publishes ports 80/443. Either lower the floor"
+    echo "  (host-wide, one-time, persisted), or set CADDY_HTTP_PORT/CADDY_HTTPS_PORT"
+    echo "  to >= 1024 in .env and adjust your URL — or run rootful Podman."
+    echo ""
+    if prompt_confirm "Lower net.ipv4.ip_unprivileged_port_start to ${min_port}? (needs sudo)"; then
+        run_sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=${min_port}" \
+            || fatal "Failed to set the sysctl. Set CADDY_* ports >= 1024 in .env, or run rootful."
+        if echo "net.ipv4.ip_unprivileged_port_start=${min_port}" \
+            | run_sudo tee /etc/sysctl.d/99-llama-toolchest-ports.conf >/dev/null 2>&1; then
+            ok "Privileged ports enabled for rootless containers (persisted)."
+        else
+            warn "Applied for this session but couldn't persist it; it may reset on reboot."
+        fi
+    else
+        fatal "Privileged ports 80/443 are unavailable to rootless Podman. Set CADDY_HTTP_PORT/CADDY_HTTPS_PORT >= 1024 in .env (and adjust the URL), or run rootful. See docs/secure.md."
+    fi
+}
+
 prompt_ports() {
+    # Non-interactive: accept the configured/flagged ports as-is, no prompting.
+    if [[ "$INTERACTIVE" != true || "$ASSUME_YES" == true ]]; then
+        return
+    fi
+
     echo ""
     echo -e "${BOLD}Port configuration${NC}"
     echo ""
@@ -694,6 +817,11 @@ prompt_ports() {
 }
 
 prompt_models_dir() {
+    # Non-interactive: keep the configured/flagged value (env or .env), no prompt.
+    if [[ "$INTERACTIVE" != true || "$ASSUME_YES" == true ]]; then
+        return
+    fi
+
     echo ""
     echo -e "${BOLD}Model storage${NC}"
     echo ""
@@ -763,6 +891,30 @@ load_env_ports() {
     [[ -n "$val" ]] && LLAMA_TOOLCHEST_INFERENCE_PORT="$val" || true
     val="$(grep '^LLAMA_TOOLCHEST_MODELS_DIR=' "$env_file" 2>/dev/null | cut -d= -f2)" || true
     [[ -n "$val" ]] && LLAMA_TOOLCHEST_MODELS_DIR="$val" || true
+
+    # Remember a prior secure install so up/down/rebuild re-add the Caddy
+    # overlay without needing --secure again. An explicit --secure/--no-secure
+    # on this run always wins.
+    if [[ "$SECURE_EXPLICIT" != true ]]; then
+        val="$(grep '^LLAMA_TOOLCHEST_SECURE=' "$env_file" 2>/dev/null | cut -d= -f2)" || true
+        [[ "$val" == "1" || "$val" == "true" ]] && SECURE=true || true
+    fi
+
+    # Reload the secure-mode values so a rebuild/quick (which re-runs
+    # write_env_file but NOT configure_secure) reproduces the same .env instead
+    # of resetting the external URL/ports to defaults.
+    if [[ "$SECURE" == true ]]; then
+        val="$(grep '^LLAMA_TOOLCHEST_EXTERNAL_URL=' "$env_file" 2>/dev/null | cut -d= -f2-)" || true
+        [[ -n "$val" ]] && SECURE_EXTERNAL_URL="$val" || true
+        val="$(grep '^LLAMA_TOOLCHEST_INFERENCE_PORT=' "$env_file" 2>/dev/null | cut -d= -f2)" || true
+        [[ -n "$val" ]] && SECURE_APP_DEBUG_INF_PORT="$val" || true
+        val="$(grep '^CADDY_HTTP_PORT=' "$env_file" 2>/dev/null | cut -d= -f2)" || true
+        [[ -n "$val" ]] && CADDY_HTTP_PORT="$val" || true
+        val="$(grep '^CADDY_HTTPS_PORT=' "$env_file" 2>/dev/null | cut -d= -f2)" || true
+        [[ -n "$val" ]] && CADDY_HTTPS_PORT="$val" || true
+        val="$(grep '^CADDY_CHAT_PORT=' "$env_file" 2>/dev/null | cut -d= -f2)" || true
+        [[ -n "$val" ]] && CADDY_CHAT_PORT="$val" || true
+    fi
 }
 
 # Legacy rename: copy contents of pre-rebrand 'llamactl-data' Docker volume
@@ -881,6 +1033,10 @@ compose_cmd() {
     if [[ -n "${LLAMA_TOOLCHEST_MODELS_DIR:-}" ]]; then
         cmd+=" -f docker-compose.models.yml"
     fi
+    # Add the Caddy reverse-proxy overlay for secure installs.
+    if [[ "$SECURE" == true ]]; then
+        cmd+=" -f docker-compose.secure.yml"
+    fi
     echo "$cmd"
 }
 
@@ -898,9 +1054,26 @@ write_env_file() {
     local env_file="${SCRIPT_DIR}/.env"
     : > "$env_file"
 
-    # Port configuration
-    echo "LLAMA_TOOLCHEST_PORT=${LLAMA_TOOLCHEST_PORT}" >> "$env_file"
-    echo "LLAMA_TOOLCHEST_INFERENCE_PORT=${LLAMA_TOOLCHEST_INFERENCE_PORT}" >> "$env_file"
+    if [[ "$SECURE" == true ]]; then
+        # Secure mode: only Caddy faces the network. Bind the app to loopback
+        # (host-local debugging) and shift its inference publish off 8080 so it
+        # doesn't collide with Caddy's published chat port. The public surface
+        # is Caddy's 80/443/8080; see docs/secure.md.
+        {
+            echo "LLAMA_TOOLCHEST_SECURE=1"
+            echo "LLAMA_TOOLCHEST_BIND=127.0.0.1:"
+            echo "LLAMA_TOOLCHEST_PORT=${LLAMA_TOOLCHEST_PORT}"
+            echo "LLAMA_TOOLCHEST_INFERENCE_PORT=${SECURE_APP_DEBUG_INF_PORT:-8081}"
+            echo "LLAMA_TOOLCHEST_EXTERNAL_URL=${SECURE_EXTERNAL_URL:-https://localhost}"
+            echo "CADDY_HTTP_PORT=${CADDY_HTTP_PORT:-80}"
+            echo "CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT:-443}"
+            echo "CADDY_CHAT_PORT=${CADDY_CHAT_PORT:-8080}"
+        } >> "$env_file"
+    else
+        # Port configuration
+        echo "LLAMA_TOOLCHEST_PORT=${LLAMA_TOOLCHEST_PORT}" >> "$env_file"
+        echo "LLAMA_TOOLCHEST_INFERENCE_PORT=${LLAMA_TOOLCHEST_INFERENCE_PORT}" >> "$env_file"
+    fi
 
     # Model storage — bind-mount a host directory so models survive volume removal
     if [[ -n "$LLAMA_TOOLCHEST_MODELS_DIR" ]]; then
@@ -920,10 +1093,171 @@ write_env_file() {
     fi
 }
 
+# ─── Secure (Caddy reverse proxy) configuration ──────────────────────────────
+
+print_secure_disclaimer() {
+    echo ""
+    echo -e "${YELLOW}  ⚠  BEST-EFFORT SECURITY${NC}"
+    echo "     The bundled Caddy config is a convenience starting point, provided"
+    echo "     AS-IS with no warranty and NOT hardened for any specific threat"
+    echo "     model. You are responsible for reviewing and auditing it (TLS, auth,"
+    echo "     exposed ports, rate limiting, firewall/network policy) before relying"
+    echo "     on it. See docs/secure.md and the rendered ./Caddyfile."
+    echo ""
+}
+
+# Prompt for host vs container when the user didn't choose explicitly.
+prompt_install_mode() {
+    echo ""
+    echo -e "${BOLD}Install mode${NC}"
+    echo ""
+    echo "  1) Container  (Docker/Podman) — isolated, recommended"
+    echo "  2) Host       (install directly on this machine)"
+    echo ""
+    local choice
+    read -rp "$(echo -e "  ${BOLD}Choose${NC} [1]: ")" choice
+    case "${choice:-1}" in
+        1) INSTALL_MODE="container" ;;
+        2) INSTALL_MODE="host" ;;
+        *) err "Invalid choice: $choice"; prompt_install_mode; return ;;
+    esac
+    INSTALL_MODE_EXPLICIT=true
+}
+
+# caddy_hash_password hashes plaintext via the caddy image, feeding the secret
+# on STDIN (newline-terminated — hash-password reads a line) so it never appears
+# in argv / ps. Echoes the resulting hash. Caddy's basic_auth accepts both
+# bcrypt ($2…) and argon2id ($argon2id$…); the image default is bcrypt.
+caddy_hash_password() {
+    local plaintext="$1" hash
+    hash="$(printf '%s\n' "$plaintext" | $CONTAINER_CMD run --rm -i "$CADDY_IMAGE" caddy hash-password 2>/dev/null || true)"
+    hash="${hash%%$'\n'*}"
+    [[ "$hash" == \$* ]] || return 1
+    printf '%s' "$hash"
+}
+
+# render_caddyfile fills Caddyfile.template into ./Caddyfile. Values are
+# substituted with bash parameter expansion (not sed) so the bcrypt hash's
+# special chars ($ / .) are handled literally.
+render_caddyfile() {
+    local tpl="${SCRIPT_DIR}/Caddyfile.template" out="${SCRIPT_DIR}/Caddyfile"
+    [[ -f "$tpl" ]] || fatal "Missing $tpl"
+    local content; content="$(<"$tpl")"
+    content="${content//@@GLOBAL@@/$CADDY_GLOBAL}"
+    content="${content//@@TLS@@/$CADDY_TLS}"
+    content="${content//@@SITE_ADDRESS@@/$CADDY_SITE_ADDRESS}"
+    content="${content//@@CHAT_ADDRESS@@/$CADDY_CHAT_ADDRESS}"
+    content="${content//@@AUTH_USER@@/$AUTH_USER}"
+    content="${content//@@AUTH_HASH@@/$AUTH_HASH}"
+    printf '%s\n' "$content" > "$out"
+    chmod 600 "$out" 2>/dev/null || true
+    ok "Rendered ./Caddyfile — review it before exposing the server."
+}
+
+# configure_secure resolves all secure-install settings (flags > prompts >
+# defaults), computes the bcrypt hash, and renders ./Caddyfile. Container-only.
+configure_secure() {
+    # Offer it interactively when the user didn't pass --secure/--no-secure.
+    if [[ "$SECURE_EXPLICIT" != true && "$INTERACTIVE" == true && "$ASSUME_YES" != true ]]; then
+        if prompt_confirm "Enable access control + HTTPS (Caddy reverse proxy)?"; then
+            SECURE=true
+        fi
+    fi
+    [[ "$SECURE" == true ]] || return 0
+
+    print_secure_disclaimer
+
+    # ── TLS mode ──
+    if [[ -z "$TLS_MODE" ]]; then
+        if [[ "$INTERACTIVE" == true && "$ASSUME_YES" != true ]]; then
+            echo -e "${BOLD}TLS certificate${NC}"
+            echo "  1) Self-signed / internal CA — works on any LAN/IP; browser shows a warning"
+            echo "  2) Let's Encrypt            — trusted cert; needs a public domain + ports 80/443"
+            local c; read -rp "$(echo -e "  ${BOLD}Choose${NC} [1]: ")" c
+            case "${c:-1}" in 1) TLS_MODE="self-signed" ;; 2) TLS_MODE="letsencrypt" ;; *) fatal "Invalid choice: $c" ;; esac
+        else
+            TLS_MODE="self-signed"
+        fi
+    fi
+    case "$TLS_MODE" in
+        self-signed|letsencrypt) ;;
+        *) fatal "--tls must be 'self-signed' or 'letsencrypt' (got '$TLS_MODE')" ;;
+    esac
+
+    # ── Domain / ACME email (letsencrypt) ──
+    if [[ "$TLS_MODE" == letsencrypt ]]; then
+        if [[ -z "$DOMAIN" && "$INTERACTIVE" == true && "$ASSUME_YES" != true ]]; then
+            read -rp "$(echo -e "  ${BOLD}Public domain (FQDN)${NC}: ")" DOMAIN
+        fi
+        [[ -n "$DOMAIN" ]] || fatal "Let's Encrypt requires a domain (--domain <fqdn>)"
+        if [[ -z "$ACME_EMAIL" && "$INTERACTIVE" == true && "$ASSUME_YES" != true ]]; then
+            read -rp "$(echo -e "  ${BOLD}ACME account email${NC} (optional, recommended): ")" ACME_EMAIL
+        fi
+        [[ -n "$ACME_EMAIL" ]] || warn "No ACME email set; Let's Encrypt registration will be anonymous."
+    fi
+
+    # ── Admin credentials ──
+    [[ -n "$AUTH_USER" ]] || AUTH_USER="admin"
+    if [[ "$INTERACTIVE" == true && "$ASSUME_YES" != true && -z "$AUTH_HASH" && -z "$AUTH_PASS_FILE" && -z "$AUTH_PASS" ]]; then
+        local u; read -rp "$(echo -e "  ${BOLD}Admin username${NC} [${AUTH_USER}]: ")" u
+        [[ -n "$u" ]] && AUTH_USER="$u"
+    fi
+
+    # ── Resolve the bcrypt hash (plaintext never touches argv) ──
+    if [[ -z "$AUTH_HASH" ]]; then
+        local pw=""
+        if [[ -n "$AUTH_PASS_FILE" ]]; then
+            [[ -r "$AUTH_PASS_FILE" ]] || fatal "Cannot read --auth-pass-file: $AUTH_PASS_FILE"
+            pw="$(< "$AUTH_PASS_FILE")"; pw="${pw%%$'\n'*}"
+        elif [[ -n "$AUTH_PASS" ]]; then
+            pw="$AUTH_PASS"
+        elif [[ "$INTERACTIVE" == true && "$ASSUME_YES" != true ]]; then
+            local pw2
+            read -rsp "$(echo -e "  ${BOLD}Admin password${NC}: ")" pw; echo ""
+            read -rsp "$(echo -e "  ${BOLD}Confirm password${NC}: ")" pw2; echo ""
+            [[ "$pw" == "$pw2" ]] || fatal "Passwords do not match"
+        fi
+        [[ -n "$pw" ]] || fatal "No admin password. Provide --auth-hash, --auth-pass-file, or AUTH_PASS (or run interactively)."
+        log "Hashing password via the caddy image..."
+        AUTH_HASH="$(caddy_hash_password "$pw")" || fatal "Failed to hash password (is the caddy:2 image pullable?). Alternatively pass --auth-hash."
+        unset pw
+    fi
+
+    # ── Derive Caddy site addresses + the external URL for the app's links ──
+    local ext_host
+    if [[ "$TLS_MODE" == letsencrypt ]]; then
+        CADDY_SITE_ADDRESS="$DOMAIN"
+        CADDY_CHAT_ADDRESS="${DOMAIN}:${CADDY_CHAT_PORT:-8080}"
+        CADDY_GLOBAL=$'{\n\temail '"${ACME_EMAIL}"$'\n}'
+        CADDY_TLS="# Let's Encrypt cert is provisioned automatically for the domain"
+        ext_host="$DOMAIN"
+    else
+        # Bare port + internal CA. on_demand mints a self-signed cert for
+        # whatever hostname/IP the client uses (localhost, LAN IP, hostname),
+        # so a bare :443 site still presents a certificate instead of failing
+        # the TLS handshake.
+        CADDY_SITE_ADDRESS=":${CADDY_HTTPS_PORT:-443}"
+        CADDY_CHAT_ADDRESS=":${CADDY_CHAT_PORT:-8080}"
+        CADDY_GLOBAL="# self-signed / internal CA — no ACME"
+        CADDY_TLS=$'tls internal {\n\t\ton_demand\n\t}'
+        ext_host="${DOMAIN:-$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)}"
+    fi
+    local scheme_port=""
+    [[ "${CADDY_HTTPS_PORT:-443}" != "443" ]] && scheme_port=":${CADDY_HTTPS_PORT}"
+    SECURE_EXTERNAL_URL="https://${ext_host}${scheme_port}"
+
+    render_caddyfile
+}
+
 container_up() {
     if has_quadlet; then
         log "Starting llama-toolchest via systemd (Quadlet)..."
-        systemctl_cmd start "${PODMAN_SERVICE_NAME}.service"
+        # Start in order (app first, then Caddy). Each service's Requires=/After=
+        # also pulls its deps, but starting explicitly keeps output clear.
+        local svc
+        while read -r svc; do
+            systemctl_cmd start "$svc"
+        done < <(quadlet_services)
     else
         $(compose_cmd) up -d
     fi
@@ -932,14 +1266,44 @@ container_up() {
 container_down() {
     if has_quadlet; then
         log "Stopping llama-toolchest via systemd (Quadlet)..."
-        systemctl_cmd stop "${PODMAN_SERVICE_NAME}.service"
+        # Stop in reverse order (Caddy first, then app).
+        local svc
+        while read -r svc; do
+            systemctl_cmd stop "$svc" 2>/dev/null || true
+        done < <(quadlet_services | tac)
     else
         $(compose_cmd) down
     fi
 }
 
+# stop_existing_containers clears any running/stopped llama-toolchest containers
+# before a fresh `up`, so their published ports are free. This covers copies a
+# plain `compose up` won't manage: a different compose project name, a Quadlet
+# service, the pre-rename "llamactl" container, or a manually-started one.
+stop_existing_containers() {
+    # If Quadlet owns the containers, stop the services first so systemd doesn't
+    # immediately restart what we remove.
+    if has_quadlet; then
+        local svc
+        while read -r svc; do
+            systemctl_cmd stop "$svc" 2>/dev/null || true
+        done < <(quadlet_services | tac)
+    fi
+    local cname
+    for cname in llama-toolchest-caddy llama-toolchest llamactl; do
+        if container_exists "$cname"; then
+            log "Removing existing container so the new one can bind its ports: $cname"
+            $CONTAINER_CMD stop "$cname" 2>/dev/null || true
+            $CONTAINER_CMD rm "$cname" 2>/dev/null || true
+        fi
+    done
+}
+
 container_install() {
     migrate_legacy_volume
+    stop_existing_containers
+    preflight_port_check
+    ensure_unprivileged_ports
     write_env_file
     $(compose_cmd) up -d --build
 }
@@ -950,13 +1314,14 @@ container_rebuild() {
 
     migrate_legacy_volume
     container_down
-    $CONTAINER_CMD rm llama-toolchest 2>/dev/null || true
+    stop_existing_containers
+    preflight_port_check
+    ensure_unprivileged_ports
     write_env_file
     $(compose_cmd) build --no-cache
 
     if [[ "$quadlet_active" == true ]]; then
-        log "Starting via systemd (Quadlet)..."
-        systemctl_cmd start "${PODMAN_SERVICE_NAME}.service"
+        container_up
     else
         $(compose_cmd) up -d
     fi
@@ -992,7 +1357,12 @@ container_quick_rebuild() {
 
 container_logs() {
     if has_quadlet; then
-        journalctl --user -u "${PODMAN_SERVICE_NAME}.service" -n 100 -f
+        local journal_args=()
+        local svc
+        while read -r svc; do
+            journal_args+=(-u "$svc")
+        done < <(quadlet_services)
+        journalctl --user "${journal_args[@]}" -n 100 -f
     else
         $(compose_cmd) logs -f
     fi
@@ -1003,6 +1373,9 @@ container_logs() {
 readonly QUADLET_USER_DIR="${HOME}/.config/containers/systemd"
 readonly QUADLET_SYSTEM_DIR="/etc/containers/systemd"
 readonly PODMAN_SERVICE_NAME="llama-toolchest"
+# Fully-qualified so it resolves under Podman hosts with no unqualified-search
+# registries configured (Docker ignores the docker.io/library/ prefix).
+readonly CADDY_IMAGE="docker.io/library/caddy:2"
 
 quadlet_dir() {
     if [[ $EUID -eq 0 ]]; then
@@ -1050,7 +1423,21 @@ get_volume_name() {
         || echo "llama-toolchest-data"
 }
 
-generate_quadlet() {
+# quadlet_services echoes the systemd service names for the active mode, in
+# START order (app first, then Caddy). Reverse for stop. The .network unit is
+# pulled in automatically by the containers' Network= dependency, so it isn't
+# listed here.
+quadlet_services() {
+    echo "${PODMAN_SERVICE_NAME}.service"
+    if [[ "$SECURE" == true ]]; then
+        echo "${PODMAN_SERVICE_NAME}-caddy.service"
+    fi
+}
+
+# generate_quadlet_app emits the app .container unit. In secure mode it joins
+# the shared network and publishes NOTHING (Caddy fronts it); otherwise it
+# publishes the UI/inference ports to the host as before.
+generate_quadlet_app() {
     local image_name="localhost/llama-toolchest:latest"
     local volume_name
     volume_name="$(get_volume_name)"
@@ -1072,10 +1459,20 @@ GroupAdd=${HOST_RENDER_GID:-render}
 ${hsa_env}"
     fi
 
+    # Secure mode: no published ports (Caddy is the only network-facing
+    # container), join the shared network, and set ExternalURL so links render
+    # with the externally reachable https URL.
+    local net_args="" ext_url_arg=""
+    if [[ "$SECURE" == true ]]; then
+        net_args="Network=${PODMAN_SERVICE_NAME}.network"
+        ext_url_arg="Environment=LLAMA_TOOLCHEST_EXTERNAL_URL=${SECURE_EXTERNAL_URL:-https://localhost}"
+    fi
+
     cat <<EOF
 # Auto-generated by llama-toolchest setup.sh
 # GPU backend: ${GPU_VENDOR}
 # Runtime: ${CONTAINER_CMD}
+# Mode: $([[ "$SECURE" == true ]] && echo "secure (behind Caddy)" || echo "direct")
 
 [Unit]
 Description=llama-toolchest - local LLM management
@@ -1084,8 +1481,15 @@ After=network-online.target
 [Container]
 Image=${image_name}
 ContainerName=llama-toolchest
-PublishPort=${LLAMA_TOOLCHEST_PORT}:3000
-PublishPort=${LLAMA_TOOLCHEST_INFERENCE_PORT}:8080
+$(if [[ "$SECURE" == true ]]; then
+    echo "PublishPort=127.0.0.1:${LLAMA_TOOLCHEST_PORT}:3000"
+    echo "PublishPort=127.0.0.1:${SECURE_APP_DEBUG_INF_PORT:-8081}:8080"
+else
+    echo "PublishPort=${LLAMA_TOOLCHEST_PORT}:3000"
+    echo "PublishPort=${LLAMA_TOOLCHEST_INFERENCE_PORT}:8080"
+fi)
+${net_args}
+${ext_url_arg}
 Volume=${volume_name}:/data:z
 ${gpu_args}
 
@@ -1098,51 +1502,119 @@ WantedBy=default.target
 EOF
 }
 
+# generate_quadlet_network emits the shared network for the secure two-container
+# stack, giving Caddy name-based DNS to reach the app (matches compose).
+generate_quadlet_network() {
+    cat <<EOF
+# Auto-generated by llama-toolchest setup.sh
+[Unit]
+Description=llama-toolchest reverse-proxy network
+
+[Network]
+NetworkName=llama-toolchest
+EOF
+}
+
+# generate_quadlet_caddy emits the Caddy .container unit (secure mode only).
+# Ordered after the app so the upstream is up first.
+generate_quadlet_caddy() {
+    cat <<EOF
+# Auto-generated by llama-toolchest setup.sh
+[Unit]
+Description=llama-toolchest Caddy reverse proxy (HTTPS + admin login)
+After=${PODMAN_SERVICE_NAME}.service
+Requires=${PODMAN_SERVICE_NAME}.service
+
+[Container]
+Image=${CADDY_IMAGE}
+ContainerName=${PODMAN_SERVICE_NAME}-caddy
+Network=${PODMAN_SERVICE_NAME}.network
+PublishPort=${CADDY_HTTP_PORT:-80}:80
+PublishPort=${CADDY_HTTPS_PORT:-443}:443
+PublishPort=${CADDY_CHAT_PORT:-8080}:8080
+Volume=${SCRIPT_DIR}/Caddyfile:/etc/caddy/Caddyfile:ro,z
+Volume=${PODMAN_SERVICE_NAME}-caddy-data:/data:z
+Volume=${PODMAN_SERVICE_NAME}-caddy-config:/config:z
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+# quadlet_write_units (re)writes all unit files for the active mode into the
+# Quadlet dir, removing any stale ones from the other mode first.
+quadlet_write_units() {
+    local qdir="$1"
+    mkdir -p "$qdir"
+    quadlet_remove_unit_files "$qdir"   # clear stale caddy/network when toggling off
+    generate_quadlet_app > "${qdir}/${PODMAN_SERVICE_NAME}.container"
+    if [[ "$SECURE" == true ]]; then
+        generate_quadlet_network > "${qdir}/${PODMAN_SERVICE_NAME}.network"
+        generate_quadlet_caddy   > "${qdir}/${PODMAN_SERVICE_NAME}-caddy.container"
+    fi
+}
+
+# quadlet_remove_unit_files deletes every unit file this script may have written
+# (app + caddy + network), regardless of the current mode, so toggling secure
+# off doesn't leave orphaned units behind.
+quadlet_remove_unit_files() {
+    local qdir="$1"
+    rm -f "${qdir}/${PODMAN_SERVICE_NAME}.container" \
+          "${qdir}/${PODMAN_SERVICE_NAME}-caddy.container" \
+          "${qdir}/${PODMAN_SERVICE_NAME}.network"
+}
+
 autostart_enable() {
     if is_autostart_enabled; then
         ok "Auto-start is already enabled"
         return
     fi
 
-    if [[ "$CONTAINER_CMD" == "docker" ]]; then
-        # Docker: set restart policy on the container
-        if ! docker container exists llama-toolchest 2>/dev/null; then
-            # docker doesn't have "container exists" — check via inspect
-            if ! docker inspect llama-toolchest &>/dev/null; then
-                fatal "Container 'llama-toolchest' not found. Run './setup.sh install' first."
-            fi
-        fi
-        log "Setting restart policy to 'unless-stopped'..."
-        docker update --restart unless-stopped llama-toolchest
-        ok "Auto-start enabled"
-    elif [[ $EUID -eq 0 ]]; then
-        # Podman rootful: restart policy works like Docker
-        if ! podman container exists llama-toolchest 2>/dev/null; then
+    if [[ "$CONTAINER_CMD" == "docker" || $EUID -eq 0 ]]; then
+        # Docker (any user) or rootful Podman: restart policy on the container(s).
+        if ! $CONTAINER_CMD inspect llama-toolchest &>/dev/null; then
             fatal "Container 'llama-toolchest' not found. Run './setup.sh install' first."
         fi
         log "Setting restart policy to 'unless-stopped'..."
-        podman update --restart unless-stopped llama-toolchest
+        $CONTAINER_CMD update --restart unless-stopped llama-toolchest
+        if [[ "$SECURE" == true ]] && $CONTAINER_CMD inspect llama-toolchest-caddy &>/dev/null; then
+            $CONTAINER_CMD update --restart unless-stopped llama-toolchest-caddy
+        fi
         ok "Auto-start enabled"
     else
-        # Podman rootless: need Quadlet + linger to survive reboot
+        # Podman rootless: need Quadlet + linger to survive reboot. In secure
+        # mode this writes the app, Caddy, and network units together.
         local qdir
         qdir="$(quadlet_dir)"
 
-        # If the container is already running outside of systemd, stop it first
-        # so the Quadlet service can take over without a name conflict.
-        local was_running=false
-        if podman container exists llama-toolchest 2>/dev/null; then
-            was_running=true
-            log "Stopping existing container so systemd can take over..."
-            podman stop llama-toolchest 2>/dev/null || true
-            podman rm llama-toolchest 2>/dev/null || true
+        if [[ "$SECURE" == true && ! -f "${SCRIPT_DIR}/Caddyfile" ]]; then
+            fatal "Secure mode but ./Caddyfile is missing — run './setup.sh install --secure' first."
         fi
 
-        log "Installing Quadlet unit: ${qdir}/${PODMAN_SERVICE_NAME}.container"
+        # Stop any containers running outside systemd so the units can take over
+        # without a name conflict.
+        local was_running=false cname
+        for cname in llama-toolchest llama-toolchest-caddy; do
+            if podman container exists "$cname" 2>/dev/null; then
+                was_running=true
+                log "Stopping existing container $cname so systemd can take over..."
+                podman stop "$cname" 2>/dev/null || true
+                podman rm "$cname" 2>/dev/null || true
+            fi
+        done
 
-        mkdir -p "$qdir"
-        generate_quadlet > "${qdir}/${PODMAN_SERVICE_NAME}.container"
+        if [[ "$SECURE" == true ]]; then
+            log "Pulling caddy image..."
+            podman pull "$CADDY_IMAGE" >/dev/null 2>&1 \
+                || warn "Could not pre-pull $CADDY_IMAGE; the unit will pull on first start."
+        fi
 
+        log "Installing Quadlet units in ${qdir}..."
+        quadlet_write_units "$qdir"
         systemctl_cmd daemon-reload
 
         # Enable lingering so user services run without an active login session
@@ -1155,19 +1627,20 @@ autostart_enable() {
             fi
         fi
 
-        # Start the service now if the container was previously running
+        # Start now if something was already running; otherwise the units
+        # auto-activate on boot via WantedBy= (no explicit enable needed).
         if [[ "$was_running" == true ]]; then
-            log "Starting llama-toolchest via systemd..."
-            systemctl_cmd start "${PODMAN_SERVICE_NAME}.service"
+            container_up
         fi
 
-        # Quadlet units are auto-activated by systemd's generator via
-        # WantedBy= in the [Install] section — no explicit enable needed.
         ok "Auto-start enabled via Podman Quadlet"
-
         echo ""
         echo "  llama-toolchest will auto-start on boot."
-        echo "  Manage with: systemctl --user {start,stop,status} ${PODMAN_SERVICE_NAME}"
+        if [[ "$SECURE" == true ]]; then
+            echo "  Manage with: systemctl --user {start,stop,status} ${PODMAN_SERVICE_NAME} ${PODMAN_SERVICE_NAME}-caddy"
+        else
+            echo "  Manage with: systemctl --user {start,stop,status} ${PODMAN_SERVICE_NAME}"
+        fi
     fi
 }
 
@@ -1177,24 +1650,22 @@ autostart_disable() {
         return
     fi
 
-    if [[ "$CONTAINER_CMD" == "docker" ]]; then
+    if [[ "$CONTAINER_CMD" == "docker" || $EUID -eq 0 ]]; then
         log "Setting restart policy to 'no'..."
-        docker update --restart no llama-toolchest
-        ok "Auto-start disabled"
-    elif [[ $EUID -eq 0 ]]; then
-        log "Setting restart policy to 'no'..."
-        podman update --restart no llama-toolchest
+        $CONTAINER_CMD update --restart no llama-toolchest 2>/dev/null || true
+        $CONTAINER_CMD update --restart no llama-toolchest-caddy 2>/dev/null || true
         ok "Auto-start disabled"
     else
         local qdir
         qdir="$(quadlet_dir)"
 
-        log "Removing Quadlet unit: ${qdir}/${PODMAN_SERVICE_NAME}.container"
-
-        # Stop the service, remove the Quadlet file, then reload so
-        # systemd's generator drops the unit entirely.
-        systemctl_cmd stop "${PODMAN_SERVICE_NAME}.service" 2>/dev/null || true
-        rm -f "${qdir}/${PODMAN_SERVICE_NAME}.container"
+        log "Removing Quadlet units from ${qdir}..."
+        # Stop services (Caddy first, then app), drop the unit files, reload.
+        local svc
+        while read -r svc; do
+            systemctl_cmd stop "$svc" 2>/dev/null || true
+        done < <(quadlet_services | tac)
+        quadlet_remove_unit_files "$qdir"
         systemctl_cmd daemon-reload
         ok "Auto-start disabled"
     fi
@@ -1218,6 +1689,13 @@ container_uninstall() {
     if container_exists llama-toolchest; then
         has_container=true
         actions+=("Stop and remove container 'llama-toolchest'")
+    fi
+
+    # Secure installs also have a Caddy sidecar.
+    local has_caddy=false
+    if container_exists llama-toolchest-caddy; then
+        has_caddy=true
+        actions+=("Stop and remove container 'llama-toolchest-caddy'")
     fi
 
     # `image exists` is podman-specific; on Docker we use inspect.
@@ -1251,6 +1729,9 @@ container_uninstall() {
     volume_name="$($CONTAINER_CMD inspect --format '{{range .Mounts}}{{.Name}}{{end}}' llama-toolchest 2>/dev/null || echo "llama-toolchest-data")"
     echo -e "  ${YELLOW}Note:${NC} The data volume (models, builds, config) will be kept."
     echo -e "        To remove it: ${CONTAINER_CMD} volume rm ${volume_name}"
+    if [[ "$has_caddy" == true ]]; then
+        echo -e "        Caddy certs/state are kept too: ${CONTAINER_CMD} volume rm llama-toolchest-caddy-data llama-toolchest-caddy-config"
+    fi
     echo ""
 
     if ! prompt_confirm "Proceed with uninstall?"; then
@@ -1262,6 +1743,13 @@ container_uninstall() {
 
     if [[ "$has_autostart" == true ]]; then
         autostart_disable
+    fi
+
+    if [[ "$has_caddy" == true ]]; then
+        log "Stopping and removing Caddy container..."
+        $CONTAINER_CMD stop llama-toolchest-caddy 2>/dev/null || true
+        $CONTAINER_CMD rm llama-toolchest-caddy 2>/dev/null || true
+        ok "Caddy container removed"
     fi
 
     if [[ "$has_container" == true ]]; then
@@ -1341,8 +1829,26 @@ print_summary() {
     fi
 }
 
+# require_value validates that a value-bearing flag actually got a value (and
+# not the next flag). Echoes the value so callers can capture it.
+require_value() {
+    local flag="$1" val="${2:-}"
+    if [[ -z "$val" || "$val" == -* ]]; then
+        fatal "Flag $flag requires a value"
+    fi
+    printf '%s' "$val"
+}
+
 prompt_confirm() {
     local prompt="$1"
+    # --yes auto-confirms; a non-TTY without --yes can't answer, so fail loudly
+    # rather than block or silently assume.
+    if [[ "$ASSUME_YES" == true ]]; then
+        return 0
+    fi
+    if [[ "$INTERACTIVE" != true ]]; then
+        fatal "Non-interactive shell and --yes not given; cannot answer: '${prompt}'. Re-run with --yes (and any required flags)."
+    fi
     local answer
     read -rp "$(echo -e "${BOLD}${prompt}${NC} [Y/n] ")" answer
     case "${answer:-Y}" in
@@ -1421,10 +1927,34 @@ SDKs in a single run; each implies --host):
                   you a portable fallback alongside the vendor backend.
 
 If no backend flag and no GPU= env is set, setup.sh auto-detects the
-primary GPU and asks whether to add Vulkan as a secondary SDK.
+primary GPU and asks whether to add Vulkan as a secondary SDK. With no
+--host/--container flag, `install` asks interactively which mode to use.
 
 Pin a specific released version with `LT_VERSION=1.0.0 ./setup.sh
 install --host` to avoid hitting the GH API for the latest tag.
+
+Secure install (container only — Caddy reverse proxy for HTTPS + a single
+admin login in front of the UI/API):
+  --secure / --no-secure   Enable/disable the Caddy reverse proxy. Without
+                           either flag, `install` asks interactively.
+  --tls self-signed|letsencrypt   Cert strategy (default self-signed).
+  --domain <fqdn>          Public domain (required for Let's Encrypt).
+  --acme-email <email>     ACME account email (Let's Encrypt; recommended).
+  --auth-user <name>       Admin username (default "admin").
+  --auth-hash <bcrypt>     Precomputed bcrypt hash (from `caddy hash-password`).
+                           Preferred for non-interactive installs.
+  --auth-pass-file <path>  Read the admin password from a file (hashed during
+                           install). The plaintext is NEVER accepted on argv;
+                           use this, AUTH_PASS=… in the env, or --auth-hash.
+
+  ⚠  BEST-EFFORT SECURITY: the bundled Caddy config is a convenience starting
+     point, AS-IS and not hardened for any specific threat model. You are
+     responsible for auditing it before relying on it. See docs/secure.md.
+
+Non-interactive:
+  -y, --yes                Skip confirmation prompts; required when stdin is
+                           not a TTY. Combine with the flags above (and
+                           --host/--container) for a fully scripted install.
 
 Lifecycle:
   install     Detect, install prerequisites, build, and start
@@ -1476,16 +2006,27 @@ Environment variables:
                                 use --cuda/--rocm/--vulkan flags instead)
   RUNTIME=docker|podman         Override container runtime auto-detection
   INSTALL_MODE=host|container   Same as --host / --container
+  ASSUME_YES=1                  Same as --yes
+  SECURE=1                      Same as --secure
+  AUTH_PASS=…                   Admin password for a scripted secure install
+                                (hashed during install; keeps it off argv)
 
 Port configuration is stored in .env (see .env.example for details).
 You can edit .env directly instead of using the interactive setup.
 
 Examples:
-  ./setup.sh install                    # detect, install prereqs, build & run (container)
+  ./setup.sh install                    # detect, install prereqs, build & run (asks mode)
   ./setup.sh install --host             # install latest released package on the host
   ./setup.sh install --rocm --vulkan    # host install, install both ROCm and Vulkan SDKs
   ./setup.sh install --vulkan           # host install, Vulkan SDK only (cross-vendor)
   ./setup.sh install --from-source      # host install, build from local source
+  ./setup.sh install --secure           # container install behind Caddy (asks TLS/login)
+  ./setup.sh install --secure --tls self-signed \
+      --auth-user admin --auth-hash "$(caddy hash-password --plaintext s3cret)" --yes
+                                        # fully scripted self-signed secure install
+  AUTH_PASS="$(cat ~/pw)" ./setup.sh install --secure --tls letsencrypt \
+      --domain llm.example.com --acme-email me@example.com --yes
+                                        # fully scripted Let's Encrypt secure install
   ./setup.sh migrate --to-host          # snapshot container state, install on host
   ./setup.sh migrate --to-container     # opposite direction
   ./setup.sh status --host              # show host install status
@@ -1526,6 +2067,23 @@ main() {
             --to-container)
                 [[ -n "$MIGRATE_DIRECTION" ]] && { err "--to-host and --to-container are mutually exclusive"; exit 1; }
                 MIGRATE_DIRECTION="to-container" ;;
+            # ── Non-interactive ──
+            -y|--yes)       ASSUME_YES=true ;;
+            # ── Secure (Caddy reverse proxy) install ──
+            --secure)       SECURE=true;  SECURE_EXPLICIT=true ;;
+            --no-secure)    SECURE=false; SECURE_EXPLICIT=true ;;
+            --tls)          TLS_MODE="$(require_value "$1" "${2:-}")"; shift ;;
+            --tls=*)        TLS_MODE="${1#*=}" ;;
+            --domain)       DOMAIN="$(require_value "$1" "${2:-}")"; shift ;;
+            --domain=*)     DOMAIN="${1#*=}" ;;
+            --acme-email)   ACME_EMAIL="$(require_value "$1" "${2:-}")"; shift ;;
+            --acme-email=*) ACME_EMAIL="${1#*=}" ;;
+            --auth-user)    AUTH_USER="$(require_value "$1" "${2:-}")"; shift ;;
+            --auth-user=*)  AUTH_USER="${1#*=}" ;;
+            --auth-hash)    AUTH_HASH="$(require_value "$1" "${2:-}")"; shift ;;
+            --auth-hash=*)  AUTH_HASH="${1#*=}" ;;
+            --auth-pass-file)   AUTH_PASS_FILE="$(require_value "$1" "${2:-}")"; shift ;;
+            --auth-pass-file=*) AUTH_PASS_FILE="${1#*=}" ;;
             -h|--help)      usage; exit 0 ;;
             *)
                 err "Unknown flag: $1"
@@ -1534,8 +2092,20 @@ main() {
                 exit 1
                 ;;
         esac
-        shift
+        shift || true
     done
+
+    # --secure implies container mode; reject an explicit host combo.
+    if [[ "$SECURE" == true ]]; then
+        if [[ "$INSTALL_MODE" == "host" ]]; then
+            fatal "--secure (Caddy reverse proxy) is container-only; it can't be combined with --host."
+        fi
+        INSTALL_MODE="container"
+    fi
+
+    # Interactivity: a non-TTY stdin means we can't prompt. Prompts then either
+    # use flag/env values or fail fast asking for --yes (see prompt_confirm).
+    [[ -t 0 ]] || INTERACTIVE=false
 
     # ── Validate flag/command combinations ──
     if [[ -n "$MIGRATE_DIRECTION" && "$command" != "migrate" ]]; then
@@ -1557,6 +2127,13 @@ main() {
             exit 1
             ;;
     esac
+
+    # ── Interactive install: offer host vs container when not chosen ──
+    # Only `install` prompts; stateful commands auto-detect below. A --secure
+    # run already forced container mode (and INSTALL_MODE_EXPLICIT), so it skips.
+    if [[ "$command" == "install" && "$INSTALL_MODE_EXPLICIT" != true && "$INTERACTIVE" == true && "$ASSUME_YES" != true ]]; then
+        prompt_install_mode
+    fi
 
     # ── Auto-route stateful commands by detecting which install is present ──
     # up/down/logs are mode-agnostic from the user's POV: they want to start,
@@ -1580,6 +2157,32 @@ main() {
                         exit 1
                         ;;
                 esac
+                ;;
+        esac
+    fi
+
+    # ── uninstall: detect and remove whatever is installed (both, if present) ──
+    # Without an explicit --host/--container, uninstall used to assume container
+    # and silently leave a host install behind. Detect and route instead.
+    if [[ "$command" == "uninstall" && "$INSTALL_MODE_EXPLICIT" != "true" ]]; then
+        local detected
+        detected="$(detect_install_mode)"
+        case "$detected" in
+            none)
+                ok "Nothing to uninstall — llama-toolchest is not installed."
+                exit 0
+                ;;
+            host)      INSTALL_MODE="host" ;;       # handled by the host short-circuit
+            container) INSTALL_MODE="container" ;;  # handled by the container path
+            both)
+                log "Both host and container installs detected — removing both."
+                detect_container_runtime
+                detect_distro
+                load_env_ports
+                container_uninstall
+                echo ""
+                host_uninstall
+                exit 0
                 ;;
         esac
     fi
@@ -1763,6 +2366,11 @@ main() {
     prompt_ports
     prompt_models_dir
 
+    # ── Secure (Caddy reverse proxy) — install only; rebuild reuses .env ──
+    if [[ "$command" == "install" ]]; then
+        configure_secure
+    fi
+
     # ── Install prerequisites if needed ──
     if [[ ${#PREREQS[@]} -gt 0 ]]; then
         if ! prompt_confirm "Install prerequisites?"; then
@@ -1789,9 +2397,20 @@ main() {
     echo ""
     ok "llama-toolchest is running"
     echo ""
-    echo "  Web UI:     http://localhost:${LLAMA_TOOLCHEST_PORT}"
-    echo "  Inference:  http://localhost:${LLAMA_TOOLCHEST_INFERENCE_PORT}"
-    echo ""
+    if [[ "$SECURE" == true ]]; then
+        echo "  Web UI:     ${SECURE_EXTERNAL_URL:-https://<host>}      (login required)"
+        echo "  Chat UI:    ${SECURE_EXTERNAL_URL:-https://<host>}:${CADDY_CHAT_PORT:-8080}"
+        echo "  API:        ${SECURE_EXTERNAL_URL:-https://<host>}/v1   (Bearer api_key)"
+        if [[ "${TLS_MODE:-}" == "self-signed" ]]; then
+            echo ""
+            echo "  Note: self-signed TLS — your browser will warn until you trust"
+            echo "        Caddy's root CA. See docs/secure.md."
+        fi
+        print_secure_disclaimer
+    else
+        echo "  Web UI:     http://localhost:${LLAMA_TOOLCHEST_PORT}"
+        echo "  Inference:  http://localhost:${LLAMA_TOOLCHEST_INFERENCE_PORT}"
+    fi
     echo "  Logs:       ./setup.sh logs"
     echo "  Stop:       ./setup.sh down"
     echo "  Auto-start: ./setup.sh enable"

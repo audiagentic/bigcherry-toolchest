@@ -31,6 +31,45 @@ func TestDefaultConfigPathEnvWins(t *testing.T) {
 	}
 }
 
+// TestEnvOverrides verifies the deployment env hooks override YAML (so a
+// reverse-proxy deploy can set ExternalURL via compose) but ignore empty/unset
+// values and non-numeric ports.
+func TestEnvOverrides(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "cfg.yaml")
+	if err := os.WriteFile(path, []byte("external_url: \"http://localhost:3000\"\nllama_port: 8080\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set overrides → they win over the YAML.
+	t.Setenv("LLAMA_TOOLCHEST_EXTERNAL_URL", "https://llm.example.com")
+	t.Setenv("LLAMA_TOOLCHEST_LLAMA_PORT", "9090")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ExternalURL != "https://llm.example.com" {
+		t.Errorf("ExternalURL = %q, want env override", cfg.ExternalURL)
+	}
+	if cfg.LlamaPort != 9090 {
+		t.Errorf("LlamaPort = %d, want 9090", cfg.LlamaPort)
+	}
+
+	// Empty env must not clobber the YAML value; non-numeric port is ignored.
+	t.Setenv("LLAMA_TOOLCHEST_EXTERNAL_URL", "")
+	t.Setenv("LLAMA_TOOLCHEST_LLAMA_PORT", "not-a-number")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ExternalURL != "http://localhost:3000" {
+		t.Errorf("empty env clobbered ExternalURL: %q", cfg.ExternalURL)
+	}
+	if cfg.LlamaPort != 8080 {
+		t.Errorf("non-numeric port should be ignored, got %d", cfg.LlamaPort)
+	}
+}
+
 // TestDefaultConfigPathPrefersExistingConfig verifies the first candidate that
 // actually exists on disk is returned, rather than a fixed canonical path.
 func TestDefaultConfigPathPrefersExistingConfig(t *testing.T) {
