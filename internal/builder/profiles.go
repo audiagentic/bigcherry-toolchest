@@ -185,6 +185,26 @@ func DefaultProfiles() []BuildProfile {
 	}
 }
 
+// ApplyOptionOverrides folds a profile's build options into flags: each
+// option is enabled per its Default unless toggled in overrides, and
+// enabled options are set to their CMakeValue ("ON" unless the option
+// carries an explicit Value). Single source of truth shared by the
+// actual build (Builder.Build) and the flag preview (api effectiveCMakeFlags)
+// so the two can't diverge.
+func ApplyOptionOverrides(flags map[string]string, options []BuildOption, overrides map[string]bool) {
+	for _, opt := range options {
+		enabled := opt.Default
+		if overrides != nil {
+			if v, ok := overrides[opt.Flag]; ok {
+				enabled = v
+			}
+		}
+		if enabled {
+			flags[opt.Flag] = opt.CMakeValue()
+		}
+	}
+}
+
 // FindProfile returns the profile matching the given name.
 func FindProfile(name string) (BuildProfile, bool) {
 	for _, p := range DefaultProfiles() {
