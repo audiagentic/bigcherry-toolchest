@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,12 +74,214 @@ type jobListEntry struct {
 
 // jobCreateRequest is the JSON body POST /api/benchmark-jobs accepts.
 type jobCreateRequest struct {
-	Name        string                       `json:"name"`
-	Description string                       `json:"description,omitempty"`
-	ModelIDs    []string                     `json:"model_ids"`
-	BuildIDs    []string                     `json:"build_ids"`
-	Presets     []string                     `json:"presets"`
-	Overrides   *benchmark.ConfigOverrides   `json:"overrides,omitempty"`
+	Name        string                     `json:"name"`
+	Description string                     `json:"description,omitempty"`
+	ModelIDs    []string                   `json:"model_ids"`
+	BuildIDs    []string                   `json:"build_ids"`
+	Presets     []string                   `json:"presets"`
+	Overrides   *benchmark.ConfigOverrides `json:"overrides,omitempty"`
+	Sweeps      []benchmark.SweepAxis      `json:"sweeps,omitempty"`
+	// Params is the unified shape the job form posts: parameter name →
+	// selected values. One value fixes the parameter, two or more sweep
+	// it. Supersedes Overrides/Sweeps for form callers; the older fields
+	// remain for JSON API callers and already-saved jobs.
+	Params map[string][]string `json:"params,omitempty"`
+}
+
+// resolveSweeps normalizes the accepted input shapes into overrides and
+// axes. Params wins when present, since it is what the form sends and it
+// expresses both concepts at once.
+func resolveSweeps(req *jobCreateRequest) error {
+	if len(req.Params) > 0 {
+		derived, axes, err := benchmark.SplitParams(req.Params)
+		if err != nil {
+			return err
+		}
+		// Merge rather than replace: the form carries through override
+		// fields it has no control for (draft_model_path), and replacing
+		// wholesale would delete them from a job whose name was the only
+		// thing the user meant to change.
+		//
+		// Only unsweepable fields carry through. A field the params map
+		// can express is params' to decide, including deciding to leave
+		// it unset — carrying those over made a supplied override
+		// impossible to clear.
+		req.Overrides = benchmark.MergeOverrides(
+			benchmark.KeepUnsweepable(req.Overrides), derived)
+		req.Sweeps = axes
+		return nil
+	}
+	return nil
+}
+
+// validateJobRequest checks the parts both create and update share.
+// Sweeps are validated up front so a bad value fails at definition time
+// rather than partway through a run that may already have taken hours.
+func validateJobRequest(req jobCreateRequest) error {
+	if strings.TrimSpace(req.Name) == "" {
+		return errors.New("name is required")
+	}
+	if len(req.ModelIDs) == 0 || len(req.BuildIDs) == 0 || len(req.Presets) == 0 {
+		return errors.New("model_ids, build_ids, and presets are all required")
+	}
+	if err := benchmark.ValidateSweeps(req.Sweeps); err != nil {
+		return err
+	}
+	if err := benchmark.ValidateSamplingSupport(req.Presets, req.Overrides, req.Sweeps); err != nil {
+		return err
+	}
+	// A sweep of every axis multiplies fast. Refuse obviously runaway
+	// matrices rather than letting someone queue a week of work by
+	// pasting a long list.
+	cells := len(req.ModelIDs) * len(req.BuildIDs) * len(req.Presets)
+	for _, sw := range req.Sweeps {
+		cells *= len(sw.Values)
+	}
+	if cells > maxJobCells {
+		return fmt.Errorf("this matrix expands to %d cells, above the %d limit — narrow a sweep or split the job", cells, maxJobCells)
+	}
+	return nil
+}
+
+// maxJobCells caps matrix size. Each cell is a full benchmark and most
+// carry a router reload, so four figures of them is a runaway job, not
+// an experiment.
+const maxJobCells = 500
+
+// validateBatchMatrix rejects a job whose batch/micro-batch combinations
+// can't load, before any of it runs.
+//
+// The apply-time check catches these too, but only once the cell is
+// reached — a long sweep would run for an hour and then fail every cell
+// above the batch size. Effective values depend on each model's saved
+// config, so this needs the registry and can't live in the pure
+// request validator.
+func (s *Server) validateBatchMatrix(modelIDs []string, overrides *benchmark.ConfigOverrides, sweeps []benchmark.SweepAxis) error {
+	// A parse failure here would silently degrade the check to "field not
+	// set" and let a job through that fails every cell hours later.
+	// ValidateSweeps has already parsed these, so an error is a bug.
+	candidates := func(field string, fixed *int) ([]int, error) {
+		for _, sw := range sweeps {
+			if sw.Field != field {
+				continue
+			}
+			out := make([]int, 0, len(sw.Values))
+			for _, v := range sw.Values {
+				n, err := strconv.Atoi(v)
+				if err != nil {
+					return nil, fmt.Errorf("%s: %q is not an integer", field, v)
+				}
+				out = append(out, n)
+			}
+			return out, nil
+		}
+		if fixed != nil {
+			return []int{*fixed}, nil
+		}
+		return nil, nil // not set: fall back to the model's saved value
+	}
+
+	var fixedBatch, fixedUBatch *int
+	if overrides != nil {
+		fixedBatch, fixedUBatch = overrides.BatchSize, overrides.UBatchSize
+	}
+	batches, err := candidates("batch_size", fixedBatch)
+	if err != nil {
+		return err
+	}
+	ubatches, err := candidates("ubatch_size", fixedUBatch)
+	if err != nil {
+		return err
+	}
+	if len(batches) == 0 && len(ubatches) == 0 {
+		return nil
+	}
+
+	// Reject only when *no* combination can run.
+	//
+	// A batch × micro-batch matrix legitimately contains invalid corners
+	// — sweeping b=[1024,2048] against ub=[512,2048] means (1024, 2048)
+	// can't load while the other three can. Failing the whole job for one
+	// bad corner made that experiment impossible to create. Those cells
+	// still fail individually at apply time, with a message naming the
+	// pair, which is the right granularity.
+	viable := func(bs, ubs []int) (int, int) {
+		ok, total := 0, 0
+		for _, b := range bs {
+			for _, ub := range ubs {
+				total++
+				probe := models.ModelConfig{BatchSize: b, UBatchSize: ub}
+				if probe.ValidateBatchSizes() == nil {
+					ok++
+				}
+			}
+		}
+		return ok, total
+	}
+
+	if len(batches) > 0 && len(ubatches) > 0 {
+		if ok, total := viable(batches, ubatches); ok == 0 && total > 0 {
+			return fmt.Errorf("no batch / micro-batch combination in this job can run: every micro-batch value exceeds every batch value")
+		}
+	}
+
+	// Then against each model's saved values, which fill in whichever
+	// side the job left alone.
+	for _, id := range modelIDs {
+		saved, err := s.registry.GetConfig(id)
+		if err != nil {
+			continue // a missing model fails later with a clearer error
+		}
+		bs, ubs := batches, ubatches
+		if len(bs) == 0 {
+			bs = []int{saved.BatchSize}
+		}
+		if len(ubs) == 0 {
+			ubs = []int{saved.UBatchSize}
+		}
+		if ok, total := viable(bs, ubs); ok == 0 && total > 0 {
+			probe := models.ModelConfig{BatchSize: bs[0], UBatchSize: ubs[0]}
+			return fmt.Errorf("%s: %w", id, probe.ValidateBatchSizes())
+		}
+	}
+	return nil
+}
+
+// validateGPUAssignment refuses jobs whose GPU placement cannot produce
+// distinct, correctly-labelled cells.
+//
+// gpu_assign and tensor_split are two ways to express the same thing:
+// only tensor_split / split_mode / main_gpu reach llama-server, and
+// gpu_assign is resolved into them. Setting both is contradictory, and
+// whichever way it was resolved silently, some cells ended up
+// byte-identical while being reported under different labels.
+//
+// A gpu_assign job also needs a GPU count to resolve against. Refusing
+// here beats failing every cell partway through a run.
+func (s *Server) validateGPUAssignment(overrides *benchmark.ConfigOverrides, sweeps []benchmark.SweepAxis) error {
+	set := func(field string, fixed *string) bool {
+		for _, sw := range sweeps {
+			if sw.Field == field {
+				return true
+			}
+		}
+		return fixed != nil && *fixed != ""
+	}
+	var fixedAssign, fixedSplit *string
+	if overrides != nil {
+		fixedAssign, fixedSplit = overrides.GPUAssign, overrides.TensorSplit
+	}
+	assign := set("gpu_assign", fixedAssign)
+	if !assign {
+		return nil
+	}
+	if set("tensor_split", fixedSplit) {
+		return errors.New("set GPU Assignment or Tensor Split, not both — GPU Assignment is resolved into a tensor split, so setting both makes some cells identical while reporting different values")
+	}
+	if len(s.monitor.Current().GPU) == 0 {
+		return errors.New("cannot use GPU Assignment: no GPUs detected, so every value would resolve to the same configuration. Use Tensor Split directly, or check that GPU monitoring is working")
+	}
+	return nil
 }
 
 // handleCreateJob expands the matrix and submits the job to the queue.
@@ -89,12 +292,20 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		http.Error(w, "name is required", http.StatusBadRequest)
+	if err := resolveSweeps(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(req.ModelIDs) == 0 || len(req.BuildIDs) == 0 || len(req.Presets) == 0 {
-		http.Error(w, "model_ids, build_ids, and presets are all required", http.StatusBadRequest)
+	if err := validateJobRequest(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.validateBatchMatrix(req.ModelIDs, req.Overrides, req.Sweeps); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.validateGPUAssignment(req.Overrides, req.Sweeps); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -109,7 +320,8 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		BuildIDs:    req.BuildIDs,
 		Presets:     req.Presets,
 		Overrides:   req.Overrides,
-		Cells:       benchmark.ExpandCells(req.ModelIDs, req.BuildIDs, req.Presets),
+		Sweeps:      req.Sweeps,
+		Cells:       benchmark.ExpandCellsWithSweeps(req.ModelIDs, req.BuildIDs, req.Presets, req.Sweeps),
 	}
 
 	if err := s.jobs.Submit(job); err != nil {
@@ -140,16 +352,32 @@ func (s *Server) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		http.Error(w, "name is required", http.StatusBadRequest)
+	if err := resolveSweeps(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(req.ModelIDs) == 0 || len(req.BuildIDs) == 0 || len(req.Presets) == 0 {
-		http.Error(w, "model_ids, build_ids, and presets are all required", http.StatusBadRequest)
+	if err := validateJobRequest(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.validateBatchMatrix(req.ModelIDs, req.Overrides, req.Sweeps); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.validateGPUAssignment(req.Overrides, req.Sweeps); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	updated, err := s.bench.UpdateJobDefinition(id, req.Name, req.Description, req.ModelIDs, req.BuildIDs, req.Presets, req.Overrides)
+	updated, err := s.bench.UpdateJobDefinition(id, benchmark.JobDefinition{
+		Name:        req.Name,
+		Description: req.Description,
+		ModelIDs:    req.ModelIDs,
+		BuildIDs:    req.BuildIDs,
+		Presets:     req.Presets,
+		Overrides:   req.Overrides,
+		Sweeps:      req.Sweeps,
+	})
 	if err != nil {
 		// "synthetic" is the adhoc-edit refusal; anything else means the
 		// job wasn't found.
@@ -203,13 +431,13 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 // parent list row without re-rendering the entire list.
 func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.BenchmarkJob) {
 	type cellRow struct {
-		Idx       int
-		Cell      benchmark.JobCell
-		ModelName string
-		Quant     string
-		BuildLbl  string
-		TGTPS     string // formatted, "—" when no summary
-		PPTPS     string
+		Idx        int
+		Cell       benchmark.JobCell
+		ModelName  string
+		Quant      string
+		BuildLbl   string
+		TGTPS      string // formatted, "—" when no summary
+		PPTPS      string
 		ErrorShort string
 	}
 	rows := make([]cellRow, 0, len(job.Cells))
@@ -287,12 +515,16 @@ func (s *Server) handleJobForm(w http.ResponseWriter, r *http.Request) {
 		Builds     []buildOpt
 		Presets    []benchmark.Preset
 		GPUOptions []models.GPUOption
+		Params     []paramView
+		MaxCells   int
 		Running    bool
 	}{
 		Models:     enabled,
 		Builds:     builds,
 		Presets:    benchmark.Presets(),
 		GPUOptions: models.GPUAssignOptions(numGPUs),
+		Params:     paramViews(numGPUs),
+		MaxCells:   maxJobCells,
 		Running:    s.process.IsRunning(),
 	})
 }
@@ -303,6 +535,14 @@ func (s *Server) handleJobForm(w http.ResponseWriter, r *http.Request) {
 //   - orphan: runs reassigned to the synthetic adhoc job
 func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+
+	// Deleting the record does not stop the run — the queue holds the job
+	// in memory — so the job would keep driving the router while every
+	// lookup by id failed. Cancel first.
+	if cur, running := s.jobs.Status(); running && cur != nil && cur.ID == id {
+		http.Error(w, "this job is running — cancel it before deleting", http.StatusConflict)
+		return
+	}
 	disposition := benchmark.DeleteCascade
 	if v := r.URL.Query().Get("runs"); v != "" {
 		switch v {
@@ -358,6 +598,7 @@ func (s *Server) handleRetryFailedCells(w http.ResponseWriter, r *http.Request) 
 // One event type:
 //   - "snapshot": JSON-encoded BenchmarkJob with cells. Emitted only
 //     when something changed since the previous send.
+//
 // Stream ends when the job reaches a terminal state.
 func (s *Server) handleJobProgress(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -457,4 +698,31 @@ func newJobID() string {
 	var buf [4]byte
 	_, _ = rand.Read(buf[:])
 	return fmt.Sprintf("job-%d-%s", time.Now().UnixMilli(), hex.EncodeToString(buf[:]))
+}
+
+// paramView is a sweep field with its choices resolved for rendering.
+type paramView struct {
+	benchmark.SweepField
+	Choices []benchmark.SweepChoice
+}
+
+// paramViews resolves each parameter's choice list, filling in the sets
+// that depend on the host — currently just GPU assignment, which can't
+// be a static table because it depends on how many GPUs are installed.
+func paramViews(numGPUs int) []paramView {
+	fields := benchmark.SweepFields()
+	out := make([]paramView, 0, len(fields))
+	for _, f := range fields {
+		pv := paramView{SweepField: f, Choices: f.Choices}
+		if f.DynamicChoices == "gpu_assign" {
+			for _, o := range models.GPUAssignOptions(numGPUs) {
+				if o.Disabled {
+					continue
+				}
+				pv.Choices = append(pv.Choices, benchmark.SweepChoice{Value: o.Value, Label: o.Label})
+			}
+		}
+		out = append(out, pv)
+	}
+	return out
 }

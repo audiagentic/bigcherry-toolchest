@@ -239,6 +239,7 @@ function openBenchHelp() {
 var editingJobID = '';
 
 function openJobForm() {
+    unmappedOverrides = {};
     editingJobID = '';
     document.getElementById('job-form-title').textContent = 'New Batch Job';
     var modal = document.getElementById('job-form-modal');
@@ -290,35 +291,220 @@ function prefillJobForm(job) {
     setChecked('model', job.model_ids);
     setChecked('build', job.build_ids);
     setChecked('preset', job.presets);
+    // Rebuild the parameter controls from the job's stored shape. Saved
+    // jobs still carry overrides and sweeps separately, so both are
+    // folded back into one selection per parameter — a fixed override is
+    // just a one-value selection.
+    var selections = {};
     var ov = job.overrides || {};
-    var setField = function(name, val) {
-        var el = form.elements[name];
-        if (!el) return;
-        if (val === null || val === undefined) { el.value = ''; return; }
-        el.value = String(val);
-    };
-    setField('ov_gpu_layers',      ov.gpu_layers);
-    setField('ov_context_size',    ov.context_size);
-    setField('ov_threads',         ov.threads);
-    setField('ov_flash_attention', ov.flash_attention === undefined || ov.flash_attention === null ? null : (ov.flash_attention ? 'true' : 'false'));
-    setField('ov_kv_cache_quant',  ov.kv_cache_quant);
-    setField('ov_direct_io',       ov.direct_io === undefined || ov.direct_io === null ? null : (ov.direct_io ? 'true' : 'false'));
-    setField('ov_gpu_assign',      ov.gpu_assign);
-    setField('ov_tensor_split',    ov.tensor_split);
-    setField('ov_spec_type',       ov.spec_type);
-    // Reveal the overrides <details> if any override is set so the user
-    // can see what they're editing without an extra click.
-    if (Object.keys(ov).length > 0) {
-        var det = form.querySelector('details');
-        if (det) det.open = true;
+    // Overrides the form has no control for (e.g. draft_model_path, which
+    // is settable via the JSON API but not sweepable). Carried through
+    // untouched on save so editing a job's name can't silently delete a
+    // setting the form can't display.
+    unmappedOverrides = {};
+    Object.keys(ov).forEach(function(field){
+        var v = ov[field];
+        if (v === null || v === undefined) return;
+        if (typeof v === 'boolean') v = v ? 'true' : 'false';
+        if (!form.querySelector('.param-row[data-param="'+field+'"]')) {
+            unmappedOverrides[field] = v;
+            return;
+        }
+        selections[field] = [String(v)];
+    });
+    (job.sweeps || []).forEach(function(axis){
+        selections[axis.field] = (axis.values || []).map(String);
+    });
+
+    paramRows(form).forEach(function(row){
+        var name = row.getAttribute('data-param');
+        var values = selections[name] || [];
+
+        var text = row.querySelector('[data-param-text]');
+        if (text) {
+            var sep = row.getAttribute('data-sep') || ',';
+            text.value = values.join(sep === ',' ? ',' : ' ' + sep + ' ');
+            return;
+        }
+
+        // Match numerically where both sides parse as numbers: a stored
+        // 1.0 arrives from JSON as the number 1, whose string form is
+        // "1" and matches no "1.0" checkbox. Without this, editing turns
+        // a curated choice into a spurious custom entry — and ticking
+        // the visible one too would sweep "1" against "1.0", two cells
+        // measuring the same thing.
+        var wanted = values.slice();
+        row.querySelectorAll('.param-value').forEach(function(c){
+            var hit = wanted.findIndex(function(v){ return numEq(v, c.value); });
+            c.checked = hit !== -1;
+            if (hit !== -1) wanted.splice(hit, 1);
+        });
+        // Values the curated list doesn't offer. These must still appear
+        // and stay selected — dropping them silently deleted the setting
+        // from the job when the user edited anything else.
+        wanted.forEach(function(v){ addParamValue(row, v); });
+        var inherit = row.querySelector('.param-inherit');
+        if (inherit) inherit.checked = values.length === 0;
+        syncParamRow(row);
+    });
+
+    // Open the parameters pane when the job actually sets something, so
+    // an edit shows what it's editing without an extra click.
+    if (Object.keys(selections).length > 0) {
+        var pane = form.querySelector('details');
+        if (pane) pane.open = true;
     }
     // Tweak submit button label so it reads natural in edit mode.
     var btn = document.getElementById('job-submit-btn');
     if (btn) btn.textContent = 'Save & Re-run';
 }
+// Overrides with no matching form control, preserved across an edit.
+var unmappedOverrides = {};
 function closeJobForm() {
     document.getElementById('job-form-modal').close();
 }
+// ---- Parameter controls -------------------------------------------------
+// One control per parameter: no selection means "use each model's saved
+// value", one value fixes it for the job, several sweep it. There is no
+// separate override concept — having both was two names for one question,
+// and setting both left one of them silently ignored.
+
+function paramRows(form) {
+    return Array.from(form.querySelectorAll('.param-row'));
+}
+
+// Values a row currently contributes. Free-text rows split on the
+// parameter's own separator, matching how the Go parser splits them.
+function paramValues(row) {
+    var text = row.querySelector('[data-param-text]');
+    if (text) {
+        var sep = row.getAttribute('data-sep') || ',';
+        return text.value.split(sep).map(function(v){return v.trim();}).filter(Boolean);
+    }
+    var inherit = row.querySelector('.param-inherit');
+    if (inherit && inherit.checked) return [];
+    return Array.from(row.querySelectorAll('.param-value:checked')).map(function(c){return c.value;});
+}
+
+// "Use model's saved value" is mutually exclusive with picking values:
+// selecting both would be asking for the default and an override at once.
+function onParamInheritToggle(cb) {
+    var row = cb.closest('.param-row');
+    if (cb.checked) {
+        row.querySelectorAll('.param-value').forEach(function(c){ c.checked = false; });
+    }
+    syncParamRow(row);
+}
+
+function onParamValueToggle(cb) {
+    var row = cb.closest('.param-row');
+    var inherit = row.querySelector('.param-inherit');
+    if (cb.checked && inherit) inherit.checked = false;
+    syncParamRow(row);
+}
+
+// Numeric equality that requires the *whole* string to be a number.
+// parseFloat would accept a prefix, making gpu_assign "0-1" equal to the
+// "0" choice and silently rewriting a dual-GPU job to single-GPU.
+function numEq(a, b) {
+    if (a === b) return true;
+    if (a === '' || b === '') return false;
+    var na = Number(a), nb = Number(b);
+    return !isNaN(na) && !isNaN(nb) && na === nb;
+}
+
+function addParamCustom(el) {
+    var row = el.closest('.param-row');
+    var input = row.querySelector('.param-custom-input');
+    var raw = (input.value || '').trim();
+    if (!raw) return;
+    addParamValue(row, raw);
+    input.value = '';
+}
+
+// addParamValue selects `raw` in a row, creating a checkbox when the
+// curated list doesn't offer one. Works whether or not the row has a
+// custom-entry box: parameters registered without one (spec_type, the
+// booleans) previously dropped any stored value the list didn't cover,
+// silently deleting the setting when the job was edited.
+function addParamValue(row, raw) {
+    // Reuse an existing checkbox when the value is already offered, so
+    // this can't create a duplicate the server would reject.
+    var existing = Array.from(row.querySelectorAll('.param-value'))
+        .find(function(c){ return numEq(c.value, raw); });
+    if (existing) {
+        existing.checked = true;
+    } else {
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'param-value';
+        cb.value = raw;
+        cb.checked = true;
+        cb.setAttribute('data-param-value', row.getAttribute('data-param'));
+        cb.onchange = function(){ onParamValueToggle(cb); };
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' ' + raw + ' (custom)'));
+        var custom = row.querySelector('.param-custom');
+        if (custom) {
+            custom.before(label);
+        } else {
+            var opts = row.querySelector('.param-options');
+            if (opts) opts.appendChild(label);
+        }
+    }
+    var inherit = row.querySelector('.param-inherit');
+    if (inherit) inherit.checked = false;
+    syncParamRow(row);
+}
+
+// Keeps the collapsed summary honest about what's selected, so the state
+// is readable without opening every dropdown.
+function syncParamRow(row) {
+    var summary = row.querySelector('.param-summary');
+    if (summary) {
+        var values = paramValues(row);
+        if (!values.length) {
+            summary.textContent = "Use model's saved value";
+            summary.removeAttribute('data-active');
+        } else if (values.length === 1) {
+            summary.textContent = values[0];
+            summary.setAttribute('data-active', 'fixed');
+        } else {
+            summary.textContent = values.join(', ') + ' — sweep';
+            summary.setAttribute('data-active', 'sweep');
+        }
+    }
+    updateMatrixCount();
+}
+
+// The request shape: parameter → selected values. The server decides
+// which are fixed and which are swept, so the browser never has to.
+function readParams(form) {
+    var params = {};
+    paramRows(form).forEach(function(row){
+        var values = paramValues(row);
+        if (values.length) params[row.getAttribute('data-param')] = values;
+    });
+    return Object.keys(params).length ? params : null;
+}
+
+function fillUbatchLadder() {
+    var form = document.getElementById('new-job-form');
+    if (!form) return;
+    var row = form.querySelector('.param-row[data-param="ubatch_size"]');
+    if (!row) return;
+    var wanted = ['64','128','256','512','1024','2048'];
+    row.querySelectorAll('.param-value').forEach(function(c){
+        c.checked = wanted.indexOf(c.value) !== -1;
+    });
+    var inherit = row.querySelector('.param-inherit');
+    if (inherit) inherit.checked = false;
+    var menu = row.querySelector('.param-menu');
+    if (menu) menu.open = true;
+    syncParamRow(row);
+}
+
 function updateMatrixCount() {
     var form = document.getElementById('new-job-form');
     if (!form) return;
@@ -327,29 +513,40 @@ function updateMatrixCount() {
     var p = form.querySelectorAll('input[name=preset]:checked').length;
     var preview = document.getElementById('job-matrix-preview');
     var btn = document.getElementById('job-submit-btn');
-    if (m && b && p) {
-        preview.textContent = m+' models × '+b+' builds × '+p+' presets = '+(m*b*p)+' cells';
-        btn.disabled = false;
-    } else {
+    if (!(m && b && p)) {
         preview.textContent = 'Select models, builds, and presets to compute the matrix size.';
         btn.disabled = true;
+        return;
     }
-}
-function readOverrides(form) {
-    var ov = {};
-    var num = function(name){ var v=form.elements[name].value; return v===''?null:parseInt(v,10); };
-    var bool = function(name){ var v=form.elements[name].value; return v===''?null:(v==='true'); };
-    var str = function(name){ var v=form.elements[name].value; return v===''?null:v; };
-    if (num('ov_gpu_layers')!==null)       ov.gpu_layers = num('ov_gpu_layers');
-    if (num('ov_context_size')!==null)     ov.context_size = num('ov_context_size');
-    if (num('ov_threads')!==null)          ov.threads = num('ov_threads');
-    if (bool('ov_flash_attention')!==null) ov.flash_attention = bool('ov_flash_attention');
-    if (str('ov_kv_cache_quant')!==null)   ov.kv_cache_quant = str('ov_kv_cache_quant');
-    if (bool('ov_direct_io')!==null)       ov.direct_io = bool('ov_direct_io');
-    if (str('ov_gpu_assign')!==null)       ov.gpu_assign = str('ov_gpu_assign');
-    if (str('ov_tensor_split')!==null)     ov.tensor_split = str('ov_tensor_split');
-    if (str('ov_spec_type')!==null)        ov.spec_type = str('ov_spec_type');
-    return Object.keys(ov).length ? ov : null;
+
+    var sweepCells = 1, reloadPoints = 1, desc = '';
+    paramRows(form).forEach(function(row){
+        var n = paramValues(row).length;
+        if (n < 2) return;                        // one value fixes it, no extra cells
+        sweepCells *= n;
+        if (row.getAttribute('data-restarts')) reloadPoints *= n;
+        desc += ' × ' + n + ' ' + row.getAttribute('data-param');
+    });
+
+    var cells = m*b*p*sweepCells;
+    var text = m+' models × '+b+' builds × '+p+' presets'+desc+' = '+cells+' cells';
+
+    // Reloads are what make a sweep slow, so surface them next to the
+    // cell count. Matches the runner: one reload per distinct
+    // (model, config), amortized across presets.
+    if (sweepCells > 1 || form.querySelector('.param-summary[data-active]')) {
+        var reloads = m*b*reloadPoints;
+        text += ' · ~'+reloads+' llama-server reload'+(reloads===1?'':'s');
+    }
+    preview.textContent = text;
+
+    var max = parseInt(form.getAttribute('data-max-cells'), 10) || Infinity;
+    if (cells > max) {
+        preview.textContent = text+' — over the '+max+'-cell limit';
+        btn.disabled = true;
+        return;
+    }
+    btn.disabled = false;
 }
 function submitNewJob() {
     var form = document.getElementById('new-job-form');
@@ -362,7 +559,8 @@ function submitNewJob() {
         model_ids: picked('model'),
         build_ids: picked('build'),
         presets: picked('preset'),
-        overrides: readOverrides(form),
+        params: readParams(form),
+        overrides: Object.keys(unmappedOverrides).length ? unmappedOverrides : null,
     };
     var isEdit = !!editingJobID;
     var url = isEdit ? '/api/benchmark-jobs/'+encodeURIComponent(editingJobID) : '/api/benchmark-jobs';

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tmac1973/llama-toolchest/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -48,6 +49,13 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	// Held across the whole mutate-then-persist sequence: the benchmark
+	// queue writes cfg.ActiveBuild from its own goroutine, and two
+	// interleaved saveConfig calls could otherwise serialize a
+	// half-updated struct and lose one side's changes.
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
 	if r.Header.Get("Content-Type") == "application/json" {
 		var update struct {
 			LlamaPort *int    `json:"llama_port,omitempty"`
@@ -86,6 +94,22 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 				s.cfg.ModelsMax = v
 			}
 		}
+		// Curated runtime env vars. Presence of the marker means the form
+		// included this section, so an unchecked/blank field clears the
+		// value rather than being ignored.
+		if r.Form.Has("runtime_env_touched") {
+			env := map[string]string{}
+			for _, opt := range config.RuntimeEnvOptions() {
+				if v := strings.TrimSpace(r.FormValue("env_" + opt.Name)); v != "" {
+					env[opt.Name] = v
+				}
+			}
+			if err := config.ValidateRuntimeEnv(env); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			s.cfg.RuntimeEnv = env
+		}
 		if r.Form.Has("auto_start_touched") {
 			s.cfg.AutoStart = r.FormValue("auto_start") == "on"
 		}
@@ -102,7 +126,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Persist config
-	s.saveConfig()
+	s.saveConfigLocked()
 
 	if isHTMX(r) {
 		respondHTML(w)
@@ -147,7 +171,8 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, result)
 }
 
-func (s *Server) saveConfig() {
+// saveConfigLocked persists cfg. Callers must hold cfgMu.
+func (s *Server) saveConfigLocked() {
 	// Write back to the same path the config was loaded from, so the next
 	// startup actually sees what the user just changed. Old behavior wrote
 	// to <DataDir>/config/llama-toolchest.yaml unconditionally, which only
@@ -196,4 +221,11 @@ func validateModelsDir(path string) error {
 	}
 	dh.Close()
 	return nil
+}
+
+// saveConfig persists cfg, taking the config lock.
+func (s *Server) saveConfig() {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.saveConfigLocked()
 }

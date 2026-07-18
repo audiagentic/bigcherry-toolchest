@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -33,6 +34,39 @@ const (
 	exportScopeCells = "cells"
 	exportScopeSum   = "summary"
 )
+
+// formatCMakeFlags renders a build's CMake flags as a single stable
+// cell value. Matches effectiveCMakeFlags' "-DK=V" form and sorting so
+// an exported row can be compared against the Builds tab preview
+// verbatim. Without this column, two builds off the same git ref that
+// differ only in flags are indistinguishable in CSV — which is exactly
+// the flag-comparison workflow benchmarks exist to support.
+func formatCMakeFlags(flags map[string]string) string {
+	if len(flags) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(flags))
+	for k, v := range flags {
+		parts = append(parts, fmt.Sprintf("-D%s=%s", k, v))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " ")
+}
+
+// formatSweepValues renders a run's sweep point as a stable cell value.
+// Without it, a sweep's rows are identical apart from a throughput
+// number — the same reason cmake_flags had to be exported.
+func formatSweepValues(values map[string]string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(values))
+	for k, v := range values {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " ")
+}
 
 // jobByID looks up a job pointer in a slice without scanning twice.
 type jobLookup map[string]*benchmark.BenchmarkJob
@@ -77,8 +111,8 @@ func writeCSVCells(cw *csv.Writer, runs []benchmark.BenchmarkRun, jobs jobLookup
 	header := []string{
 		"job_id", "job_name", "run_id", "created_at",
 		"model_id", "model_name", "quant",
-		"build_id", "build_profile", "git_ref",
-		"preset", "source",
+		"build_id", "build_profile", "git_ref", "cmake_flags",
+		"preset", "sweep", "source",
 		"prompt_tokens", "gen_tokens", "depth", "concurrency", "repetition",
 		"pp_throughput", "pp_throughput_std",
 		"tg_throughput", "tg_throughput_std",
@@ -98,8 +132,8 @@ func writeCSVCells(cw *csv.Writer, runs []benchmark.BenchmarkRun, jobs jobLookup
 		base := []string{
 			run.JobID, jobName, run.ID, run.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 			run.ModelID, run.ModelName, run.Quant,
-			build.ID, build.Profile, build.GitRef,
-			run.Preset,
+			build.ID, build.Profile, build.GitRef, formatCMakeFlags(build.CMakeFlags),
+			run.Preset, formatSweepValues(run.SweepValues),
 		}
 
 		if len(run.Results) > 0 {
@@ -156,8 +190,8 @@ func writeCSVSummary(cw *csv.Writer, runs []benchmark.BenchmarkRun, jobs jobLook
 	header := []string{
 		"job_id", "job_name", "run_id", "created_at",
 		"model_id", "model_name", "quant",
-		"build_id", "build_profile", "git_ref",
-		"preset", "source", "status",
+		"build_id", "build_profile", "git_ref", "cmake_flags",
+		"preset", "sweep", "source", "status",
 		"avg_pp_throughput", "avg_tg_throughput", "avg_ttft_ms",
 		"min_tg_throughput", "max_tg_throughput",
 		"result_count", "duration_ms",
@@ -189,8 +223,8 @@ func writeCSVSummary(cw *csv.Writer, runs []benchmark.BenchmarkRun, jobs jobLook
 		row := []string{
 			run.JobID, jobName, run.ID, run.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 			run.ModelID, run.ModelName, run.Quant,
-			build.ID, build.Profile, build.GitRef,
-			run.Preset, source, run.Status,
+			build.ID, build.Profile, build.GitRef, formatCMakeFlags(build.CMakeFlags),
+			run.Preset, formatSweepValues(run.SweepValues), source, run.Status,
 			avgPP, avgTG, avgTTFT,
 			minTG, maxTG,
 			itoa(count), strconv.FormatInt(run.DurationMs, 10),

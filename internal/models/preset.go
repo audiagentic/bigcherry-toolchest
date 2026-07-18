@@ -2,8 +2,10 @@ package models
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -101,10 +103,26 @@ func writeConfigParams(b *strings.Builder, cfg *ModelConfig, isEmbedding bool) {
 	if !isEmbedding && cfg.ContextSize > 0 {
 		b.WriteString(fmt.Sprintf("ctx-size = %d\n", cfg.ContextSize))
 	}
-	if cfg.GPULayers > 0 {
+	if cfg.BatchSize > 0 {
+		b.WriteString(fmt.Sprintf("batch-size = %d\n", cfg.BatchSize))
+	}
+	if cfg.UBatchSize > 0 {
+		b.WriteString(fmt.Sprintf("ubatch-size = %d\n", cfg.UBatchSize))
+	}
+	// Emitted even at zero: 0 means "offload nothing, run on CPU", which
+	// is a real setting and the value the sweep menu offers as
+	// "0 (CPU only)". Guarding on > 0 conflated it with "unset", so the
+	// key was omitted, llama-server applied its own default, and the cell
+	// ran fully offloaded while the results recorded gpu_layers=0.
+	//
+	// Registration defaults this to 999 (registry.go), so a stored 0 is a
+	// deliberate choice rather than missing data.
+	if cfg.GPULayers >= 0 {
 		b.WriteString(fmt.Sprintf("gpu-layers = %d\n", cfg.GPULayers))
 	}
-	if cfg.Threads > 0 {
+	// Same conflation as gpu-layers: 0 is llama.cpp's "pick automatically",
+	// which a sweep can legitimately ask for.
+	if cfg.Threads >= 0 {
 		b.WriteString(fmt.Sprintf("threads = %d\n", cfg.Threads))
 	}
 	if cfg.Parallel > 1 {
@@ -287,24 +305,74 @@ func (r *Registry) ModelFilePath(id string) string {
 	return m.FilePath
 }
 
+// PresetFileName is the preset the router normally runs against,
+// regenerated from the registry on every start.
+const PresetFileName = "preset.ini"
+
+// BenchPresetFileName is a throwaway preset used when a benchmark job
+// needs to run a model under config that differs from what the user
+// saved. Written to a separate file so the real preset — and the
+// models.json it derives from — are never touched: an interrupted job
+// leaves nothing behind but a stale file nobody reads.
+const BenchPresetFileName = "bench-preset.ini"
+
 // WritePresetINI generates and writes the preset INI file to the data directory.
 func (r *Registry) WritePresetINI() (string, error) {
+	return r.writePreset(PresetFileName, nil)
+}
+
+// WriteBenchPresetINI writes a preset in which the given models run
+// under substitute configs, leaving every other model at its saved
+// config. Keys are registry IDs; unknown IDs are ignored.
+//
+// Callers must treat the returned path as ephemeral: the router has to
+// be restarted to pick it up, and restarted again against
+// WritePresetINI's output to go back to the user's settings.
+func (r *Registry) WriteBenchPresetINI(overrides map[string]*ModelConfig) (string, error) {
+	return r.writePreset(BenchPresetFileName, overrides)
+}
+
+func (r *Registry) writePreset(name string, overrides map[string]*ModelConfig) (string, error) {
 	r.mu.RLock()
 	models := make([]*Model, 0, len(r.data.Models))
 	for _, m := range r.data.Models {
 		models = append(models, m)
 	}
-	configs := r.data.Configs
+	// Sort by ID so the generated file is byte-stable across writes.
+	// Ranging a map alone left section order random, which made presets
+	// undiffable and meant two presets built from identical config could
+	// not be compared byte-wise.
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+	// Shallow-copy the config map so an override can be swapped in
+	// without mutating the registry's own pointers — GeneratePresetINI
+	// only reads, but the registry map is shared with live handlers.
+	configs := make(map[string]*ModelConfig, len(r.data.Configs))
+	for id, cfg := range r.data.Configs {
+		configs[id] = cfg
+	}
 	r.mu.RUnlock()
+
+	for id, cfg := range overrides {
+		if cfg == nil {
+			continue
+		}
+		if _, known := configs[id]; !known {
+			continue
+		}
+		configs[id] = cfg
+	}
 
 	content := GeneratePresetINI(r.modelsDir, models, configs)
 
-	presetPath := filepath.Join(r.dataDir, "config", "preset.ini")
+	presetPath := filepath.Join(r.dataDir, "config", name)
 	os.MkdirAll(filepath.Dir(presetPath), 0o755)
 
 	if err := os.WriteFile(presetPath, []byte(content), 0o644); err != nil {
 		return "", fmt.Errorf("write preset: %w", err)
 	}
+
+	slog.Debug("wrote preset", "path", presetPath,
+		"models", len(models), "substituted", len(overrides))
 
 	return presetPath, nil
 }

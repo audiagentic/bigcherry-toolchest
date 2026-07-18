@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,6 +72,18 @@ type BenchmarkRun struct {
 
 	// Duration
 	DurationMs int64 `json:"duration_ms,omitempty"`
+
+	// SweepValues records which point of a parameter sweep this run
+	// measured, copied from its cell. Stored on the run so results stay
+	// self-describing when compared across jobs, or after a job is
+	// deleted and its runs are orphaned to Ad-Hoc.
+	SweepValues map[string]string `json:"sweep_values,omitempty"`
+
+	// ConfigUnverified marks a run whose recorded Config may not reflect
+	// what llama-server actually ran. Set by the v2→v3 migration on runs
+	// from jobs that declared overrides back when overrides were never
+	// applied. Never set on runs produced after that fix.
+	ConfigUnverified bool `json:"config_unverified,omitempty"`
 }
 
 // ConfigSnapshot freezes model config at benchmark time.
@@ -83,7 +96,10 @@ type ConfigSnapshot struct {
 	KVCacheQuant   string `json:"kv_cache_quant,omitempty"`
 	DirectIO       bool   `json:"direct_io,omitempty"`
 	Threads        int    `json:"threads"`
+	BatchSize      int    `json:"batch_size,omitempty"`
+	UBatchSize     int    `json:"ubatch_size,omitempty"`
 	SpecType       string `json:"spec_type,omitempty"`
+	DraftModelPath string `json:"draft_model_path,omitempty"`
 }
 
 // GPUSnapshot captures GPU hardware at benchmark time.
@@ -109,13 +125,13 @@ type BuildSnapshot struct {
 
 // BenchmarkResult is one test point.
 type BenchmarkResult struct {
-	PromptTokens     int     `json:"prompt_tokens"`
-	GenTokens        int     `json:"gen_tokens"`
-	Repetition       int     `json:"repetition"`
-	PromptTokPerSec  float64 `json:"prompt_tok_per_sec"`
-	GenTokPerSec     float64 `json:"gen_tok_per_sec"`
-	TTFTMs           float64 `json:"ttft_ms"`
-	TotalMs          float64 `json:"total_ms"`
+	PromptTokens    int     `json:"prompt_tokens"`
+	GenTokens       int     `json:"gen_tokens"`
+	Repetition      int     `json:"repetition"`
+	PromptTokPerSec float64 `json:"prompt_tok_per_sec"`
+	GenTokPerSec    float64 `json:"gen_tok_per_sec"`
+	TTFTMs          float64 `json:"ttft_ms"`
+	TotalMs         float64 `json:"total_ms"`
 }
 
 // BenchmarkSummary holds aggregated stats.
@@ -207,6 +223,13 @@ func Presets() []Preset {
 			PromptTokens: []int{32768}, GenTokens: 512, Repetitions: 1,
 		},
 		{
+			Name:         "internal-long-ctx-thorough",
+			Label:        "internal-long-ctx-thorough — 3 reps × 4 prompt sizes 8K–64K (~20 min)",
+			Description:  "Three repetitions at 8192 / 16384 / 32768 / 65536-token prompts with 512 generated tokens each. Long-context companion to internal-long-ctx: enough repetitions to see run-to-run variance, and enough prompt sizes to show how prefill throughput scales with context depth. Prompt sizes are nominal — prompts are built at an estimated 4 chars/token, so the tokenized length typically comes out 10-25% lower depending on the tokenizer (check prompt_tokens in the results). Needs a model context of at least 64K.",
+			Source:       PresetSourceInternal,
+			PromptTokens: []int{8192, 16384, 32768, 65536}, GenTokens: 512, Repetitions: 3,
+		},
+		{
 			Name:         "benchy-quick",
 			Label:        "benchy-quick — 1 rep, 512 prompt / 32 gen via llama-benchy (~10s)",
 			Description:  "Single-shot llama-benchy run against the router. Smoke test for the API path; works with sharded GGUFs.",
@@ -296,8 +319,9 @@ type Store struct {
 const maxTimingSamples = 1000
 
 // schemaVersion is the on-disk envelope version this build writes. v1
-// was a bare JSON array of runs; v2 wraps them with a jobs list.
-const schemaVersion = 2
+// was a bare JSON array of runs; v2 wraps them with a jobs list; v3
+// flags runs whose recorded config was never actually applied.
+const schemaVersion = 3
 
 // benchmarkFile is the v2 envelope. v1 files are detected by an
 // unmarshal failure into this shape and a successful retry as []BenchmarkRun.
@@ -305,6 +329,42 @@ type benchmarkFile struct {
 	Version int            `json:"version"`
 	Jobs    []BenchmarkJob `json:"jobs"`
 	Runs    []BenchmarkRun `json:"runs"`
+}
+
+// markUnverifiedConfigs is the v2→v3 migration. Before v3, a job's
+// ConfigOverrides were merged into each run's recorded ConfigSnapshot
+// but never applied to llama-server — the cell benchmarked the model's
+// saved config while reporting the overridden one. The throughput
+// numbers are real; the config they are attributed to is not.
+//
+// We cannot recover what actually ran, so flag every run belonging to a
+// job that declared overrides and let the UI say so.
+//
+// Known gap: runs whose job was deleted before this upgrade were
+// re-parented to the synthetic Ad-Hoc job, which has no Overrides, so
+// they cannot be identified here and stay unflagged. They are also
+// indistinguishable from genuine ad-hoc runs, whose recorded config was
+// always accurate — flagging the whole Ad-Hoc job would mislabel those
+// instead. Affected runs are limited to pre-v3 override jobs the user
+// deleted while keeping results.
+func markUnverifiedConfigs(jobs []BenchmarkJob, runs []BenchmarkRun) bool {
+	overridden := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		if j.Overrides != nil {
+			overridden[j.ID] = true
+		}
+	}
+	if len(overridden) == 0 {
+		return false
+	}
+	changed := false
+	for i := range runs {
+		if overridden[runs[i].JobID] && !runs[i].ConfigUnverified {
+			runs[i].ConfigUnverified = true
+			changed = true
+		}
+	}
+	return changed
 }
 
 // NewStore creates a store and loads persisted benchmarks. resolver may
@@ -483,7 +543,77 @@ func (s *Store) DeleteJob(id string, disposition DeleteDisposition) error {
 //
 // Refuses to edit the synthetic adhoc job. Does not check whether the
 // queue is busy — that's the JobQueue's responsibility on Submit.
-func (s *Store) UpdateJobDefinition(id, name, description string, modelIDs, buildIDs, presets []string, overrides *ConfigOverrides) (*BenchmarkJob, error) {
+// JobDefinition is the editable part of a job. Grouped into a struct
+// because the positional form had grown to seven parameters and adding
+// sweeps would have made eight.
+type JobDefinition struct {
+	Name        string
+	Description string
+	ModelIDs    []string
+	BuildIDs    []string
+	Presets     []string
+	Overrides   *ConfigOverrides
+	Sweeps      []SweepAxis
+}
+
+// cellIdentity keys a cell for match-up across an edit. Sweep values are
+// part of the identity: without them, editing a swept job would match a
+// completed cell to a different sweep point and report its result under
+// the wrong configuration.
+type cellIdentity struct {
+	Model, Build, Preset string
+	Sweep                string
+	Overrides            string
+}
+
+// overrideKey renders a job's fixed overrides into the cell identity.
+// Without it, editing a single-value parameter (which lands in Overrides
+// rather than Sweeps) leaves every completed cell matching, so results
+// measured at the old value are carried forward and re-attributed to the
+// new one. Harmless while overrides did nothing; not anymore.
+func overrideKey(o *ConfigOverrides) string {
+	if o == nil {
+		return ""
+	}
+	b, err := json.Marshal(o)
+	if err != nil {
+		return ""
+	}
+	// Every field is omitempty, so an all-nil struct marshals to "{}".
+	// That must key the same as nil: they mean the same thing, and
+	// differing would drop every completed cell to pending and re-parent
+	// its runs to Ad-Hoc on an unrelated edit.
+	if string(b) == "{}" {
+		return ""
+	}
+	return string(b)
+}
+
+func identify(c JobCell) cellIdentity {
+	names := make([]string, 0, len(c.SweepValues))
+	for k := range c.SweepValues {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, n := range names {
+		fmt.Fprintf(&b, "%s=%s;", n, c.SweepValues[n])
+	}
+	return cellIdentity{Model: c.ModelID, Build: c.BuildID, Preset: c.Preset, Sweep: b.String()}
+}
+
+// identifyIn keys a cell within a job, folding in that job's fixed
+// overrides so a changed override invalidates prior results.
+func identifyIn(c JobCell, o *ConfigOverrides) cellIdentity {
+	id := identify(c)
+	id.Overrides = overrideKey(o)
+	return id
+}
+
+func (s *Store) UpdateJobDefinition(id string, def JobDefinition) (*BenchmarkJob, error) {
+	name, description := def.Name, def.Description
+	modelIDs, buildIDs, presets := def.ModelIDs, def.BuildIDs, def.Presets
+	overrides := def.Overrides
 	if id == AdhocJobID {
 		return nil, fmt.Errorf("cannot edit the synthetic %q job", AdhocJobID)
 	}
@@ -502,16 +632,15 @@ func (s *Store) UpdateJobDefinition(id, name, description string, modelIDs, buil
 	}
 	job := s.jobs[idx]
 
-	type cellKey struct{ Model, Build, Preset string }
-	prev := make(map[cellKey]JobCell, len(job.Cells))
+	prev := make(map[cellIdentity]JobCell, len(job.Cells))
 	for _, c := range job.Cells {
-		prev[cellKey{c.ModelID, c.BuildID, c.Preset}] = c
+		prev[identifyIn(c, job.Overrides)] = c
 	}
 
-	newCells := ExpandCells(modelIDs, buildIDs, presets)
+	newCells := ExpandCellsWithSweeps(modelIDs, buildIDs, presets, def.Sweeps)
 	keptRuns := make(map[string]bool)
 	for i := range newCells {
-		k := cellKey{newCells[i].ModelID, newCells[i].BuildID, newCells[i].Preset}
+		k := identifyIn(newCells[i], overrides)
 		if old, ok := prev[k]; ok && old.Status == CellStatusCompleted {
 			newCells[i] = old
 			if old.BenchmarkRunID != "" {
@@ -549,6 +678,7 @@ func (s *Store) UpdateJobDefinition(id, name, description string, modelIDs, buil
 	job.BuildIDs = buildIDs
 	job.Presets = presets
 	job.Overrides = overrides
+	job.Sweeps = def.Sweeps
 	job.Cells = newCells
 	job.Status = JobStatusPending
 	job.StartedAt = time.Time{}
@@ -666,6 +796,14 @@ func (s *Store) load() {
 		}
 		s.runs = runs
 		dirty = true // forces a v2 rewrite at end of load
+	}
+
+	// v2→v3: flag runs whose config snapshot was never applied. Runs
+	// written by v3+ are already correct, so scope this to older files.
+	if file.Version < 3 {
+		if markUnverifiedConfigs(s.jobs, s.runs) {
+			dirty = true
+		}
 	}
 
 	// Any benchmark still marked running at startup belongs to a previous

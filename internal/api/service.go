@@ -6,6 +6,7 @@ import (
 	"html"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -178,7 +179,40 @@ func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, status)
 }
 
+// routerBusyWithJob reports whether a benchmark job is currently running
+// and therefore driving the router. Interactive start/stop/restart
+// refuses rather than fighting it: restarting mid-cell would leave that
+// cell measuring something other than what it reports.
+//
+// Deliberately sourced from the queue rather than from jobEnv's
+// ownership flag. That flag is sticky by design — a failed restore
+// leaves it set so cleanup knows work is still owed — and using it here
+// meant one failed restore locked the user out of starting the router
+// at all, with no job to cancel.
+func (s *Server) routerBusyWithJob() bool {
+	// Both signals, because each is blind alone. The queue's view goes
+	// false if the running job's record is deleted mid-run, which would
+	// disarm every guard while the job kept driving the router. jobEnv's
+	// ownership covers that window — and it can no longer strand the
+	// guards, because cleanup releases it unconditionally, including when
+	// the restore restart fails.
+	if s.jobs != nil {
+		if _, running := s.jobs.Status(); running {
+			return true
+		}
+	}
+	if env, ok := s.jobEnv(); ok {
+		return env.routerOwnedByJob()
+	}
+	return false
+}
+
 func (s *Server) handleServiceStart(w http.ResponseWriter, r *http.Request) {
+	if s.routerBusyWithJob() {
+		slog.Info("refused router action: a benchmark job is using the router", "path", r.URL.Path)
+		http.Error(w, "a benchmark job is currently running the router — cancel it first", http.StatusConflict)
+		return
+	}
 	if !s.process.IsRunning() {
 		if err := s.startRouter(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -188,6 +222,11 @@ func (s *Server) handleServiceStart(w http.ResponseWriter, r *http.Request) {
 	s.handleServiceStatus(w, r)
 }
 
+// Stop is deliberately NOT guarded against a running job. It is the
+// user's only way out of a hung cell holding all the VRAM, and cleanup
+// already handles finding the router stopped. Guards belong on the
+// actions that *start* the router, because those are the ones that can
+// put a cell on the wrong config while it reports another.
 func (s *Server) handleServiceStop(w http.ResponseWriter, r *http.Request) {
 	if err := s.process.Stop(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -195,11 +234,16 @@ func (s *Server) handleServiceStop(w http.ResponseWriter, r *http.Request) {
 	}
 	// Nothing is live anymore — drop the snapshot so /info falls back to
 	// reporting just the configured value.
-	s.runningConfigs = make(map[string]*models.ModelConfig)
+	s.setRunningConfigs(make(map[string]*models.ModelConfig))
 	s.handleServiceStatus(w, r)
 }
 
 func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
+	if s.routerBusyWithJob() {
+		slog.Info("refused router action: a benchmark job is using the router", "path", r.URL.Path)
+		http.Error(w, "a benchmark job is currently running the router — cancel it first", http.StatusConflict)
+		return
+	}
 	// Stop + startRouter rather than process.Restart(): the latter relaunches
 	// with the RouterConfig captured at the original Start, so a build
 	// switched in the UI between Start and Restart would be ignored. Going
@@ -340,6 +384,17 @@ func (s *Server) handleServiceHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleActivateModel(w http.ResponseWriter, r *http.Request) {
 	id := s.registry.ResolveID(chi.URLParam(r, "id"))
 
+	// Third startRouter caller, and the easiest to miss: it fires only
+	// when the router happens to be down, which includes the window
+	// between Stop and Start inside a job's own restart. Starting there
+	// would launch the user's preset under a job, so the cell would
+	// measure saved config while reporting the override.
+	if s.routerBusyWithJob() {
+		slog.Info("refused router action: a benchmark job is using the router", "path", r.URL.Path)
+		http.Error(w, "a benchmark job is currently running the router — cancel it first", http.StatusConflict)
+		return
+	}
+
 	// Ensure router is running
 	if !s.process.IsRunning() {
 		if err := s.startRouter(); err != nil {
@@ -381,6 +436,15 @@ func (s *Server) handleActivateModel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeactivateModel(w http.ResponseWriter, r *http.Request) {
 	id := s.registry.ResolveID(chi.URLParam(r, "id"))
 
+	// Unloading the model a cell is measuring corrupts that measurement,
+	// which makes this more disruptive than Activate — it was left
+	// unguarded while Activate was not.
+	if s.routerBusyWithJob() {
+		slog.Info("refused model action: a benchmark job is using the router", "path", r.URL.Path)
+		http.Error(w, "a benchmark job is currently using the router — cancel it first", http.StatusConflict)
+		return
+	}
+
 	if err := s.process.UnloadModel(s.registry.RouterName(id)); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -394,38 +458,120 @@ func (s *Server) handleDeactivateModel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// startRouter starts the llama-server in router mode using the active build.
+// routerOptions describes what one particular router start should run.
+//
+// The zero value means "the user's saved build and config", which is
+// what every interactive path wants. A benchmark job passes its own
+// build and config explicitly.
+//
+// This used to be ambient server state that startRouter consulted, and
+// that design was the root of a family of bugs: a user hitting Restart
+// during a job got the benchmark's config, the job's build selection was
+// persisted to disk, and the launch snapshot had to be suppressed by a
+// flag. Making it a parameter means an interactive start structurally
+// cannot pick up a job's settings.
+type routerOptions struct {
+	// buildID overrides which build to launch. Empty uses the user's
+	// saved selection. Deliberately not persisted: a job's build choice
+	// is transient, so a crash mid-job can't rewrite the user's config.
+	buildID string
+	// overrides substitutes model configs for this start only. Nil uses
+	// the user's saved config, written to the normal preset.
+	overrides map[string]*models.ModelConfig
+}
+
+// startRouter starts the llama-server on the user's saved build and
+// config. Interactive callers use this.
 func (s *Server) startRouter() error {
+	return s.startRouterWith(routerOptions{})
+}
+
+// startRouterWith starts the llama-server under the given options.
+func (s *Server) startRouterWith(opt routerOptions) error {
+	// Read config under the lock: the benchmark queue and the settings
+	// handler both write these fields from other goroutines.
+	s.cfgMu.Lock()
+	buildID := opt.buildID
+	if buildID == "" {
+		buildID = s.cfg.ActiveBuild
+	}
+	modelsMax := s.cfg.ModelsMax
+	port := s.cfg.LlamaPort
+	extraEnv := s.cfg.RuntimeEnvPairs()
+	s.cfgMu.Unlock()
+
 	// Find the build binary. Explicit selection wins; otherwise fall back
 	// to the successful build with the newest GitRef.
-	build := s.resolveActiveBuild()
+	build := s.resolveBuild(buildID)
 	if build == nil || build.BinaryPath == "" {
 		return fmt.Errorf("no compiled build available — build llama.cpp first")
 	}
-	binaryPath := build.BinaryPath
 
-	// Generate preset INI from model configs
-	presetPath, err := s.registry.WritePresetINI()
-	if err != nil {
-		slog.Warn("failed to write preset INI", "error", err)
+	// A benchmark start writes its substitute config to a separate preset
+	// file; everything else regenerates the user's.
+	var presetPath string
+	var err error
+	if opt.overrides != nil {
+		presetPath, err = s.registry.WriteBenchPresetINI(opt.overrides)
+		if err != nil {
+			// Falling back to the saved preset would silently benchmark
+			// the wrong config — the exact failure this mechanism exists
+			// to prevent. Refuse to start instead.
+			return fmt.Errorf("write benchmark preset: %w", err)
+		}
+	} else {
+		presetPath, err = s.registry.WritePresetINI()
+		if err != nil {
+			slog.Warn("failed to write preset INI", "error", err)
+		}
 	}
 
+	overridden := make([]string, 0, len(opt.overrides))
+	for id := range opt.overrides {
+		overridden = append(overridden, id)
+	}
+	sort.Strings(overridden)
+
+	slog.Info("starting router",
+		"build", build.ID,
+		"preset", presetPath,
+		"for_benchmark", opt.overrides != nil,
+		"substitute_configs", overridden,
+		"env", extraEnv,
+	)
+
 	if err := s.process.Start(process.RouterConfig{
-		BinaryPath: binaryPath,
+		BinaryPath: build.BinaryPath,
 		PresetPath: presetPath,
-		ModelsMax:  s.cfg.ModelsMax,
-		Port:       s.cfg.LlamaPort,
+		ModelsMax:  modelsMax,
+		Port:       port,
+		ExtraEnv:   extraEnv,
 	}); err != nil {
 		return err
 	}
 
-	// The router has just (re)read preset.ini. Snapshot each model's launch
-	// config so /api/models/{id}/info can report live values for
-	// restart-requiring fields vs. a subsequent edit. Value-copy (not a
-	// shared pointer) because handleUpdateModelConfig mutates the registry's
-	// config struct in place.
+	// Record which build is actually serving, so callers can tell the
+	// user's saved selection from what a job temporarily launched.
+	s.setRunningBuild(build.ID)
+
+	// Snapshot each model's launch config so /api/models/{id}/info can
+	// report live values for restart-requiring fields vs. a subsequent
+	// edit. Value-copy (not a shared pointer) because
+	// handleUpdateModelConfig mutates the registry's config struct in
+	// place.
+	//
+	// Built from the configs this start actually used, substitutes
+	// included. Returning early for override starts left the previous
+	// snapshot in place, so /info reported the user's saved values as
+	// live while llama-server ran the job's — the same "recorded config
+	// is a lie" failure this mechanism exists to prevent.
 	snapshot := make(map[string]*models.ModelConfig)
 	for _, m := range s.registry.List() {
+		if sub, ok := opt.overrides[m.ID]; ok && sub != nil {
+			cp := *sub
+			snapshot[m.ID] = &cp
+			continue
+		}
 		cfg, err := s.registry.GetConfig(m.ID)
 		if err != nil {
 			continue
@@ -433,8 +579,14 @@ func (s *Server) startRouter() error {
 		cp := *cfg
 		snapshot[m.ID] = &cp
 	}
-	s.runningConfigs = snapshot
-	s.dirtyModels = make(map[string]bool)
+	s.setRunningConfigs(snapshot)
+
+	// Pending-reload badges only make sense against the user's own
+	// config. A job's start doesn't apply the user's edits, so it must
+	// not clear them.
+	if opt.overrides == nil {
+		s.clearDirty()
+	}
 	return nil
 }
 
@@ -712,6 +864,8 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 		}
 		cfg.ContextSize, _ = strconv.Atoi(r.FormValue("context_size"))
 		cfg.Parallel, _ = strconv.Atoi(r.FormValue("parallel"))
+		cfg.BatchSize, _ = strconv.Atoi(r.FormValue("batch_size"))
+		cfg.UBatchSize, _ = strconv.Atoi(r.FormValue("ubatch_size"))
 		cfg.Threads, _ = strconv.Atoi(r.FormValue("threads"))
 		cfg.FlashAttention = r.FormValue("flash_attention") == "on"
 		cfg.Jinja = r.FormValue("jinja") == "on"
@@ -811,6 +965,13 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Reject an unusable batch pair here rather than letting llama-server
+	// clamp or fail at model load, where the cause is far less obvious.
+	if err := cfg.ValidateBatchSizes(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	if err := s.registry.SetConfig(id, cfg); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -824,7 +985,7 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 	// Mark model as needing reload (config changed but model not reloaded yet).
 	// Sampling params are injected at the proxy layer and don't need a reload.
 	if cfg.Enabled && s.process.IsRunning() {
-		s.dirtyModels[id] = true
+		s.markDirty(id)
 	}
 
 	// Update VRAM estimate in model list

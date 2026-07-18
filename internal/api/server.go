@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -45,7 +46,95 @@ type Server struct {
 	// live value of any restart-requiring field separately from a config
 	// edit that hasn't been picked up yet (the router reads preset.ini only
 	// at startup). Populated by startRouter, cleared by Stop.
+	// stateMu guards runningConfigs and dirtyModels. They used to be
+	// touched only from HTTP handlers, but the benchmark queue now
+	// restarts the router once per cell from its own goroutine, and a
+	// concurrent map read/write is a fatal runtime error that would take
+	// the whole process down rather than failing one request.
+	stateMu        sync.RWMutex
 	runningConfigs map[string]*models.ModelConfig
+	// runningBuild_ is the build id the router was last started with.
+	// Distinct from cfg.ActiveBuild, which is the user's saved choice: a
+	// job launches other builds without changing that.
+	runningBuild_ string
+	// cfgMu serializes access to cfg and its persistence. The benchmark
+	// queue and the Settings handlers both write config fields, and two
+	// interleaved saveConfig calls could otherwise serialize a
+	// half-updated struct and lose one side's changes.
+	cfgMu sync.Mutex
+
+	// env is the JobEnv handed to the queue, kept so interactive handlers
+	// can ask whether a job currently controls the router.
+	env *jobEnv
+}
+
+// jobEnv returns the benchmark job environment, if wired.
+func (s *Server) jobEnv() (*jobEnv, bool) {
+	return s.env, s.env != nil
+}
+
+// withConfig runs fn with the config lock held, so a mutation and its
+// persistence are atomic with respect to other writers.
+func (s *Server) withConfig(fn func()) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	fn()
+}
+
+// setRunningBuild records the build the router was last launched with.
+func (s *Server) setRunningBuild(id string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.runningBuild_ = id
+}
+
+// runningBuild returns the build the router is actually serving, which
+// differs from the user's saved selection while a job runs.
+func (s *Server) runningBuild() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.runningBuild_
+}
+
+// activeBuild reads the selected build under lock.
+func (s *Server) activeBuild() string {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	return s.cfg.ActiveBuild
+}
+
+// setRunningConfigs replaces the launch-config snapshot under lock.
+func (s *Server) setRunningConfigs(m map[string]*models.ModelConfig) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.runningConfigs = m
+}
+
+// runningConfigFor returns the launch config recorded for a model.
+func (s *Server) runningConfigFor(id string) (*models.ModelConfig, bool) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	cfg, ok := s.runningConfigs[id]
+	return cfg, ok
+}
+
+// markDirty / isDirty / clearDirty guard the pending-reload set.
+func (s *Server) markDirty(id string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.dirtyModels[id] = true
+}
+
+func (s *Server) isDirty(id string) bool {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.dirtyModels[id]
+}
+
+func (s *Server) clearDirty() {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.dirtyModels = make(map[string]bool)
 }
 
 // SetVersion records the build's version string. main.go calls this with
@@ -82,7 +171,8 @@ func NewServer(cfg *config.Config, configPath string) *Server {
 		dirtyModels:    make(map[string]bool),
 		runningConfigs: make(map[string]*models.ModelConfig),
 	}
-	s.jobs = benchmark.NewJobQueue(s.bench, newJobEnv(s))
+	s.env = newJobEnv(s)
+	s.jobs = benchmark.NewJobQueue(s.bench, s.env)
 	s.downloader.SetOnComplete(s.onDownloadComplete)
 	s.registry.BackfillGGUFMeta()
 	if n := s.registry.DeduplicateModels(); n > 0 {
@@ -418,6 +508,8 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 		ModelsDir        string
 		DefaultModelsDir string
 		AutoStart        bool
+		RuntimeEnvOpts   []config.RuntimeEnvOption
+		RuntimeEnv       map[string]string
 	}{
 		pageData:         pageData{Title: "Settings", Nav: "settings"},
 		ProxyEndpoint:    proxyEndpoint,
@@ -430,6 +522,8 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 		ModelsDir:        s.cfg.ModelsDir,
 		DefaultModelsDir: filepath.Join(s.cfg.DataDir, "models"),
 		AutoStart:        s.cfg.AutoStart,
+		RuntimeEnvOpts:   config.RuntimeEnvOptions(),
+		RuntimeEnv:       s.cfg.RuntimeEnv,
 	}
 	s.render(w, "settings.html", data)
 }
