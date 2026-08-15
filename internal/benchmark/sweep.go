@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/tmac1973/llama-toolchest/internal/models"
 )
 
 // SweepAxis is one parameter varied across a job's matrix. Field names
@@ -34,6 +36,13 @@ const (
 type SweepChoice struct {
 	Value string
 	Label string
+	// Params are the tunable settings this choice carries, rendered as
+	// an expandable section under its checkbox. Only the speculative
+	// decoding modes have them; editing one changes the submitted value
+	// to the encoded form "mode:key=value,...". Mode is the bare mode
+	// name the encoded Value starts with.
+	Params []models.SpecModeParam
+	Mode   string
 }
 
 // SweepField describes one sweepable parameter. The set function is the
@@ -72,6 +81,9 @@ type SweepField struct {
 	DynamicChoices string
 
 	set func(o *ConfigOverrides, raw string) error
+	// canon overrides the kind-based canonical form for fields whose
+	// values have structure of their own (the encoded spec_type values).
+	canon func(raw string) string
 }
 
 func parseInt(raw string) (int, error) {
@@ -140,6 +152,139 @@ func boolField(name, label, help string, apply func(*ConfigOverrides, *bool)) Sw
 	}
 }
 
+// specValue is a parsed spec_type sweep value: a mode plus any
+// parameter settings from the mode's expandable section.
+type specValue struct {
+	mode   string
+	params map[string]string // key -> raw value, keys from models.SpecModeParams
+}
+
+// parseSpecValue parses the three accepted shapes: "none", a bare mode
+// name, or "mode:key=value,key=value". Keys must belong to the mode
+// (per models.SpecModeParams) and integer parameters must parse.
+func parseSpecValue(raw string) (specValue, error) {
+	v := strings.TrimSpace(raw)
+	out := specValue{params: map[string]string{}}
+	if v == "none" {
+		return out, nil // mode "" = speculative decoding off
+	}
+	mode, rest, hasParams := strings.Cut(v, ":")
+	mode = strings.TrimSpace(mode)
+	allowed := models.SpecModeParams(mode)
+	if len(allowed) == 0 {
+		return out, fmt.Errorf("%q is not a speculative decoding mode", mode)
+	}
+	out.mode = mode
+	if !hasParams {
+		return out, nil
+	}
+	allowedKeys := map[string]bool{}
+	for _, p := range allowed {
+		allowedKeys[p.Key] = true
+	}
+	for _, pair := range strings.Split(rest, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		k, val, ok := strings.Cut(pair, "=")
+		k, val = strings.TrimSpace(k), strings.TrimSpace(val)
+		if !ok || k == "" {
+			return out, fmt.Errorf("%q is not a key=value setting", pair)
+		}
+		if !allowedKeys[k] {
+			return out, fmt.Errorf("%q is not a setting of the %s mode", k, mode)
+		}
+		if k == "draft_p_min" {
+			if _, err := strconv.ParseFloat(val, 64); err != nil {
+				return out, fmt.Errorf("draft_p_min %q is not a number", val)
+			}
+		} else {
+			if _, err := strconv.Atoi(val); err != nil {
+				return out, fmt.Errorf("%s %q is not an integer", k, val)
+			}
+		}
+		out.params[k] = val
+	}
+	return out, nil
+}
+
+// applySpecValue is spec_type's set function: it writes the mode and any
+// parameter settings onto the overrides. Parameters the value doesn't
+// mention are left nil, so the model's saved values apply — the same
+// inherit rule as every other parameter.
+func applySpecValue(o *ConfigOverrides, raw string) error {
+	sv, err := parseSpecValue(raw)
+	if err != nil {
+		return err
+	}
+	mode := sv.mode
+	o.SpecType = &mode
+	for k, val := range sv.params {
+		switch k {
+		case "draft_max":
+			n, _ := strconv.Atoi(val)
+			o.DraftMax = &n
+		case "draft_min":
+			n, _ := strconv.Atoi(val)
+			o.DraftMin = &n
+		case "draft_p_min":
+			v := val
+			o.DraftPMin = &v
+		case "ngram_size_n":
+			n, _ := strconv.Atoi(val)
+			o.NgramSizeN = &n
+		case "ngram_size_m":
+			n, _ := strconv.Atoi(val)
+			o.NgramSizeM = &n
+		}
+	}
+	return nil
+}
+
+// encodeSpecValue renders a mode with its parameters' current values in
+// the encoded form the parser accepts, skipping empty values (empty =
+// inherit the model's saved setting). Bare mode when nothing is set.
+func encodeSpecValue(mode string, params []models.SpecModeParam) string {
+	var pairs []string
+	for _, p := range params {
+		if p.Default != "" {
+			pairs = append(pairs, p.Key+"="+p.Default)
+		}
+	}
+	if len(pairs) == 0 {
+		return mode
+	}
+	return mode + ":" + strings.Join(pairs, ",")
+}
+
+// canonicalSpecValue renders a spec value in its parsed, sorted form so
+// dedup catches values that differ only in spacing or parameter order.
+// Unparseable values return trimmed raw; the parser rejects them later
+// with a real error message.
+func canonicalSpecValue(raw string) string {
+	sv, err := parseSpecValue(raw)
+	if err != nil {
+		return strings.TrimSpace(raw)
+	}
+	if sv.mode == "" {
+		return "none"
+	}
+	if len(sv.params) == 0 {
+		return sv.mode
+	}
+	keys := make([]string, 0, len(sv.params))
+	for k := range sv.params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, len(keys))
+	for i, k := range keys {
+		pairs[i] = k + "=" + sv.params[k]
+	}
+	return sv.mode + ":" + strings.Join(pairs, ",")
+}
+
 func floatField(name, label, help, example string, apply func(*ConfigOverrides, *float64)) SweepField {
 	return SweepField{
 		Name: name, Label: label, Kind: SweepKindFloat, Help: help,
@@ -160,6 +305,9 @@ func floatField(name, label, help, example string, apply func(*ConfigOverrides, 
 // "1.0" vs "1", "8" vs "08". Raw text is returned for free-form kinds.
 func (f SweepField) canonical(raw string) string {
 	v := strings.TrimSpace(raw)
+	if f.canon != nil {
+		return f.canon(v)
+	}
 	switch f.Kind {
 	case SweepKindInt:
 		n, err := strconv.Atoi(v)
@@ -207,8 +355,20 @@ var sweepFields = map[string]SweepField{
 		func(o *ConfigOverrides, v *string) { o.GPUAssign = v }),
 	"tensor_split": strField("tensor_split", "Tensor Split", "Proportional split across GPUs, e.g. 1,1.", "1,1|3,1",
 		func(o *ConfigOverrides, v *string) { o.TensorSplit = v }),
-	"spec_type": strField("spec_type", "Speculative Decoding", "Speculative decoding mode.", "none,draft-mtp",
-		func(o *ConfigOverrides, v *string) { o.SpecType = v }),
+	// A value is either a bare mode name, "none" (an explicit
+	// "speculative decoding off" — a blank value would be dropped as
+	// "use the model's saved setting"), or a mode with parameter
+	// settings in the encoded form "mode:draft_max=8,draft_p_min=0.9".
+	// The form builds the encoded values from the expandable parameter
+	// sections under each mode's checkbox; parseSpecValue is the single
+	// parser for all three shapes.
+	"spec_type": {
+		Name: "spec_type", Label: "Speculative Decoding", Kind: SweepKindStr,
+		Help:    "Speculative decoding mode. Select none to turn speculative decoding off for that cell; expand a mode to adjust its settings.",
+		Example: "none,draft-mtp", RestartsRouter: true, Separator: ";",
+		set:   applySpecValue,
+		canon: canonicalSpecValue,
+	},
 
 	// Sampling params ride along with each request, so sweeping them
 	// costs no router restarts.
@@ -406,16 +566,17 @@ func init() {
 	set("kv_cache_quant", true, choices(
 		"f16", "f16 (no quant)", "q8_0", "q8_0", "q4_0", "q4_0",
 	))
-	// No empty choice: a blank value already means "use the model's saved
-	// setting", so an "off" entry would be dropped as if unset.
+	// "none" (not an empty value, which would be dropped as unset) is the
+	// explicit off entry; the field's set function maps it to "".
 	set("spec_type", false, choices(
+		"none", "Off (no speculative decoding)",
 		"draft", "Draft Model", "draft-mtp", "MTP (self-speculation)",
 		"ngram-simple", "N-gram Simple", "ngram-cache", "N-gram Cache",
 		"ngram-map-k", "N-gram Map-K", "ngram-map-k4v", "N-gram Map-K4V",
 		"ngram-mod", "N-gram Mod",
 	))
 	set("temperature", true, choices("0", "0 (greedy)", "0.7", "0.7", "1.0", "1.0"))
-	set("top_p", true, choices("0.9", "0.9", "0.95", "0.95", "1.0", "1.0"))
+	set("top_p", true, choices("0.9", "0.9", "0.95", "0.95", "1.0", "1.0 (off)"))
 	set("top_k", true, choices("20", "20", "40", "40", "0", "0 (disabled)"))
 	set("min_p", true, choices("0", "0", "0.05", "0.05", "0.1", "0.1"))
 	set("repeat_penalty", true, choices("1.0", "1.0 (off)", "1.05", "1.05", "1.1", "1.1"))
@@ -431,6 +592,24 @@ func init() {
 	ts2 := sweepFields["tensor_split"]
 	ts2.FreeText = true
 	sweepFields["tensor_split"] = ts2
+
+	// Each speculative mode choice carries its tunable parameters (the
+	// same set with the same recommended defaults as the model config
+	// form), rendered as an expandable section under its checkbox. The
+	// choice's submitted value is pre-encoded with those defaults —
+	// selecting a mode in a job then behaves exactly like selecting it
+	// on the model config form, and what the inputs show is what
+	// submits. Editing an input re-encodes the value in the browser.
+	st := sweepFields["spec_type"]
+	for i := range st.Choices {
+		mode := st.Choices[i].Value
+		st.Choices[i].Params = models.SpecModeParams(mode)
+		if len(st.Choices[i].Params) > 0 {
+			st.Choices[i].Mode = mode
+			st.Choices[i].Value = encodeSpecValue(mode, st.Choices[i].Params)
+		}
+	}
+	sweepFields["spec_type"] = st
 }
 
 // SplitParams turns the unified "parameter → selected values" shape the
@@ -517,6 +696,13 @@ func MergeOverrides(base, derived *ConfigOverrides) *ConfigOverrides {
 	return &out
 }
 
+// specParamTags are ConfigOverrides fields expressible through
+// spec_type's encoded values rather than registry entries of their own.
+var specParamTags = map[string]bool{
+	"draft_max": true, "draft_min": true, "draft_p_min": true,
+	"ngram_size_n": true, "ngram_size_m": true,
+}
+
 // IsSweepable reports whether a parameter has a form control, i.e.
 // whether params can express it.
 func IsSweepable(field string) bool {
@@ -533,7 +719,10 @@ func KeepUnsweepable(o *ConfigOverrides) *ConfigOverrides {
 		return nil
 	}
 	// JSON tags are the registry keys, so a field is sweepable exactly
-	// when its tag names a registry entry.
+	// when its tag names a registry entry — with one addition: the
+	// speculative parameters have no registry entries of their own but
+	// ARE expressible through spec_type's encoded values, so params own
+	// them too and they must not carry through an edit.
 	var out ConfigOverrides
 	v := reflect.ValueOf(*o)
 	t := v.Type()
@@ -544,7 +733,7 @@ func KeepUnsweepable(o *ConfigOverrides) *ConfigOverrides {
 			continue
 		}
 		tag := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
-		if IsSweepable(tag) {
+		if IsSweepable(tag) || specParamTags[tag] {
 			continue
 		}
 		dst.Field(i).Set(v.Field(i))

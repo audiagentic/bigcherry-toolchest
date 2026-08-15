@@ -1,6 +1,7 @@
 package benchmark
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -169,8 +170,9 @@ func TestSweepFieldOrdering(t *testing.T) {
 	}
 }
 
-// A draft model path is a thing to select, not a knob to tune, and it
-// was the only parameter whose values were filesystem paths.
+// A draft model path is a thing to select, not a value to tune, and it
+// is the one override with no form control: the draft mode runs against
+// the path in the model's saved config.
 func TestDraftModelPathIsNotSweepable(t *testing.T) {
 	if _, ok := LookupSweepField("draft_model_path"); ok {
 		t.Error("draft_model_path should not be offered as a tunable parameter")
@@ -302,10 +304,14 @@ func TestOverrideKeyTreatsEmptyAsNil(t *testing.T) {
 
 // Params own every parameter they can express, including by omission —
 // otherwise an override supplied alongside them can never be cleared.
+// The speculative parameters are expressible through spec_type's
+// encoded values, so they must not carry through; draft_model_path has
+// no form control and must.
 func TestKeepUnsweepableDropsExpressibleFields(t *testing.T) {
 	ngl := 40
+	dm := 8
 	path := "/models/draft.gguf"
-	got := KeepUnsweepable(&ConfigOverrides{GPULayers: &ngl, DraftModelPath: &path})
+	got := KeepUnsweepable(&ConfigOverrides{GPULayers: &ngl, DraftMax: &dm, DraftModelPath: &path})
 
 	if got == nil {
 		t.Fatal("the unsweepable field should have been kept")
@@ -313,8 +319,23 @@ func TestKeepUnsweepableDropsExpressibleFields(t *testing.T) {
 	if got.GPULayers != nil {
 		t.Error("gpu_layers is expressible via params and must not carry through")
 	}
+	if got.DraftMax != nil {
+		t.Error("draft_max is expressible via spec_type values and must not carry through")
+	}
 	if got.DraftModelPath == nil || *got.DraftModelPath != path {
 		t.Error("draft_model_path has no form control and must carry through")
+	}
+
+	// Coverage guard: every ConfigOverrides field must be accounted for —
+	// a registry entry, the spec-parameter set, or the one deliberate
+	// carry-through — so a new field cannot silently do the wrong thing.
+	accounted := map[string]bool{"draft_model_path": true}
+	tp := reflect.TypeOf(ConfigOverrides{})
+	for i := 0; i < tp.NumField(); i++ {
+		tag := strings.Split(tp.Field(i).Tag.Get("json"), ",")[0]
+		if !IsSweepable(tag) && !specParamTags[tag] && !accounted[tag] {
+			t.Errorf("ConfigOverrides field %s (%s) is not accounted for in the sweep registry", tp.Field(i).Name, tag)
+		}
 	}
 }
 
@@ -453,5 +474,99 @@ func TestPromptsOfDifferentSizesDoNotSharePrefix(t *testing.T) {
 	}
 	if div > 64 {
 		t.Errorf("prompts share their first %d chars; the overlap should be a few tokens at most", div)
+	}
+}
+
+// "none" is the explicit speculative-decoding-off value: it must survive
+// SplitParams (a literal empty string would be dropped as unset) and map
+// to an explicit empty SpecType override.
+func TestSpecTypeNoneMapsToExplicitOff(t *testing.T) {
+	// Single value: fixed override.
+	o, axes, err := SplitParams(map[string][]string{"spec_type": {"none"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(axes) != 0 {
+		t.Fatalf("single value should fix, not sweep: %+v", axes)
+	}
+	if o == nil || o.SpecType == nil || *o.SpecType != "" {
+		t.Fatalf("none should become an explicit empty SpecType override, got %+v", o)
+	}
+
+	// Two values: a sweep comparing off against a mode in one job.
+	_, axes, err = SplitParams(map[string][]string{"spec_type": {"none", "draft-mtp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(axes) != 1 || len(axes[0].Values) != 2 {
+		t.Fatalf("none+mode should sweep with both values kept: %+v", axes)
+	}
+
+	// And the axis value applies per cell the same way.
+	var cell ConfigOverrides
+	f, _ := LookupSweepField("spec_type")
+	if err := f.set(&cell, "none"); err != nil {
+		t.Fatal(err)
+	}
+	if cell.SpecType == nil || *cell.SpecType != "" {
+		t.Fatalf("axis value none should apply as explicit off, got %+v", cell.SpecType)
+	}
+}
+
+// A mode's parameters travel inside the spec_type value and reach the
+// snapshot, so a job can tune a mode, not just select it. Parameters
+// the value doesn't mention inherit the model's saved setting.
+func TestSpecParamsFlowToSnapshot(t *testing.T) {
+	o, _, err := SplitParams(map[string][]string{
+		"spec_type": {"draft-mtp:draft_max=6,draft_p_min=0.75"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := applyOverrides(ConfigSnapshot{DraftMax: 16, DraftMin: 3}, o)
+	if snap.SpecType != "draft-mtp" || snap.DraftMax != 6 || snap.DraftPMin != "0.75" {
+		t.Fatalf("spec params did not reach the snapshot: %+v", snap)
+	}
+	if snap.DraftMin != 3 {
+		t.Errorf("unmentioned parameter should keep the saved value, got %d", snap.DraftMin)
+	}
+}
+
+// parseSpecValue is the single parser for all three value shapes, and
+// canonicalization makes parameter order and spacing irrelevant so
+// dedup can't be fooled.
+func TestSpecValueParsingAndCanonical(t *testing.T) {
+	for _, bad := range []string{
+		"warp-drive",                // unknown mode
+		"draft-mtp:ngram_size_n=12", // key not valid for the mode
+		"draft-mtp:draft_max=lots",  // non-integer
+		"draft:draft_p_min=high",    // non-number
+		"draft-mtp:draft_max",       // not key=value
+	} {
+		if _, err := parseSpecValue(bad); err == nil {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+
+	f, _ := LookupSweepField("spec_type")
+	a := f.canonical(" draft-mtp: draft_p_min=0.75 , draft_max=6 ")
+	b := f.canonical("draft-mtp:draft_max=6,draft_p_min=0.75")
+	if a != b {
+		t.Errorf("canonical forms differ: %q vs %q", a, b)
+	}
+	if got := f.canonical("none"); got != "none" {
+		t.Errorf("canonical none = %q", got)
+	}
+
+	// Two spellings of the same value dedup to one, so it fixes rather
+	// than sweeps.
+	_, axes, err := SplitParams(map[string][]string{
+		"spec_type": {"draft-mtp:draft_max=6,draft_p_min=0.75", "draft-mtp: draft_p_min=0.75 ,draft_max=6"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(axes) != 0 {
+		t.Errorf("equivalent values should dedup to a fixed override, got axes %+v", axes)
 	}
 }
