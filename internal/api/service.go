@@ -736,27 +736,11 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 		// GPU assignment options
 		metrics := s.monitor.Current()
 		numGPUs := len(metrics.GPU)
-		gpuOptions := models.GPUAssignOptions(numGPUs)
+		gpuOptions := models.GPUAssignOptions(numGPUs, igpuFlags(metrics.GPU))
 
-		// Migration: map legacy configs onto the unified dropdown values.
-		if cfg.GPUAssign == "" || cfg.GPUAssign == "tensor" {
-			switch {
-			case cfg.SplitMode == "tensor":
-				// Derive N from tensor-split (count of non-zero entries); fall
-				// back to all GPUs if not set.
-				n := countNonZeroSplit(cfg.TensorSplit)
-				if n <= 0 || n > numGPUs {
-					n = numGPUs
-				}
-				if n >= 2 && n < numGPUs {
-					cfg.GPUAssign = fmt.Sprintf("tensor-%d", n)
-				} else {
-					cfg.GPUAssign = fmt.Sprintf("tensor-%d", numGPUs)
-				}
-			case cfg.TensorSplit != "":
-				cfg.GPUAssign = "custom"
-			}
-		}
+		// Migration: map legacy and pre-iGPU-audit configs onto the
+		// current dropdown values.
+		migrateGPUAssign(cfg, gpuOptions, numGPUs)
 
 		// Mark disabled/recommended options
 		if numGPUs > 0 && model != nil {
@@ -809,6 +793,7 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			IsEmbedding         bool
 			DraftCandidates     []models.DraftCandidate
 			GPUOptions          []models.GPUOption
+			GPUAssignWarning    string
 			NumGPUs             int
 			SamplingPresets     []models.SamplingPreset
 			SamplingPresetsJSON string
@@ -824,6 +809,7 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			IsEmbedding:         isEmbedding,
 			DraftCandidates:     draftCandidates,
 			GPUOptions:          gpuOptions,
+			GPUAssignWarning:    s.gpuAssignWarning(cfg, metrics.GPU),
 			NumGPUs:             numGPUs,
 			SamplingPresets:     samplingPresets,
 			SamplingPresetsJSON: samplingPresetsJSON,

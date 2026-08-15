@@ -65,6 +65,11 @@ type Builder struct {
 
 	refsMu     sync.Mutex
 	cachedRefs []string
+
+	// Saved build-flag presets (see flag_presets.go), loaded lazily.
+	fpMu        sync.Mutex
+	fpLoaded    bool
+	flagPresets []FlagPreset
 }
 
 // NewBuilder creates a Builder and loads persisted build state.
@@ -424,6 +429,33 @@ func (b *Builder) runBuild(ctx context.Context, prof BuildProfile, srcDir string
 	// a compatible side-by-side g++ and hand it to cmake as the host
 	// compiler — without this, build fails on "unsupported GNU version".
 	buildEnv := os.Environ()
+	// Arch-family distros install ROCm under /opt/rocm without adding it
+	// to PATH (Fedora/Debian symlink the tools into /usr/bin), so cmake's
+	// HIP compiler probe and rocm_agent_enumerator fail even with ROCm
+	// fully installed. Put the detected tool directory on PATH for the
+	// build; harmless when it's already there.
+	//
+	// ROCM_PATH/HIP_PATH matter for the same layout: Arch's HIP clang
+	// lives at <root>/lib/llvm/bin, and its automatic ROCm detection
+	// walks up to <root>/lib instead of <root>. The HIP compiler-id link
+	// then fails with "unable to find -lamdhip64", cmake reports "The
+	// HIP compiler identification is unknown", and the HIP sources get
+	// compiled in CUDA mode — surfacing as "unsupported CUDA gpu
+	// architecture: gfxNNNN". Point clang at the real root (mirroring
+	// the ENV block in Dockerfile.rocm); values already exported around
+	// the service win, matching applyExtraEnv's precedence rule.
+	if prof.Backend == "rocm" {
+		if tool := FindROCmTool("hipconfig"); tool != "" {
+			binDir := filepath.Dir(tool)
+			buildEnv = prependPath(buildEnv, binDir)
+			root := filepath.Dir(binDir)
+			buildEnv = setEnvDefault(buildEnv, "ROCM_PATH", root)
+			buildEnv = setEnvDefault(buildEnv, "HIP_PATH", root)
+			if devlib := filepath.Join(root, "amdgcn", "bitcode"); dirExists(devlib) {
+				buildEnv = setEnvDefault(buildEnv, "HIP_DEVICE_LIB_PATH", devlib)
+			}
+		}
+	}
 	if prof.Backend == "cuda" {
 		if nvcc, dir := findNVCC(); nvcc != "" {
 			alreadySet := false
@@ -883,6 +915,23 @@ func findNVCC() (string, string) {
 		}
 	}
 	return "", ""
+}
+
+// setEnvDefault returns env with KEY=value appended unless KEY is
+// already present — an inherited value stays authoritative.
+func setEnvDefault(env []string, key, value string) []string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			return env
+		}
+	}
+	return append(env, key+"="+value)
+}
+
+// dirExists reports whether path exists and is a directory.
+func dirExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
 }
 
 // prependPath returns env with dir prepended to PATH (no-op if dir is

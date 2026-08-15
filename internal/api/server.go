@@ -351,6 +351,9 @@ func (s *Server) buildRouter() chi.Router {
 			r.Get("/backends", s.handleListBackends)
 			r.Get("/refs", s.handleListRefs)
 			r.Get("/options", s.handleProfileOptions)
+			r.Get("/flag-presets", s.handleFlagPresetRow)
+			r.Post("/flag-presets", s.handleSaveFlagPreset)
+			r.Post("/flag-presets/delete", s.handleDeleteFlagPreset)
 			r.Get("/active-log", s.handleActiveBuildLog)
 			r.Get("/{id}/logs", s.handleBuildLogs)
 			r.Get("/{id}/info", s.handleBuildInfo)
@@ -518,6 +521,11 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 		AutoStart        bool
 		RuntimeEnvOpts   []config.RuntimeEnvOption
 		RuntimeEnv       map[string]string
+		RuntimeEnvExtra  string
+		EnvBackends      []string
+		ActiveBackend    string
+		EnvWarnings      []string
+		EffectiveEnv     []envLine
 	}{
 		pageData:         pageData{Title: "Settings", Nav: "settings"},
 		ProxyEndpoint:    proxyEndpoint,
@@ -532,6 +540,11 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 		AutoStart:        s.cfg.AutoStart,
 		RuntimeEnvOpts:   config.RuntimeEnvOptions(),
 		RuntimeEnv:       s.cfg.RuntimeEnv,
+		RuntimeEnvExtra:  s.cfg.RuntimeEnvExtra,
+		EnvBackends:      config.RuntimeEnvBackends(),
+		ActiveBackend:    s.activeBackend(),
+		EnvWarnings:      s.cfg.EnvSet().Warnings(),
+		EffectiveEnv:     s.effectiveEnvLines(),
 	}
 	s.render(w, "settings.html", data)
 }
