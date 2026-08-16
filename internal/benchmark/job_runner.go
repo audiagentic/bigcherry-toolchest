@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/tmac1973/llama-toolchest/internal/evaluate"
 	"github.com/tmac1973/llama-toolchest/internal/monitor"
 )
 
@@ -52,6 +54,13 @@ type JobEnv interface {
 
 	// ClearEphemeralConfig drops any active override and restarts the
 	// router onto saved config. Must be a no-op when nothing is active.
+	//
+	// Eval-stop case: when the job stopped the router for a capability
+	// cell via StopRouterForEval, "not running" means THIS job stopped
+	// it, not the user — ClearEphemeralConfig restarts the router
+	// (restoring the pre-job state) instead of leaving it stopped. Only
+	// when the router was already stopped before the job started does
+	// the user-stop semantics apply and cleanup leave it stopped.
 	ClearEphemeralConfig(ctx context.Context) error
 
 	// ResolveBuild returns the snapshot for buildID. Empty struct means
@@ -73,14 +82,73 @@ type JobEnv interface {
 	// cache. Forwarded as HF_HOME so the tokenizer downloads once
 	// and is reused across every benchmark in a batch.
 	HFCacheDir() string
+
+	// StopRouterForEval stops llama-server so an evaluation can own the
+	// GPU. It records that THIS JOB stopped a RUNNING router — when the
+	// router was already stopped (by the user, before the job) nothing
+	// is recorded, so cleanup will not start a server the user had
+	// turned off. Idempotent.
+	StopRouterForEval(ctx context.Context) error
+
+	// EvalBinary returns the llama-perplexity path for a build, or an
+	// error naming the fix ("rebuild") when the build predates the
+	// binary's installation.
+	EvalBinary(buildID string) (string, error)
+
+	// EnsureEvalData downloads/verifies the dataset for a mode.
+	EnsureEvalData(ctx context.Context, mode evaluate.Mode) (path string, err error)
+
+	// ResolveKLReference picks the reference for a model: the override
+	// when set, else the largest installed quant (by SizeBytes) sharing
+	// the model's HF repo. Returns an error when no distinct candidate
+	// exists (the model is the only installed quant of its repo).
+	ResolveKLReference(modelID, overrideID string) (ModelInfo, error)
+
+	// EvalFlags builds the complete llama-perplexity flag list for a
+	// cell: merges the snapshot onto the model's saved config
+	// (applySnapshotToConfig), validates the merged config the same
+	// way ApplyEphemeralConfig does (ValidateBatchSizes — a -ub > -b
+	// sweep fails with the named message, not the loader's raw error),
+	// resolves GPU assignment (resolveGPUAssignment), fills
+	// evaluate.SnapshotSubset (plain fields + PlacementFlags via
+	// models.GPUPlacementFlags with the build's backend), and returns
+	// evaluate.MapConfigFlags's output.
+	// The single place config becomes CLI flags — phase 01 step 2.
+	EvalFlags(modelID string, snap ConfigSnapshot, buildID string) ([]string, error)
+
+	// EnsureKLBase returns the cached logits path for (reference,
+	// dataset, chunks, ctx), generating it first when absent. The
+	// progress callback receives plain-language status lines; the
+	// runner wires it to the run's ProgressDetail through the store —
+	// the same transport performance runs already use — which is what
+	// makes generation the overview's "visible job step". Progress
+	// SOURCE: the generation's own output is newline-less fragments, so
+	// the implementation polls the growing .kld.partial file's size on
+	// a ticker and reports "generating reference logits: 2.1 of
+	// ~4.6 GiB" against the phase 02 estimate — no output parsing. On
+	// failure or cancel the partial is deleted, never cached.
+	// Generation takes the reference's own placement, threads and GPU
+	// layers — so a large reference is not pushed onto the CPU — but
+	// every setting that changes the arithmetic from underTest, the
+	// config the comparison cell will run at (EvalReferenceConfig).
+	// Both sides must be measured the same way or the difference is
+	// not attributable to the compression being studied. Enforces the
+	// phase 02 disk guard before generating.
+	EnsureKLBase(ctx context.Context, ref ModelInfo, underTest ConfigSnapshot, chunks int, buildID string, progress func(string)) (string, error)
+
+	// RunEval executes one evaluation and returns parsed scores.
+	RunEval(ctx context.Context, spec evaluate.Spec) (evaluate.Result, error)
 }
 
 // ModelInfo bundles registry data for a single model so the JobRunner
 // doesn't have to know about the models package.
 type ModelInfo struct {
+	ID          string // registry model ID
 	HFRepoID    string // model.ModelID — passed to llama-benchy --tokenizer
 	Quant       string
 	SizeGiB     float64
+	SizeBytes   int64          // kept alongside the display-oriented SizeGiB
+	FilePath    string         // path to the GGUF on disk
 	DisplayName string         // short, human-readable name for the run
 	RouterName  string         // identifier the router responds to
 	Config      ConfigSnapshot // saved baseline; ConfigOverrides overlay on this
@@ -242,11 +310,26 @@ func (q *JobQueue) run(ctx context.Context, job BenchmarkJob, rj *runningJob) {
 		cell.Error = ""
 		q.store.SaveJob(job)
 
-		if err := q.runCell(ctx, &job, cell, &prevBuildID, &lastApplied); err != nil {
+		cellErr := q.runCell(ctx, &job, cell, &prevBuildID, &lastApplied)
+
+		// A capability cell ran StopRouterForEval (or will on retry), so
+		// the router is down and no config is "applied" anymore.
+		// Invalidate both caches so the NEXT PERFORMANCE cell
+		// unconditionally re-enters EnsureBuildActive/ApplyEphemeralConfig
+		// and starts the router back up. Only performance cells ever read
+		// those caches — capability cells never call EnsureBuildActive —
+		// so consecutive capability cells run back-to-back with the
+		// router simply staying stopped: no start/stop churn.
+		if GetPreset(cell.Preset).EffectiveSource() == PresetSourceCapability {
+			prevBuildID = ""
+			lastApplied = appliedConfig{}
+		}
+
+		if cellErr != nil {
 			cell.Status = CellStatusFailed
-			cell.Error = err.Error()
+			cell.Error = cellErr.Error()
 			q.store.SaveJob(job)
-			slog.Warn("job cell failed", "job", job.ID, "model", cell.ModelID, "build", cell.BuildID, "preset", cell.Preset, "error", err)
+			slog.Warn("job cell failed", "job", job.ID, "model", cell.ModelID, "build", cell.BuildID, "preset", cell.Preset, "error", cellErr)
 			continue
 		}
 
@@ -317,14 +400,29 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 		return fmt.Errorf("resolve cell overrides: %w", err)
 	}
 
+	preset := GetPreset(cell.Preset)
+	isCapability := preset.EffectiveSource() == PresetSourceCapability
+
+	// The runnable check applies to every cell; starting the router is
+	// performance-only. The two used to share one build-change guard,
+	// split so a capability cell verifies the build but never calls
+	// EnsureBuildActive — starting llama-server just to stop it again
+	// would add a full router restart + health wait between every pair
+	// of consecutive capability cells.
 	if cell.BuildID != *prevBuildID {
 		if err := q.env.CheckBuildRunnable(ctx, cell.BuildID); err != nil {
 			return fmt.Errorf("build %s not runnable on this host: %w", cell.BuildID, err)
 		}
+	}
+	if !isCapability && cell.BuildID != *prevBuildID {
 		if err := q.env.EnsureBuildActive(ctx, cell.BuildID, cellOv != nil); err != nil {
 			return fmt.Errorf("activate build %s: %w", cell.BuildID, err)
 		}
 		*prevBuildID = cell.BuildID
+	}
+
+	if isCapability {
+		return q.runCapabilityCell(ctx, job, cell, preset, cellOv)
 	}
 
 	modelInfo, err := q.env.ResolveModel(cell.ModelID)
@@ -335,7 +433,6 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 	if buildSnap.ID == "" {
 		return fmt.Errorf("build %s no longer exists", cell.BuildID)
 	}
-	preset := GetPreset(cell.Preset)
 
 	cfg := applyOverrides(modelInfo.Config, cellOv)
 
@@ -412,6 +509,202 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 	return nil
 }
 
+// runCapabilityCell drives one capability cell (a preset whose
+// EffectiveSource is "capability") to completion: llama-perplexity runs
+// directly against the model, so the router is stopped for the cell's
+// duration.
+//
+// Deliberately unlike the performance path, which creates its run last,
+// the run is created and saved FIRST (status running): the KL base
+// generation's progress lands on the run's ProgressDetail, which must
+// exist and be stored before generation starts. The performance path
+// finalizes its run inside Runner.Run, which this branch bypasses — so
+// this branch owns the run's WHOLE lifecycle explicitly, on every exit:
+//
+//   - any sub-step failure (a: binary, b: dataset, c: reference
+//     resolve/generation, e: flags, f: eval) sets StatusFailed + Error
+//     and saves;
+//   - success (f) sets StatusCompleted and saves;
+//   - the reference-model skip (c) DELETES the pre-created run and
+//     clears cell.BenchmarkRunID, restoring "skipped cell has no run".
+//
+// No exit may leave a stored StatusRunning run: the run list renders
+// those as live and retry would orphan them.
+func (q *JobQueue) runCapabilityCell(ctx context.Context, job *BenchmarkJob, cell *JobCell, preset Preset, cellOv *ConfigOverrides) error {
+	modelInfo, err := q.env.ResolveModel(cell.ModelID)
+	if err != nil {
+		return fmt.Errorf("resolve model %s: %w", cell.ModelID, err)
+	}
+	buildSnap := q.env.ResolveBuild(cell.BuildID)
+	if buildSnap.ID == "" {
+		return fmt.Errorf("build %s no longer exists", cell.BuildID)
+	}
+
+	// The recorded config and the flags that ran share this one source:
+	// the same snapshot goes on the run and into EvalFlags, which is
+	// what makes a swept gpu_assign measurably reach llama-perplexity —
+	// the config-fidelity criterion. EvalConfigSnapshot, not
+	// applyOverrides: an evaluation defaults to an f16 KV cache so its
+	// score is comparable, unless the job asked for a specific one.
+	cfg := EvalConfigSnapshot(modelInfo.Config, cellOv)
+
+	run := BenchmarkRun{
+		ID:           newRunID(cell.Attempt),
+		JobID:        job.ID,
+		CreatedAt:    time.Now(),
+		Status:       StatusRunning,
+		ModelID:      cell.ModelID,
+		ModelName:    modelInfo.DisplayName,
+		Quant:        modelInfo.Quant,
+		SizeGiB:      modelInfo.SizeGiB,
+		Config:       cfg,
+		BuildID:      buildSnap.ID,
+		BuildRef:     buildSnap.GitRef,
+		BuildProfile: buildSnap.Profile,
+		Build:        buildSnap,
+		GPUs:         GPUSnapshotsFromMetrics(q.env.CurrentMetrics()),
+		Preset:       preset.Name,
+		SweepValues:  cell.SweepValues,
+	}
+	q.store.Save(run)
+	cell.BenchmarkRunID = run.ID
+	q.store.SaveJob(*job)
+
+	fail := func(format string, args ...any) error {
+		run.Status = StatusFailed
+		run.Error = fmt.Sprintf(format, args...)
+		run.ProgressDetail = ""
+		q.store.Save(run)
+		return errors.New(run.Error)
+	}
+
+	// a. The build must carry the evaluation binary. Missing means the
+	// build predates the binary's installation; the message names the
+	// fix.
+	binary, err := q.env.EvalBinary(cell.BuildID)
+	if err != nil {
+		return fail("capability cell cannot run: %v", err)
+	}
+
+	// d. Stop the router before any GPU work. Dataset downloads don't
+	// need it, but base generation and the eval do; stopping early keeps
+	// the ordering simple and the window deterministic.
+	if err := q.env.StopRouterForEval(ctx); err != nil {
+		return fail("stop the router for the evaluation: %v", err)
+	}
+
+	// b. The dataset the mode runs over, downloaded/verified on first
+	// use.
+	datasetPath, err := q.env.EnsureEvalData(ctx, preset.EvalMode)
+	if err != nil {
+		return fail("prepare the %s dataset: %v", preset.EvalMode, err)
+	}
+
+	// c. KL only: resolve the reference (the job's override when set,
+	// else the largest installed quant of the model's own repo) and make
+	// sure its cached logits exist.
+	var klBasePath, referenceIdentity, referenceLabel string
+	if preset.EvalMode == evaluate.ModeKLDiv {
+		ref, err := q.env.ResolveKLReference(cell.ModelID, job.KLReference)
+		if err != nil {
+			return fail("resolve the KL reference for %s: %v", modelInfo.DisplayName, err)
+		}
+		if ref.ID == cell.ModelID {
+			// The reference model's own cell (the largest quant's own
+			// cell in an all-quants job — the flagship flow): its answer
+			// is known (zero), so an expensive eval is waste, and a
+			// refusal would break the primary use case. Skip, don't
+			// fail: mark completed with a reason, delete the
+			// pre-created run, and keep the cell run-free.
+			//
+			// Deliberately NOT CellStatusSkipped — that status means
+			// "job canceled before this cell ran" and such cells are
+			// re-run on retry, which is correct for them and wrong for
+			// a reference cell. NOT a reuse of Error either (retry and
+			// error-styling collisions). Completed-with-reason means the
+			// existing loop short-circuit, retry selection, and the
+			// Done/Total counting all behave with zero changes.
+			cell.SkipReason = "this is the reference model — its difference from itself is zero"
+			if err := q.store.Delete(run.ID); err != nil {
+				slog.Warn("failed to delete the pre-created run for a skipped reference cell",
+					"job", job.ID, "run", run.ID, "error", err)
+			}
+			cell.BenchmarkRunID = ""
+			q.store.SaveJob(*job)
+			return nil
+		}
+		referenceIdentity = ref.ID
+		// The ID is the stable identity; the label is what the score
+		// cell reads out. Without it every KL result renders as
+		// "(vs unsloth--Qwen3.5-9B-MTP-GGUF--Qwen3.5-9B-IQ4_NL)".
+		referenceLabel = ref.DisplayName
+		if ref.Quant != "" {
+			referenceLabel += " (" + ref.Quant + ")"
+		}
+		// Generation runs with the reference model loaded (the router is
+		// already stopped — the d ordering above). Its progress lands on
+		// the stored run's ProgressDetail through the store, the same
+		// transport performance runs use.
+		// cfg, not the reference's own config: both sides of the
+		// comparison must be measured the same way (EvalReferenceConfig).
+		klBasePath, err = q.env.EnsureKLBase(ctx, ref, cfg, preset.EvalChunks, cell.BuildID, func(line string) {
+			run.ProgressDetail = line
+			q.store.Save(run)
+		})
+		if err != nil {
+			return fail("KL reference logits for %s: %v", ref.DisplayName, err)
+		}
+	}
+
+	// e. The complete flag list for this cell's config: the single place
+	// config becomes CLI flags.
+	flags, err := q.env.EvalFlags(cell.ModelID, cfg, cell.BuildID)
+	if err != nil {
+		return fail("build the evaluation flags: %v", err)
+	}
+
+	// f. Run the evaluation and land the parsed scores on the run.
+	// Timings fields stay zero; the detail view renders them as absent.
+	evalStart := time.Now()
+	spec := evaluate.Spec{
+		Binary:      binary,
+		ModelPath:   modelInfo.FilePath,
+		Mode:        preset.EvalMode,
+		DatasetPath: datasetPath,
+		Tasks:       preset.EvalTasks,
+		Chunks:      preset.EvalChunks,
+		KLBasePath:  klBasePath,
+		Flags:       flags,
+	}
+	result, err := q.env.RunEval(ctx, spec)
+	if err != nil {
+		// The engine's error already carries the tail of the tool's
+		// output — keep it in the run's error.
+		return fail("%s: %v", preset.EvalMode, err)
+	}
+
+	// EvalScores is an alias for evaluate.Result, so the engine's output
+	// IS the stored value — no field-by-field copy to fall out of step
+	// with the schema. Only the reference identity is the runner's to
+	// add.
+	result.Reference = referenceIdentity
+	result.ReferenceLabel = referenceLabel
+	run.Eval = &result
+	if w := evalComparabilityWarning(cfg); w != "" {
+		run.Warnings = append(run.Warnings, w)
+	}
+	run.Status = StatusCompleted
+	// From when the EVALUATION started, not from when the cell's run
+	// record was created: dataset download and reference-logits
+	// generation happen in between and can take longer than the
+	// evaluation itself, which would make the recorded duration a
+	// measure of the prep rather than the work.
+	run.DurationMs = time.Since(evalStart).Milliseconds()
+	run.ProgressDetail = ""
+	q.store.Save(run)
+	return nil
+}
+
 // samplingFromOverrides extracts the per-request generation settings
 // from a job's overrides. These deliberately bypass ConfigSnapshot:
 // llama-server takes them per chat-completion request, not from the
@@ -433,6 +726,83 @@ func samplingFromOverrides(o *ConfigOverrides) SamplingParams {
 
 // applyOverrides returns base with non-nil ConfigOverrides fields
 // applied on top. A nil overrides argument returns base unchanged.
+// EvalConfigSnapshot returns the config a CAPABILITY cell runs at:
+// applyOverrides, then the KV cache type reset to the default f16
+// unless the job asked for a specific one.
+//
+// A quantized KV cache changes the answer, not the speed. Inheriting a
+// model's saved kv_cache_quant would mean every perplexity figure this
+// tool produces was measured through whatever cache type the user
+// happened to pick for chat — and those numbers are presented, in the
+// preset descriptions and the help page, as comparable to llama.cpp's
+// published wikitext-2 figures, which are not. So the evaluation
+// default is f16 and the measurement is comparable.
+//
+// Sweeping or fixing kv_cache_quant still works and still reaches the
+// command line: an explicit override is the user asking to measure that
+// cache type's quality cost, which is a good question. The rule is only
+// that they have to ask.
+//
+// The returned snapshot is what the run RECORDS as well as what runs,
+// so the detail view's KV Quant column shows the cache the score was
+// actually measured through.
+func EvalConfigSnapshot(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
+	cfg := applyOverrides(base, overrides)
+	if overrides == nil || overrides.KVCacheQuant == nil {
+		cfg.KVCacheQuant = ""
+	}
+	return cfg
+}
+
+// evalComparabilityWarning returns the note to attach to a capability
+// run whose settings make its score incomparable to figures measured
+// elsewhere, or "" when there is nothing to say.
+//
+// Today that is a compressed KV cache. An evaluation defaults to f16
+// (EvalConfigSnapshot) precisely so scores stay comparable, and a job
+// that sets kv_cache_quant is taken as asking to measure that cache
+// type's quality cost. The trap is that someone reusing their everyday
+// chat settings in a benchmark job is not asking that question at all,
+// and would otherwise get a number that looks publishable and is not.
+// The run says so rather than leaving the reader to notice the config
+// column.
+func evalComparabilityWarning(cfg ConfigSnapshot) string {
+	if cfg.KVCacheQuant == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"This score was measured with a compressed short-term memory cache (kv_cache_quant = %s), not the uncompressed f16 the evaluations default to. "+
+			"That changes the answer, not just the speed, so this number is NOT comparable to published figures or to scores from runs that used f16. "+
+			"It is still valid for comparing against other runs that used %s. Remove kv_cache_quant from the job to get a comparable score.",
+		cfg.KVCacheQuant, cfg.KVCacheQuant)
+}
+
+// EvalReferenceConfig returns the config the KL REFERENCE is measured
+// at: the reference model's own placement and performance settings,
+// with every setting that changes the ARITHMETIC taken from the model
+// under test instead.
+//
+// Both sides of a KL comparison have to be measured the same way, or
+// the difference is not attributable to the compression being studied.
+// The reference logits were previously generated at the reference's own
+// settings while the comparison ran at the cell's, so a job that set a
+// compressed KV cache produced a number mixing two effects — the weight
+// compression the user asked about, and a memory-cache difference
+// between the two sides — with nothing saying so.
+//
+// Placement, thread count and GPU layers stay with the reference: they
+// decide where and how fast it runs, not what it computes, and a large
+// reference must not be pushed onto the CPU because the model under
+// test was configured for a smaller card.
+func EvalReferenceConfig(ref, underTest ConfigSnapshot) ConfigSnapshot {
+	out := ref
+	out.KVCacheQuant = underTest.KVCacheQuant
+	out.FlashAttention = underTest.FlashAttention
+	out.BatchSize = underTest.BatchSize
+	out.UBatchSize = underTest.UBatchSize
+	return out
+}
+
 func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
 	if overrides == nil {
 		return base
@@ -509,11 +879,33 @@ func ExpandCells(modelIDs, buildIDs, presets []string) []JobCell {
 // reload while changing preset does not — so every preset for a given
 // config runs before the config changes again. Reversing those two would
 // multiply reloads by the preset count.
+//
+// Capability presets collapse: a capability cell runs only what
+// MapConfigFlags lets through, so when the job's sweeps vary parameters
+// that never reach the evaluation, each capability preset gets ONE cell
+// per distinct eval-reaching configuration, not one per swept value —
+// duplicate expensive cells reporting different labels for identical
+// runs is the mislabeled-results failure this package guards against
+// elsewhere. Performance presets keep the full fan-out from the same
+// job.
+//
+// Capability cells are also GROUPED LAST within each (build, model),
+// for the same restart-cost reason the rest of the ordering exists: a
+// capability cell stops the router and a performance cell needs it up,
+// so interleaving them pays a full stop-load-health-wait cycle at every
+// switch. Emitting them in two runs means a mixed job crosses that line
+// once per model instead of once per sweep combination.
 func ExpandCellsWithSweeps(modelIDs, buildIDs, presets []string, sweeps []SweepAxis) []JobCell {
 	combos := sweepCombinations(sweeps)
 	cells := make([]JobCell, 0, len(buildIDs)*len(modelIDs)*len(combos)*len(presets))
 	for _, b := range buildIDs {
 		for _, m := range modelIDs {
+			// One emitted eval config per capability preset for this
+			// (model, build): the first combo carrying a given
+			// eval-reaching configuration wins, later combos collapse
+			// onto it.
+			emitted := map[string]bool{}
+			var capabilityCells []JobCell
 			for _, combo := range combos {
 				for _, p := range presets {
 					cell := JobCell{
@@ -522,7 +914,29 @@ func ExpandCellsWithSweeps(modelIDs, buildIDs, presets []string, sweeps []SweepA
 						Preset:  p,
 						Status:  CellStatusPending,
 					}
-					if len(combo) > 0 {
+					if GetPreset(p).EffectiveSource() == PresetSourceCapability {
+						key := capabilityComboKey(p, combo)
+						if emitted[key] {
+							continue
+						}
+						emitted[key] = true
+						// Record only the eval-reaching values: the
+						// cell ran at those and only those, and two
+						// cells that differ in the excluded axes would
+						// be byte-identical invocations.
+						for k, v := range combo {
+							if f, ok := LookupSweepField(k); ok && f.AffectsEval {
+								if cell.SweepValues == nil {
+									cell.SweepValues = map[string]string{}
+								}
+								cell.SweepValues[k] = v
+							}
+						}
+						// Held back to the end of this (build, model) group
+						// so the router boundary is crossed once.
+						capabilityCells = append(capabilityCells, cell)
+						continue
+					} else if len(combo) > 0 {
 						// Copy: every cell owns its own map.
 						cell.SweepValues = make(map[string]string, len(combo))
 						for k, v := range combo {
@@ -532,9 +946,36 @@ func ExpandCellsWithSweeps(modelIDs, buildIDs, presets []string, sweeps []SweepA
 					cells = append(cells, cell)
 				}
 			}
+			cells = append(cells, capabilityCells...)
 		}
 	}
 	return cells
+}
+
+// capabilityComboKey renders a combo's eval-reaching point, namespaced by
+// preset, so the collapse dedups per capability preset. Unreachable sweep
+// fields are ignored by construction — the key IS the set of values that
+// reach the evaluation command line.
+func capabilityComboKey(preset string, combo map[string]string) string {
+	if len(combo) == 0 {
+		return preset
+	}
+	names := make([]string, 0, len(combo))
+	for k := range combo {
+		if f, ok := LookupSweepField(k); ok && f.AffectsEval {
+			names = append(names, k)
+		}
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteString(preset)
+	for _, n := range names {
+		b.WriteString(";")
+		b.WriteString(n)
+		b.WriteString("=")
+		b.WriteString(combo[n])
+	}
+	return b.String()
 }
 
 // sweepCombinations returns the Cartesian product of the sweep axes as

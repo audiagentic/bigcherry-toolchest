@@ -19,6 +19,7 @@ import (
 	"github.com/tmac1973/llama-toolchest/internal/benchmark"
 	"github.com/tmac1973/llama-toolchest/internal/builder"
 	"github.com/tmac1973/llama-toolchest/internal/config"
+	"github.com/tmac1973/llama-toolchest/internal/evaluate"
 	"github.com/tmac1973/llama-toolchest/internal/huggingface"
 	"github.com/tmac1973/llama-toolchest/internal/models"
 	"github.com/tmac1973/llama-toolchest/internal/monitor"
@@ -214,10 +215,18 @@ func NewServer(cfg *config.Config, configPath string) *Server {
 	return s
 }
 
-// parseTemplates parses the layout+partials as a base, then clones it
-// per page so each page's {{define "content"}} doesn't collide.
-func (s *Server) parseTemplates() map[string]*template.Template {
-	funcMap := template.FuncMap{
+// templateFuncs builds the custom function map the templates are
+// parsed with. Split out of parseTemplates so tests can parse the same
+// template set with the same functions instead of a hand-copied
+// duplicate: a template referencing a func the copy lacked failed the
+// WHOLE partial set's parse, which surfaced as a dozen unrelated render
+// tests breaking at once and left renderPartial silently writing
+// nothing in production.
+//
+// Only vramFit reads live server state; a test may replace that one and
+// inherit the rest.
+func (s *Server) templateFuncs() template.FuncMap {
+	return template.FuncMap{
 		"divGB": models.BytesToGiB,
 		// cssID sanitizes a string so it's safe to use as both an HTML id
 		// attribute and a CSS selector (see domID in hf.go).
@@ -257,6 +266,66 @@ func (s *Server) parseTemplates() map[string]*template.Template {
 			}
 			return (value / max) * 100
 		},
+		// evalScoreText renders a run's capability score in its
+		// mode-appropriate form ("PPL 6.234 ±0.04 (100 chunks)",
+		// "HellaSwag 77.2% [75.9–78.5] (400)", …). Shared by the
+		// results list, job cell matrix, compare table, and run detail
+		// so every surface shows the identical string.
+		"evalScoreText": func(e *benchmark.EvalScores) string {
+			return evalScoreText(e)
+		},
+		// evalScoreValue is the comparable magnitude behind evalScoreText,
+		// used only for sorting the compare view. Zero for performance
+		// runs — the score sort button is hidden in that case.
+		"evalScoreValue": func(e *benchmark.EvalScores) float64 {
+			return evalScoreValue(e)
+		},
+		// fmtBytes renders a byte count in binary units (the evaluation
+		// data card's dataset and logits sizes).
+		"fmtBytes": func(b int64) string { return evaluate.FormatBytes(b) },
+		// fmtAge renders an mtime as a relative age ("3 days ago") for
+		// the KL logits cache list.
+		"fmtAge": func(t time.Time) string {
+			return fmtDurationSince(time.Since(t))
+		},
+		// add is plain integer addition for template column math.
+		"add": func(a, b int) int { return a + b },
+		// tern is the classic three-argument conditional.
+		"tern": func(cond bool, a, b int) int {
+			if cond {
+				return a
+			}
+			return b
+		},
+		// evalHas reports whether a single run carries capability
+		// scores (the template-side form of hasEvalRuns).
+		"evalHas": func(e *benchmark.EvalScores) bool { return evalHas(e) },
+		// evalSizeText renders a capability preset's run size (task or
+		// chunk count, or "full") for the About modal's capability
+		// section.
+		"evalSizeText": func(p benchmark.Preset) string { return evalSizeText(p) },
+		// evalMeaningText renders what the mode's score means, in one
+		// line, for the same section.
+		"evalMeaningText": func(p benchmark.Preset) string { return evalMeaningText(p) },
+		// evalDoc returns the "how to read this score" guidance for a
+		// run's mode: headline, reading rules, reference values, and the
+		// authoritative link. Returns nil for a mode this build does not
+		// recognise, so the template renders nothing rather than wrong
+		// guidance.
+		"evalDoc": func(mode string) *evalDoc {
+			if d, ok := evalDocFor(mode); ok {
+				return &d
+			}
+			return nil
+		},
+		// evalPresetDoc is the same guidance keyed by preset, for the
+		// About modal's capability table.
+		"evalPresetDoc": func(p benchmark.Preset) *evalDoc {
+			if d, ok := evalDocForPreset(p); ok {
+				return &d
+			}
+			return nil
+		},
 		"vramFit": func(estimatedGB float64) string {
 			metrics := s.monitor.Current()
 			numGPUs := len(metrics.GPU)
@@ -291,8 +360,12 @@ func (s *Server) parseTemplates() map[string]*template.Template {
 			return "v" + v
 		},
 	}
+}
 
-	base := template.Must(template.New("").Funcs(funcMap).ParseFS(web.Templates,
+// parseTemplates parses the layout+partials as a base, then clones it
+// per page so each page's {{define "content"}} doesn't collide.
+func (s *Server) parseTemplates() map[string]*template.Template {
+	base := template.Must(template.New("").Funcs(s.templateFuncs()).ParseFS(web.Templates,
 		"templates/layout.html",
 		"templates/partials/*.html",
 	))
@@ -382,6 +455,8 @@ func (s *Server) buildRouter() chi.Router {
 			r.Get("/form", s.handleBenchmarkForm)
 			r.Get("/compare", s.handleCompareBenchmarks)
 			r.Get("/export", s.handleExportBenchmarks)
+			r.Get("/eval-data", s.handleEvalData)
+			r.Post("/eval-data/delete-logits", s.handleDeleteKLLogits)
 			r.Delete("/batch-delete", s.handleBatchDeleteBenchmarks)
 			r.Get("/{id}", s.handleGetBenchmark)
 			r.Delete("/{id}", s.handleDeleteBenchmark)

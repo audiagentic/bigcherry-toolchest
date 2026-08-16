@@ -10,20 +10,23 @@ import (
 	"github.com/tmac1973/llama-toolchest/web"
 )
 
-// testFuncMap mirrors the custom funcs registered in parseTemplates so the
-// layout/partial set parses standalone. The values returned here don't matter
-// for the partial under test — only that the functions exist.
-var testFuncMap = template.FuncMap{
-	"divGB":     func(v int64) float64 { return 0 },
-	"cssID":     func(s string) string { return s },
-	"deref":     func(v interface{}) interface{} { return v },
-	"shortSHA":  func(s string) string { return s },
-	"divf":      func(a, b interface{}) float64 { return 0 },
-	"pctOf":     func(a, b float64) float64 { return 0 },
-	"vramFit":   func(gb float64) string { return "" },
-	"hasHFRepo": func(s string) bool { return false },
-	"version":   func() string { return "test" },
-}
+// testFuncMap is the REAL template function map from
+// Server.templateFuncs, with only the functions that read live server
+// state replaced by stubs.
+//
+// It used to be a hand-copied list, with a comment warning that it had
+// to be kept in sync. It was not: adding a template function without
+// adding it here failed the whole partial set's parse, which broke a
+// dozen unrelated render tests at once with a message pointing at
+// neither the new function nor the test. Deriving it means a new
+// function is available here the moment it exists.
+var testFuncMap = func() template.FuncMap {
+	m := (&Server{}).templateFuncs()
+	// vramFit is the only one that dereferences server state (the GPU
+	// monitor); nothing else needs a live Server.
+	m["vramFit"] = func(gb float64) string { return "" }
+	return m
+}()
 
 // TestSamplingPresetsPartialRenders verifies the model_config partial renders
 // with a populated SamplingPresetsJSON and that the embedded JSON survives

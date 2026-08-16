@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/tmac1973/llama-toolchest/internal/benchmark"
+	"github.com/tmac1973/llama-toolchest/internal/evaluate"
 	"github.com/tmac1973/llama-toolchest/internal/models"
 )
 
@@ -72,6 +74,18 @@ type jobListEntry struct {
 	AdhocRuns int
 }
 
+// klRepoGroup is one repo's models in the job form's KL reference
+// dropdown (installed models grouped by HF repo).
+type klRepoGroup struct {
+	Repo   string
+	Models []*models.Model
+}
+
+// buildOpt is one build in the job form's build list.
+type buildOpt struct {
+	ID, Profile, GitRef, Tag string
+}
+
 // jobCreateRequest is the JSON body POST /api/benchmark-jobs accepts.
 type jobCreateRequest struct {
 	Name        string                     `json:"name"`
@@ -86,6 +100,10 @@ type jobCreateRequest struct {
 	// it. Supersedes Overrides/Sweeps for form callers; the older fields
 	// remain for JSON API callers and already-saved jobs.
 	Params map[string][]string `json:"params,omitempty"`
+	// KLReference names the registry model the kl-divergence cells
+	// compare against; empty = automatic (the largest installed quant of
+	// each model's own HF repo). Posted by the job form's KL dropdown.
+	KLReference string `json:"kl_reference,omitempty"`
 }
 
 // resolveSweeps normalizes the accepted input shapes into overrides and
@@ -128,15 +146,62 @@ func validateJobRequest(req jobCreateRequest) error {
 	}
 	// A sweep of every axis multiplies fast. Refuse obviously runaway
 	// matrices rather than letting someone queue a week of work by
-	// pasting a long list.
-	cells := len(req.ModelIDs) * len(req.BuildIDs) * len(req.Presets)
-	for _, sw := range req.Sweeps {
-		cells *= len(sw.Values)
+	// pasting a long list. The count applies the capability collapse
+	// rule: a capability preset gets one cell per distinct eval-reaching
+	// configuration, so axes without AffectsEval do not multiply it.
+	cells := 0
+	for _, name := range req.Presets {
+		mult := 1
+		capability := benchmark.GetPreset(name).EffectiveSource() == benchmark.PresetSourceCapability
+		for _, sw := range req.Sweeps {
+			if capability {
+				if f, ok := benchmark.LookupSweepField(sw.Field); ok && !f.AffectsEval {
+					continue
+				}
+			}
+			mult *= len(sw.Values)
+		}
+		cells += len(req.ModelIDs) * len(req.BuildIDs) * mult
 	}
 	if cells > maxJobCells {
 		return fmt.Errorf("this matrix expands to %d cells, above the %d limit — narrow a sweep or split the job", cells, maxJobCells)
 	}
+	if err := validateCapabilitySweeps(req); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateCapabilitySweeps refuses a capability-only job whose only
+// variation is a sweep that never reaches the evaluation: after the
+// collapse every cell would be one identical run per preset.
+//
+// Refused ONLY when ALL FOUR hold — capability-only presets, at least
+// one sweep axis configured, no configured axis has AffectsEval, and
+// models × builds == 1. Precisely NOT refused: sweep-free capability
+// jobs (the flagship four-quant job — zero sweeps is the normal case),
+// and multi-model or multi-build jobs with inert sweeps (after collapse
+// the cells still vary by model/build — meaningful).
+//
+// A job mixing benchy, capability, and a sampling axis gets the benchy
+// refusal first (ValidateSamplingSupport), unchanged.
+func validateCapabilitySweeps(req jobCreateRequest) error {
+	allCapability := len(req.Presets) > 0
+	for _, name := range req.Presets {
+		if benchmark.GetPreset(name).EffectiveSource() != benchmark.PresetSourceCapability {
+			allCapability = false
+			break
+		}
+	}
+	if !allCapability || len(req.Sweeps) == 0 || len(req.ModelIDs)*len(req.BuildIDs) != 1 {
+		return nil
+	}
+	for _, sw := range req.Sweeps {
+		if f, ok := benchmark.LookupSweepField(sw.Field); ok && f.AffectsEval {
+			return nil
+		}
+	}
+	return errors.New("the swept parameters do not affect capability evaluations — nothing would vary between cells; drop the sweeps or add a performance preset that uses them")
 }
 
 // maxJobCells caps matrix size. Each cell is a full benchmark and most
@@ -280,6 +345,110 @@ func (s *Server) validateGPUAssignment(overrides *benchmark.ConfigOverrides, swe
 	return nil
 }
 
+// validateKLJob refuses a KL job whose every cell would be skipped at
+// run time (the runner skips a KL cell whose resolved reference IS the
+// cell's own model — an expensive eval whose answer is known is waste).
+//
+// A reference that is merely AMONG the job's models is fine — that is
+// the primary all-quants flow; only its own cell skips. Refused when
+// every selected model resolves to itself: a single-model job whose
+// model is the only installed quant of its repo, an explicit reference
+// naming the only model, or every model being its own repo's largest
+// (and only) quant. The message names what to add.
+func (s *Server) validateKLJob(req jobCreateRequest) error {
+	hasKL := false
+	for _, name := range req.Presets {
+		p := benchmark.GetPreset(name)
+		if p.EffectiveSource() == benchmark.PresetSourceCapability && p.EvalMode == evaluate.ModeKLDiv {
+			hasKL = true
+			break
+		}
+	}
+	if !hasKL {
+		return nil
+	}
+	if req.KLReference != "" {
+		if _, err := s.registry.Get(req.KLReference); err != nil {
+			return fmt.Errorf("KL reference model %q is not an installed model", req.KLReference)
+		}
+		for _, id := range req.ModelIDs {
+			if err := s.checkKLReferenceIsSameModel(id, req.KLReference); err != nil {
+				return err
+			}
+		}
+	}
+	// A fresh env: the resolution only reads the registry, and s.env
+	// may be unwired (tests) while the router is not job-controlled.
+	env := newJobEnv(s)
+	for _, id := range req.ModelIDs {
+		ref, err := env.resolveKLReference(id, req.KLReference)
+		if err == nil && ref.ID != id {
+			return nil // at least one model's cells would run
+		}
+	}
+	return fmt.Errorf("every KL-divergence cell in this job would be the reference model's own cell — each selected model resolves to itself as its reference. Add a second quant of one of the repos, or pick a different KL reference model")
+}
+
+// checkKLReferenceIsSameModel refuses a KL reference that is provably a
+// DIFFERENT model rather than another quantization of the same one.
+//
+// KL divergence answers "how much did compressing this model change
+// it?". Between two different models the number is not a worse
+// measurement, it is not a measurement at all — a Qwen3.5-9B scored
+// against a Qwen3.5-4B produced 0.321 where the correct reference gave
+// 0.038, and nothing in the result said which one was meaningful. The
+// reference dropdown lists every installed model, so picking one from
+// another repository takes a single click.
+//
+// It refuses only on evidence, never on suspicion, because a legitimate
+// reference can live in a different repository — a re-quantization by
+// another packager, or a fine-tune measured against the model it came
+// from. In order of confidence:
+//
+//   - same HuggingFace repository: always allowed, no question.
+//   - both records name a base model and the names differ: different
+//     models. This is what catches the 4B-versus-9B case, since the two
+//     are packaged in separate repositories by the same publisher.
+//   - vocabulary sizes differ: KL divergence compares two probability
+//     distributions position by position. Over different vocabularies
+//     there is no shared distribution to compare, so the number is
+//     undefined rather than merely wrong.
+//   - architectures differ: different model families.
+//
+// Anything the registry cannot tell apart is allowed through. A missing
+// field means "unknown", never "different".
+func (s *Server) checkKLReferenceIsSameModel(modelID, refID string) error {
+	model, err := s.registry.Get(modelID)
+	if err != nil {
+		return nil // resolved elsewhere; not this check's business
+	}
+	ref, err := s.registry.Get(refID)
+	if err != nil {
+		return nil
+	}
+	if model.ModelID == ref.ModelID {
+		return nil
+	}
+
+	refuse := func(because string) error {
+		return fmt.Errorf(
+			"%s cannot be the KL reference for %s — %s. KL divergence compares a model with a compressed copy of ITSELF; between two different models the result does not mean anything. Pick another quantization of %s, or leave the reference on automatic",
+			shortenModelName(ref.ModelID), shortenModelName(model.ModelID), because, shortenModelName(model.ModelID))
+	}
+
+	if model.BaseModelRepo != "" && ref.BaseModelRepo != "" && model.BaseModelRepo != ref.BaseModelRepo {
+		return refuse(fmt.Sprintf("they are built from different models (%s and %s)", model.BaseModelRepo, ref.BaseModelRepo))
+	}
+	if model.VocabSize > 0 && ref.VocabSize > 0 && model.VocabSize != ref.VocabSize {
+		return refuse(fmt.Sprintf("they use different vocabularies (%d and %d tokens), so there is nothing to compare position by position",
+			model.VocabSize, ref.VocabSize))
+	}
+	if model.Arch != "" && ref.Arch != "" && model.Arch != ref.Arch {
+		return refuse(fmt.Sprintf("they are different model families (%s and %s)", model.Arch, ref.Arch))
+	}
+	return nil
+}
+
 // handleCreateJob expands the matrix and submits the job to the queue.
 // Returns 409 when another job is already running.
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
@@ -304,6 +473,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := s.validateKLJob(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	job := benchmark.BenchmarkJob{
 		ID:          newJobID(),
@@ -317,6 +490,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		Presets:     req.Presets,
 		Overrides:   req.Overrides,
 		Sweeps:      req.Sweeps,
+		KLReference: req.KLReference,
 		Cells:       benchmark.ExpandCellsWithSweeps(req.ModelIDs, req.BuildIDs, req.Presets, req.Sweeps),
 	}
 
@@ -364,6 +538,10 @@ func (s *Server) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := s.validateKLJob(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	updated, err := s.bench.UpdateJobDefinition(id, benchmark.JobDefinition{
 		Name:        req.Name,
@@ -373,6 +551,7 @@ func (s *Server) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 		Presets:     req.Presets,
 		Overrides:   req.Overrides,
 		Sweeps:      req.Sweeps,
+		KLReference: req.KLReference,
 	})
 	if err != nil {
 		// "synthetic" is the adhoc-edit refusal; anything else means the
@@ -434,10 +613,14 @@ func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.Benchmark
 		BuildLbl   string
 		TGTPS      string // formatted, "—" when no summary
 		PPTPS      string
+		Score      string // formatted capability score, "—" for performance cells
+		ScoreWarn  string // why the score is not comparable; "" when it is
 		ErrorShort string
+		SkipShort  string
 	}
 	rows := make([]cellRow, 0, len(job.Cells))
 	var done, failed int
+	hasEval := false
 	for i, c := range job.Cells {
 		switch c.Status {
 		case benchmark.CellStatusCompleted:
@@ -445,7 +628,7 @@ func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.Benchmark
 		case benchmark.CellStatusFailed:
 			failed++
 		}
-		row := cellRow{Idx: i, Cell: c, ModelName: shortenModelName(c.ModelID), BuildLbl: c.BuildID, TGTPS: "—", PPTPS: "—"}
+		row := cellRow{Idx: i, Cell: c, ModelName: shortenModelName(c.ModelID), BuildLbl: c.BuildID, TGTPS: "—", PPTPS: "—", Score: "—"}
 		// Pull Quant from the registry first so pending cells (no run
 		// yet) still show it; the run's value wins once it exists.
 		if m, err := s.registry.Get(c.ModelID); err == nil {
@@ -462,7 +645,19 @@ func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.Benchmark
 				if run.BuildID != "" {
 					row.BuildLbl = run.BuildID
 				}
-				if run.Summary != nil {
+				if run.Eval != nil {
+					// Capability cell: the score column is where its
+					// result lives; the timing columns stay em-dash
+					// (the model ran offline through llama-perplexity,
+					// so it produced no t/s).
+					hasEval = true
+					if e := evalScoreText(run.Eval); e != "" {
+						row.Score = e
+					} else {
+						row.Score = "score unavailable"
+					}
+					row.ScoreWarn = evalComparabilityNote(run.Config)
+				} else if run.Summary != nil {
 					row.TGTPS = fmt.Sprintf("%.1f", run.Summary.AvgGenTokPerSec)
 					row.PPTPS = fmt.Sprintf("%.0f", run.Summary.AvgPromptTokPerSec)
 				}
@@ -474,15 +669,24 @@ func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.Benchmark
 				row.ErrorShort = row.ErrorShort[:80] + "…"
 			}
 		}
+		if c.SkipReason != "" {
+			// Informational, not an error: the cell completed with a
+			// known answer (the KL reference model's own cell).
+			row.SkipShort = c.SkipReason
+			if len(row.SkipShort) > 80 {
+				row.SkipShort = row.SkipShort[:80] + "…"
+			}
+		}
 		rows = append(rows, row)
 	}
 	s.renderPartial(w, "job_detail", struct {
-		Job    *benchmark.BenchmarkJob
-		Rows   []cellRow
-		Done   int
-		Failed int
-		Total  int
-	}{Job: job, Rows: rows, Done: done, Failed: failed, Total: len(job.Cells)})
+		Job     *benchmark.BenchmarkJob
+		Rows    []cellRow
+		Done    int
+		Failed  int
+		Total   int
+		HasEval bool
+	}{Job: job, Rows: rows, Done: done, Failed: failed, Total: len(job.Cells), HasEval: hasEval})
 }
 
 // handleJobForm renders the new-job modal contents (multi-select models,
@@ -495,9 +699,6 @@ func (s *Server) handleJobForm(w http.ResponseWriter, r *http.Request) {
 			enabled = append(enabled, m)
 		}
 	}
-	type buildOpt struct {
-		ID, Profile, GitRef, Tag string
-	}
 	var builds []buildOpt
 	for _, b := range s.builder.List() {
 		if b.Status != "success" {
@@ -507,22 +708,44 @@ func (s *Server) handleJobForm(w http.ResponseWriter, r *http.Request) {
 	}
 	gpuList := s.monitor.Current().GPU
 	numGPUs := len(gpuList)
+
+	// The KL reference dropdown lists every installed model, grouped by
+	// HF repo, so "the other quant of this repo" is one glance away.
+	groups := map[string]*klRepoGroup{}
+	var groupOrder []string
+	for _, m := range enabled {
+		g, ok := groups[m.ModelID]
+		if !ok {
+			g = &klRepoGroup{Repo: m.ModelID}
+			groups[m.ModelID] = g
+			groupOrder = append(groupOrder, m.ModelID)
+		}
+		g.Models = append(g.Models, m)
+	}
+	sort.Slice(groupOrder, func(i, j int) bool { return groupOrder[i] < groupOrder[j] })
+	klOptions := make([]klRepoGroup, 0, len(groupOrder))
+	for _, repo := range groupOrder {
+		klOptions = append(klOptions, *groups[repo])
+	}
+
 	s.renderPartial(w, "job_form", struct {
-		Models     []*models.Model
-		Builds     []buildOpt
-		Presets    []benchmark.Preset
-		GPUOptions []models.GPUOption
-		Params     []paramView
-		MaxCells   int
-		Running    bool
+		Models      []*models.Model
+		Builds      []buildOpt
+		Presets     []benchmark.Preset
+		GPUOptions  []models.GPUOption
+		Params      []paramView
+		MaxCells    int
+		Running     bool
+		KLReference []klRepoGroup
 	}{
-		Models:     enabled,
-		Builds:     builds,
-		Presets:    benchmark.Presets(),
-		GPUOptions: models.GPUAssignOptions(numGPUs, igpuFlags(gpuList)),
-		Params:     paramViews(numGPUs, igpuFlags(gpuList)),
-		MaxCells:   maxJobCells,
-		Running:    s.process.IsRunning(),
+		Models:      enabled,
+		Builds:      builds,
+		Presets:     benchmark.Presets(),
+		GPUOptions:  models.GPUAssignOptions(numGPUs, igpuFlags(gpuList)),
+		Params:      paramViews(numGPUs, igpuFlags(gpuList)),
+		MaxCells:    maxJobCells,
+		Running:     s.process.IsRunning(),
+		KLReference: klOptions,
 	})
 }
 
