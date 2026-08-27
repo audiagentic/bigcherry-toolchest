@@ -470,10 +470,50 @@ func (b *Builder) runBuild(ctx context.Context, prof BuildProfile, srcDir string
 			binDir := filepath.Dir(tool)
 			buildEnv = prependPath(buildEnv, binDir)
 			root := filepath.Dir(binDir)
-			buildEnv = setEnvDefault(buildEnv, "ROCM_PATH", root)
-			buildEnv = setEnvDefault(buildEnv, "HIP_PATH", root)
-			if devlib := filepath.Join(root, "amdgcn", "bitcode"); dirExists(devlib) {
-				buildEnv = setEnvDefault(buildEnv, "HIP_DEVICE_LIB_PATH", devlib)
+
+			// Two ROCm layouts, and what helps one breaks the other.
+			//
+			// Arch-family (and AMD's own) install a self-contained ROCm
+			// under /opt/rocm whose clang lives at <root>/lib/llvm/bin;
+			// that clang can't locate its own ROCm and needs ROCM_PATH to
+			// find it. Debian/Ubuntu and Fedora instead spread ROCm across
+			// /usr, and there ROCM_PATH=/usr is actively harmful: clang
+			// takes it as the ROCm root and looks for the device bitcode
+			// at /usr/amdgcn/bitcode, while the distro ships it beside the
+			// compiler in /usr/lib/llvm-N/lib/clang/N/amdgcn/bitcode. It
+			// then fails with "cannot find ROCm device library", which
+			// surfaces as "The HIP compiler identification is unknown" —
+			// and since cmake derives CMAKE_HIP_LIBRARY_ARCHITECTURE from
+			// that identification, it also stops searching the multiarch
+			// directory holding hip-lang-config.cmake and dies on "does
+			// not contain the HIP runtime CMake package" with the config
+			// sitting right there.
+			//
+			// So: point cmake at the root with a cache variable, which
+			// costs clang nothing, and only export ROCM_PATH for the
+			// layout that actually needs it.
+			if root == "/usr" {
+				if !hasCMakeArg(cmakeArgs, "CMAKE_HIP_COMPILER_ROCM_ROOT") {
+					cmakeArgs = append(cmakeArgs, "-DCMAKE_HIP_COMPILER_ROCM_ROOT="+root)
+				}
+			} else {
+				buildEnv = setEnvDefault(buildEnv, "ROCM_PATH", root)
+				buildEnv = setEnvDefault(buildEnv, "HIP_PATH", root)
+				if devlib := filepath.Join(root, "amdgcn", "bitcode"); dirExists(devlib) {
+					buildEnv = setEnvDefault(buildEnv, "HIP_DEVICE_LIB_PATH", devlib)
+				}
+			}
+		}
+		// cmake asks `hipconfig --hipclangpath` for the HIP clang and
+		// otherwise falls back to a bare "clang++" on PATH. On Debian/Ubuntu
+		// neither answer lands: hipconfig names a directory with no clang++
+		// in it, and the clang HIP needs is installed as the versioned
+		// /usr/lib/llvm-N/bin/clang++ with no unversioned symlink. Pin it
+		// ourselves, exactly as the cuda profile pins nvcc below.
+		if !hasCMakeArg(cmakeArgs, "CMAKE_HIP_COMPILER") {
+			if hipcc := findHIPCompiler(buildEnv); hipcc != "" {
+				cmakeArgs = append(cmakeArgs, "-DCMAKE_HIP_COMPILER="+hipcc)
+				sendLog(fmt.Sprintf("==> Using HIP compiler at %s", hipcc))
 			}
 		}
 	}
@@ -1026,6 +1066,128 @@ func findNVCC() (string, string) {
 	return "", ""
 }
 
+// hasCMakeArg reports whether -D<name>=... was already supplied, so a
+// user-provided value in the build's extra cmake flags wins over ours.
+func hasCMakeArg(args []string, name string) bool {
+	prefix := "-D" + name + "="
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// findHIPCompiler locates a clang++ that can compile HIP device code, for
+// cmake's CMAKE_HIP_COMPILER. Returns "" when nothing suitable is found,
+// leaving cmake to its own search.
+//
+// Order matters. A ROCm install that ships its own llvm knows best, so ask
+// hipconfig first and then look in the usual ROCm roots. Only then fall
+// back to a distro-packaged clang, and only one that actually has the
+// AMD device bitcode beside it: on Debian/Ubuntu the ROCm device libs are
+// packaged per-LLVM-version (rocm-device-libs-17 installs into
+// /usr/lib/llvm-17/lib/clang/17/amdgcn/bitcode), so the newest clang on
+// the system is often the wrong one. Pairing on the bitcode picks the
+// clang the distro actually built its HIP stack against.
+func findHIPCompiler(env []string) string {
+	if p := hipconfigClangPath(env); p != "" {
+		return p
+	}
+	var roots []string
+	if rp := envValue(env, "ROCM_PATH"); rp != "" {
+		roots = append(roots, rp)
+	}
+	roots = append(roots, "/opt/rocm", "/usr/lib/rocm", "/usr/lib64/rocm")
+	if c := hipClangInRoots(roots); c != "" {
+		return c
+	}
+	return newestDistroHIPClang("/usr/lib")
+}
+
+// hipClangInRoots returns the first <root>/llvm/bin/clang++ that exists.
+func hipClangInRoots(roots []string) string {
+	for _, r := range roots {
+		if c := filepath.Join(r, "llvm", "bin", "clang++"); isExecutable(c) {
+			return c
+		}
+	}
+	return ""
+}
+
+// hipconfigClangPath asks hipconfig where the HIP clang is and returns
+// <path>/clang++ if that file exists. Empty when hipconfig is missing,
+// fails, or names a directory that isn't there — which is the common case
+// on Debian/Ubuntu and the reason this whole function exists.
+func hipconfigClangPath(env []string) string {
+	tool := FindROCmTool("hipconfig")
+	if tool == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, tool, "--hipclangpath")
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		return ""
+	}
+	if c := filepath.Join(dir, "clang++"); isExecutable(c) {
+		return c
+	}
+	return ""
+}
+
+// newestDistroHIPClang returns the highest-versioned
+// <libDir>/llvm-N/bin/clang++ that has AMD device bitcode installed
+// alongside it, or "" if none does.
+func newestDistroHIPClang(libDir string) string {
+	matches, err := filepath.Glob(filepath.Join(libDir, "llvm-*", "bin", "clang++"))
+	if err != nil {
+		return ""
+	}
+	best, bestVer := "", -1
+	for _, m := range matches {
+		if !isExecutable(m) {
+			continue
+		}
+		llvmRoot := filepath.Dir(filepath.Dir(m))
+		bitcode, err := filepath.Glob(filepath.Join(llvmRoot, "lib", "clang", "*", "amdgcn", "bitcode"))
+		if err != nil || len(bitcode) == 0 {
+			continue
+		}
+		ver, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(llvmRoot), "llvm-"))
+		if err != nil {
+			continue
+		}
+		if ver > bestVer {
+			best, bestVer = m, ver
+		}
+	}
+	return best
+}
+
+// isExecutable reports whether path is a regular file with an execute bit.
+func isExecutable(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir() && st.Mode()&0o111 != 0
+}
+
+// envValue returns the value of KEY in a KEY=value environment slice.
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			return strings.TrimPrefix(kv, prefix)
+		}
+	}
+	return ""
+}
+
 // setEnvDefault returns env with KEY=value appended unless KEY is
 // already present — an inherited value stays authoritative.
 func setEnvDefault(env []string, key, value string) []string {
@@ -1066,4 +1228,3 @@ func prependPath(env []string, dir string) []string {
 	}
 	return out
 }
-

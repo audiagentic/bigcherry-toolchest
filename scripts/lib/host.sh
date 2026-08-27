@@ -84,9 +84,9 @@ host_check_build_toolchain() {
         warn "Missing build prerequisites: ${missing[*]}"
         log "These are needed to build the llama-toolchest binary and (later) llama.cpp from the UI."
         log "Install via your package manager:"
-        echo "    Debian/Ubuntu:  sudo apt-get install golang cmake ninja-build git build-essential"
-        echo "    Fedora:         sudo dnf install golang cmake ninja-build git gcc-c++ make"
-        echo "    Arch:           sudo pacman -S go cmake ninja git base-devel"
+        echo "    Debian/Ubuntu:  sudo apt-get install golang cmake ninja-build git build-essential libssl-dev"
+        echo "    Fedora:         sudo dnf install golang cmake ninja-build git gcc-c++ make openssl-devel"
+        echo "    Arch:           sudo pacman -S go cmake ninja git base-devel openssl"
         return 1
     fi
     return 0
@@ -229,6 +229,62 @@ host_rocm_have_cmake_pkg() {
         fi
     done < <(host_rocm_prefix_candidates)
     return 1
+}
+
+# Echo the clang++ that can compile HIP device code, or nothing. Mirrors
+# findHIPCompiler in internal/builder/builder.go so setup.sh and the
+# builder agree on what counts as a usable HIP compiler. Ask hipconfig
+# first (a ROCm that ships its own llvm knows best), then the usual ROCm
+# roots, then a distro clang — but only one with the AMD device bitcode
+# beside it, since Debian/Ubuntu package those per LLVM version and the
+# newest clang on the box is regularly the wrong one.
+host_find_hip_clang() {
+    local hipconfig dir root
+    if hipconfig="$(host_find_rocm_tool hipconfig)"; then
+        dir="$("$hipconfig" --hipclangpath 2>/dev/null)" || dir=""
+        if [[ -n "$dir" && -x "${dir}/clang++" ]]; then
+            echo "${dir}/clang++"
+            return 0
+        fi
+    fi
+    for root in "${ROCM_PATH:-}" /opt/rocm /usr/lib/rocm /usr/lib64/rocm; do
+        [[ -n "$root" ]] || continue
+        if [[ -x "${root}/llvm/bin/clang++" ]]; then
+            echo "${root}/llvm/bin/clang++"
+            return 0
+        fi
+    done
+    local best="" best_ver=-1 candidate ver
+    for candidate in /usr/lib/llvm-*/bin/clang++; do
+        [[ -x "$candidate" ]] || continue
+        root="$(dirname "$(dirname "$candidate")")"
+        compgen -G "${root}/lib/clang/*/amdgcn/bitcode" >/dev/null 2>&1 || continue
+        ver="${root##*/llvm-}"
+        [[ "$ver" =~ ^[0-9]+$ ]] || continue
+        if (( ver > best_ver )); then
+            best="$candidate"
+            best_ver="$ver"
+        fi
+    done
+    [[ -n "$best" ]] || return 1
+    echo "$best"
+}
+
+# llama.cpp's HIP backend hard-fails below this — see the version gate in
+# ggml/src/ggml-hip/CMakeLists.txt ("At least ROCM/HIP V6.1 is required").
+# Worth checking up front: Ubuntu 24.04 packages ROCm 5.7, so a host can
+# have every dev package installed, a working HIP compiler, and still be
+# unable to build.
+HOST_ROCM_MIN_VERSION="6.1"
+
+# Echo the installed ROCm version as major.minor (e.g. "6.4"), or nothing
+# if it can't be determined.
+host_rocm_version() {
+    local hipconfig raw
+    hipconfig="$(host_find_rocm_tool hipconfig)" || return 1
+    raw="$("$hipconfig" --version 2>/dev/null)" || return 1
+    [[ "$raw" =~ ([0-9]+)\.([0-9]+) ]] || return 1
+    echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
 }
 
 # The cmake config packages llama.cpp's HIP backend needs, in the order
@@ -842,6 +898,32 @@ host_install_gpu_sdk() {
 # build from the UI. Report it here instead.
 host_verify_rocm_buildable() {
     [[ "$1" == "rocm" ]] || return 0
+    # enable_language(HIP) needs a clang that can target amdgcn. cmake asks
+    # hipconfig where it is and otherwise looks for a bare "clang++" on
+    # PATH; on Debian/Ubuntu neither lands, because the HIP clang installs
+    # as /usr/lib/llvm-N/bin/clang++ with no unversioned symlink. The
+    # builder passes -DCMAKE_HIP_COMPILER when it can find one — say so
+    # here when it can't, since nothing else will.
+    if ! host_find_hip_clang >/dev/null; then
+        warn "No HIP-capable clang++ found — llama.cpp's ROCm build needs one."
+        case "$DISTRO_FAMILY" in
+            debian) log "On Debian/Ubuntu it comes with hipcc (which pulls the matching clang-N and rocm-device-libs-N)." ;;
+            fedora) log "On Fedora it ships in rocm-llvm, at /usr/lib64/rocm/llvm/bin/clang++." ;;
+        esac
+    fi
+    local version
+    if version="$(host_rocm_version)" && ! host_version_ge "$version" "$HOST_ROCM_MIN_VERSION"; then
+        warn "ROCm ${version} is too old — llama.cpp's HIP backend requires ${HOST_ROCM_MIN_VERSION} or newer."
+        log "The build will stop at \"At least ROCM/HIP V6.1 is required\" no matter"
+        log "which dev packages are installed. Recent GPUs need newer still: RDNA4"
+        log "(gfx1201) isn't recognised by compilers before ROCm 6.3."
+        case "$DISTRO_FAMILY" in
+            debian) log "Ubuntu 24.04 packages ROCm 5.7. Either add AMD's ROCm repo:"
+                    echo "    https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html"
+                    log "or move to a release whose own packages are new enough (25.10+ ship 7.x)." ;;
+            fedora) log "Update rocm-hip-devel, or use AMD's repo for a newer release." ;;
+        esac
+    fi
     local absent
     absent="$(host_rocm_missing_cmake_pkgs)"
     [[ -n "$absent" ]] || return 0
@@ -1405,6 +1487,20 @@ host_report_toolchain_deps() {
             exit_code=1
         fi
     done
+    # Headers, not a binary — the openssl CLI is installed nearly
+    # everywhere while the dev package usually isn't. llama.cpp's
+    # LLAMA_OPENSSL defaults ON; without these cmake only warns
+    # ("OpenSSL not found, HTTPS support disabled") and the server it
+    # builds can't fetch over HTTPS. Not a build blocker, so this warns
+    # rather than failing the report.
+    if [[ -e /usr/include/openssl/ssl.h ]]; then
+        printf "    %-7s %s\n" "openssl" "OK"
+    else
+        local ssl_pkg="libssl-dev"
+        [[ "$DISTRO_FAMILY" == "fedora" ]] && ssl_pkg="openssl-devel"
+        printf "    %-7s %s\n" "openssl" "missing headers — llama.cpp will build without HTTPS support"
+        printf "            %s %s\n" "$inst_cmd" "$ssl_pkg"
+    fi
     return $exit_code
 }
 
