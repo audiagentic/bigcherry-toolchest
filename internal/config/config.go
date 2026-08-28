@@ -17,6 +17,15 @@ type Config struct {
 	LlamaPort   int    `yaml:"llama_port"`   // default 8080
 	ExternalURL string `yaml:"external_url"` // e.g. "http://myserver:3000" for links
 	HFToken     string `yaml:"hf_token"`     // optional HuggingFace token
+	// DefaultModelSource preselects one of the model sources on the
+	// browse page. It only sets the radio's initial position; the choice
+	// is still per-search. Empty means HuggingFace.
+	DefaultModelSource string `yaml:"default_model_source,omitempty"`
+
+	// MSToken is the ModelScope access token. Only needed for gated or
+	// private repositories; public ones, which is everything the browse
+	// UI surfaces, download anonymously.
+	MSToken     string `yaml:"ms_token,omitempty"`
 	APIKey      string `yaml:"api_key"`      // optional API key for /v1/* proxy
 	LogLevel    string `yaml:"log_level"`    // default "info"
 	ActiveBuild string `yaml:"active_build"` // which llama.cpp build to use

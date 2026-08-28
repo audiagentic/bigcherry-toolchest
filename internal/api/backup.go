@@ -8,6 +8,7 @@ import (
 
 	"github.com/tmac1973/llama-toolchest/internal/backup"
 	"github.com/tmac1973/llama-toolchest/internal/models"
+	"github.com/tmac1973/llama-toolchest/internal/modelsource"
 )
 
 // handleBackupExport serves the configuration backup as a JSON download.
@@ -133,9 +134,17 @@ func (s *Server) restoreDeps() backup.Deps {
 				s.cfg.LogLevel = *in.LogLevel
 				changed = append(changed, "log_level")
 			}
+			if in.DefaultModelSource != nil && s.cfg.DefaultModelSource != *in.DefaultModelSource {
+				s.cfg.DefaultModelSource = modelsource.NormalizeSource(*in.DefaultModelSource)
+				changed = append(changed, "default_model_source")
+			}
 			if in.HFToken != nil && s.cfg.HFToken != *in.HFToken {
 				s.cfg.HFToken = *in.HFToken
 				changed = append(changed, "hf_token")
+			}
+			if in.MSToken != nil && s.cfg.MSToken != *in.MSToken {
+				s.cfg.MSToken = *in.MSToken
+				changed = append(changed, "ms_token")
 			}
 			if in.APIKey != nil && s.cfg.APIKey != *in.APIKey {
 				s.cfg.APIKey = *in.APIKey

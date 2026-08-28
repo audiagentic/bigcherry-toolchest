@@ -30,6 +30,7 @@ type hfFileView struct {
 // hfModelView is the template payload for the HF file-list partial.
 type hfModelView struct {
 	ID             string
+	Source         string // which host these files came from
 	Files          []hfFileView
 	AvailableBytes int64 // free - margin - in-flight
 	FreeBytes      int64
@@ -43,16 +44,22 @@ func (s *Server) handleHFSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.hfClient.Search(r.Context(), query)
+	source := s.requestSource(r.URL.Query().Get("source"))
+	results, err := s.sourceClient(source).Search(r.Context(), query)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	// htmx: return HTML partial
+	// htmx: return HTML partial. The source travels with the results so
+	// each row can link to the right host and start a download against
+	// the source it was found on.
 	if isHTMX(r) {
 		respondHTML(w)
-		s.renderPartial(w, "hf_results", struct{ Results any }{Results: results})
+		s.renderPartial(w, "hf_results", struct {
+			Results any
+			Source  string
+		}{Results: results, Source: source})
 		return
 	}
 
@@ -66,7 +73,8 @@ func (s *Server) handleHFModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	detail, err := s.hfClient.GetModel(r.Context(), modelID)
+	source := s.requestSource(r.URL.Query().Get("source"))
+	detail, err := s.sourceClient(source).GetModel(r.Context(), modelID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -75,6 +83,7 @@ func (s *Server) handleHFModel(w http.ResponseWriter, r *http.Request) {
 	available := s.downloader.AvailableForDownload()
 	view := hfModelView{
 		ID:             detail.ID,
+		Source:         source,
 		Files:          make([]hfFileView, 0, len(detail.Files)),
 		AvailableBytes: available,
 		FreeBytes:      s.downloader.FreeBytes(),
@@ -107,6 +116,7 @@ func (s *Server) handleHFDownload(w http.ResponseWriter, r *http.Request) {
 		ModelID  string `json:"model_id"`
 		Filename string `json:"filename"`
 		Size     int64  `json:"size"`
+		Source   string `json:"source"`
 	}
 
 	if r.Header.Get("Content-Type") == "application/json" {
@@ -119,7 +129,9 @@ func (s *Server) handleHFDownload(w http.ResponseWriter, r *http.Request) {
 		req.ModelID = r.FormValue("model_id")
 		req.Filename = r.FormValue("filename")
 		req.Size, _ = strconv.ParseInt(r.FormValue("size"), 10, 64)
+		req.Source = r.FormValue("source")
 	}
+	req.Source = s.requestSource(req.Source)
 
 	// Inline mode: callers whose swap target can't host the table-shaped
 	// download_progress partial (the restore report rows, the pending
@@ -155,7 +167,7 @@ func (s *Server) handleHFDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	downloadID, err := s.downloader.Start(r.Context(), req.ModelID, req.Filename, req.Size)
+	downloadID, err := s.downloader.Start(r.Context(), req.Source, req.ModelID, req.Filename, req.Size)
 	if err != nil {
 		if inline && isHTMX(r) {
 			inlineRespond(err.Error(), true)
@@ -398,7 +410,7 @@ func (s *Server) handleHFDownloadCancel(w http.ResponseWriter, r *http.Request) 
 }
 
 // onDownloadComplete is called by the downloader when a file finishes.
-func (s *Server) onDownloadComplete(downloadID, modelID, filename string, sizeBytes int64) {
+func (s *Server) onDownloadComplete(source, downloadID, modelID, filename string, sizeBytes int64) {
 	safeName := huggingface.SafeModelID(modelID)
 	filePath := filepath.Join(s.cfg.ModelsPath(), safeName, filename)
 
@@ -428,6 +440,7 @@ func (s *Server) onDownloadComplete(downloadID, modelID, filename string, sizeBy
 		Filename:     filename,
 		Quant:        models.ParseQuant(filename),
 		SizeBytes:    sizeBytes,
+		Source:       source,
 		FilePath:     filePath,
 		VRAMEstGB:    models.EstimateVRAM(sizeBytes),
 		DownloadedAt: time.Now(),
