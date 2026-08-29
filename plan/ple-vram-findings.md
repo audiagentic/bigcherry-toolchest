@@ -205,6 +205,122 @@ remainder reconciles. Reading those figures as totals under-counts by the number
 of cards, which is why `memreport.ScaleAggregates` exists and why the card count
 has to come from the model's GPU assignment — the log never states it.
 
+## What drives compute buffers
+
+Compute was the term the estimate omits and the one that varies most between
+models — 1.48 GiB on the 27B against 24.40 GiB on Flash-Next at the same
+262144 context. Two things were tested.
+
+### Flash attention: large, and now measurable
+
+A/B on two layer-split models, KV quantization off so both arms load:
+
+| Model | ctx | ubatch | FA on | FA off | increase |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | 32768 | 512 | 0.83 | 5.23 | **+4.40** |
+| Qwen3.8-Flash-Next | 32768 | 1024 | 4.87 | 23.87 | **+19.00** |
+
+Flash attention is worth roughly a 5-6x reduction in compute buffers on both.
+On Flash-Next that is 19 GiB of VRAM from one toggle.
+
+This only became testable at all once the toggle was fixed — before that,
+turning it off wrote nothing and llama.cpp defaulted to auto, so both arms of
+any A/B were the same run.
+
+### It is NOT what makes the two models differ
+
+The hypothesis was that `qwen4exp` gets no flash-attention kernel and so pays
+for a materialised score matrix. That is **wrong**: flash attention is active on
+Flash-Next and saves 19 GiB there. Both models get it.
+
+What actually separates them is how compute scales with context *while flash
+attention is on*:
+
+| Model | ctx 32768 | ctx 262144 | growth over 8x context |
+|---|---|---|---|
+| Qwen3.8-27B | 0.60 | 1.48 | 2.5x |
+| Qwen3.8-Flash-Next | 4.87 | 24.40 | 5.0x |
+
+The 27B is nearly flat; Flash-Next grows almost linearly with context.
+
+### Identified: the sparse-attention indexer
+
+`qwen4exp` runs Qwen Sparse Attention. Rather than attending to the whole cache,
+each dense-attention layer first *ranks* the cached positions and attends only to
+the top-k. That ranking pass is the context-scaling term.
+
+In `src/models/qwen4exp.cpp` at build `50f068ff`, `build_qsa_top_k` produces a
+tensor the code names `indexer_score_tokens`:
+
+```
+expanded = ggml_get_rows(score, inp->cell_blk);   // F32 [n_kv, n_tokens, n_stream]
+expanded = ggml_add(expanded, mask);
+top_k    = ggml_top_k(expanded, width);
+```
+
+That is a float score for every cache cell for every token in the micro-batch —
+`n_kv x ubatch x 4` bytes. It is exactly the shape flash attention exists to
+avoid, reintroduced by the indexer, because you cannot pick the top-k of a set
+without scoring all of it.
+
+This reconciles the result above rather than overturning it. Flash attention
+really does save 19 GiB on Flash-Next: it accelerates the dense attention that
+runs *after* selection. It cannot help the selection itself.
+
+The 27B has none of this. `needs_mem_idx` in `llama-model.cpp` is true for
+`LLM_ARCH_QWEN4EXP` alone, so no other architecture in this corpus allocates an
+`n_kv`-shaped intermediate. That is the factor of sixteen.
+
+The size fits. Per device, Flash-Next's GPU compute against one such tensor:
+
+| n_kv | ubatch | one tensor | measured | ratio |
+|---|---|---|---|---|
+| 262144 | 1024 | 1.000 | 6.10 | 6.1 |
+| 262144 | 256 | 0.250 | 1.67 | 6.7 |
+| 32768 | 1024 | 0.125 | 1.22 | 9.7 |
+
+Two independent slopes — one from the micro-batch pair, one from the context
+pair — give 5.91 and 5.58. So roughly six of those tensors are live at once,
+which the graph makes plausible: the score, its permuted copy, the expanded
+per-cell form, an f32 cast of the mask, and the top-k output are each of that
+shape or close to it.
+
+### What this means for a formula
+
+Compute is not one term with one shape. Architectures divide into those that
+allocate an `n_kv`-sized intermediate and those that do not, and the difference
+is a factor of sixteen at the same context. A fit over models without an indexer
+would mispredict `qwen4exp` badly; one including it would over-predict
+everything else.
+
+So the estimate needs the distinction explicitly, and the GGUF already states
+it: `attention.indexer.{head_count,key_length,top_k}` are present only on
+architectures that rank, and `qwen4exp.cpp` reads them into `hparams` today. A
+model carrying them needs roughly `6 x n_kv x ubatch x 4` bytes per device on
+top of the ordinary graph scratch; one that does not needs the ordinary scratch
+alone, which is near-flat in context and linear in micro-batch.
+
+The indexer coefficient rests on three points from one model, so it wants a
+second indexer-carrying model before it is trusted.
+
+### Two combinations llama.cpp refuses
+
+Both found by loads that failed outright, both now rejected on save:
+
+- `SPLIT_MODE_TENSOR requires flash_attn to be enabled`
+- `quantized V cache requires flash_attn to be enabled`
+
+The second is the one a user meets by accident, since a quantized cache is a
+common way to save memory.
+
+### Worth acting on now
+
+Flash-Next at its saved config spends 24.40 GiB of VRAM on compute buffers,
+and that term is linear in micro-batch: dropping ubatch from 1024 to 256 took
+it to 6.66 GiB, freeing about 18 GiB, at some prefill throughput cost. That is
+a larger saving than anything the per-layer embedding controls can offer, and
+it is available today.
+
 ## Not recommended: a fourth "system RAM" placement option
 
 The option was conceived to free VRAM by moving the table to host memory. The
