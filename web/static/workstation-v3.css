@@ -1,5 +1,6 @@
 /* BigCherry Toolchest UI v3 — readability and professional polish.
- * Loaded after workstation-v2.css. Keep this layer presentation-only.
+ * Temporary final-pass override while the render is being tuned. Once the
+ * visual direction is locked this can be folded into the workstation sheet.
  */
 
 :root {
@@ -13,15 +14,16 @@ body {
 }
 
 [data-theme="dark"] {
-    --pico-color: #d4d7dd;
-    --pico-muted-color: #9aa0aa;
-    --pico-h1-color: #f1f3f6;
-    --pico-h2-color: #eef0f3;
-    --pico-h3-color: #eaedf1;
-    --pico-h4-color: #e5e8ec;
-    --pico-form-element-color: #d8dbe1;
+    --pico-color: #d8dbe1;
+    --pico-muted-color: #9fa5af;
+    --pico-h1-color: #f3f4f6;
+    --pico-h2-color: #f0f2f4;
+    --pico-h3-color: #eceff2;
+    --pico-h4-color: #e7eaee;
+    --pico-form-element-color: #dde0e5;
 }
 
+/* Sidebar: separate rows cleanly; the selected item is a row, not a pill. */
 nav.sidebar {
     width: 218px !important;
     min-width: 218px !important;
@@ -29,12 +31,12 @@ nav.sidebar {
 }
 
 nav.sidebar .brand {
-    margin-bottom: 20px !important;
-    padding: 0 4px;
+    margin-bottom: 22px !important;
+    padding: 0 5px;
 }
 
 nav.sidebar .brand hgroup h3 {
-    font-size: 15.5px !important;
+    font-size: 16px !important;
     line-height: 1.2;
 }
 
@@ -44,7 +46,7 @@ nav.sidebar .brand hgroup p {
 }
 
 nav.sidebar ul {
-    gap: 5px !important;
+    gap: 6px !important;
 }
 
 nav.sidebar li {
@@ -57,28 +59,29 @@ nav.sidebar a {
     align-items: center;
     min-height: 34px;
     padding: 7px 10px !important;
-    border-radius: 7px !important;
-    font-size: 14.5px !important;
+    border: 0 !important;
+    border-radius: 6px !important;
+    font-size: 15px !important;
     font-weight: 450;
     line-height: 1.2 !important;
     text-align: left !important;
 }
 
 nav.sidebar a[aria-current="page"] {
-    background: #343943 !important;
-    color: #f0f2f5 !important;
-    box-shadow: inset 3px 0 0 #9ca8d2;
-    font-weight: 600;
+    background: #343942 !important;
+    color: #f2f3f5 !important;
+    box-shadow: inset 3px 0 0 #9ca8d2 !important;
+    font-weight: 600 !important;
 }
 
 nav.sidebar a:hover:not([aria-current="page"]) {
-    background: #2d3138 !important;
-    color: #eef0f3 !important;
+    background: #2b3037 !important;
+    color: #f0f2f4 !important;
 }
 
 #monitor-bar {
-    font-size: 12px !important;
-    line-height: 1.4;
+    font-size: 12.5px !important;
+    line-height: 1.45;
 }
 
 main.container {
@@ -102,10 +105,8 @@ th,
 label,
 input,
 select,
-textarea,
-button,
-[role="button"] {
-    font-size: 14px;
+textarea {
+    font-size: 14.5px;
 }
 
 small,
@@ -113,6 +114,7 @@ small code {
     font-size: 12.5px !important;
 }
 
+/* Cards: headings should read as headings, not tiny metadata. */
 article {
     padding: 18px 20px !important;
     border-radius: 10px !important;
@@ -122,10 +124,10 @@ article > header,
 .card-h,
 .build-card-header > div:first-child > strong,
 .compiled-builds-head > div:first-child > strong {
-    color: #c8ccd3 !important;
-    font-size: 13px !important;
+    color: #d1d5db !important;
+    font-size: 13.5px !important;
     font-weight: 650 !important;
-    letter-spacing: .02em !important;
+    letter-spacing: .01em !important;
     text-transform: none !important;
 }
 
@@ -133,9 +135,10 @@ article > header {
     margin-bottom: 14px !important;
 }
 
+/* Controls */
 label {
-    color: #cdd1d7;
-    font-size: 13.5px !important;
+    color: #d1d5db;
+    font-size: 14px !important;
     font-weight: 500;
 }
 
@@ -144,7 +147,7 @@ select,
 textarea {
     min-height: 40px !important;
     padding: 8px 11px !important;
-    font-size: 14px !important;
+    font-size: 14.5px !important;
     line-height: 1.35;
 }
 
@@ -158,9 +161,10 @@ button,
     align-items: center !important;
     justify-content: center !important;
     gap: 6px;
+    width: auto;
     min-height: 38px !important;
-    padding: 8px 14px !important;
-    font-size: 13.5px !important;
+    padding: 8px 15px !important;
+    font-size: 14px !important;
     font-weight: 550;
     line-height: 1 !important;
     text-align: center !important;
@@ -172,33 +176,39 @@ button svg,
     flex: 0 0 auto;
 }
 
-button:not(.contrast):not(.full-width),
-[role="button"]:not(.full-width) {
-    width: auto !important;
-}
-
 [role="group"] {
     align-items: center;
 }
 
+[role="group"] > button,
+[role="group"] > [role="button"] {
+    justify-content: center !important;
+    text-align: center !important;
+}
+
+/* Tables */
 table {
-    font-size: 13.5px !important;
+    font-size: 14px !important;
 }
 
 thead th {
     padding: 10px !important;
-    font-size: 11.5px !important;
-    letter-spacing: .03em !important;
+    font-size: 12px !important;
+    letter-spacing: .02em !important;
     text-transform: none !important;
-    color: #a8adb6 !important;
+    color: #afb4bd !important;
 }
 
 tbody td {
     padding: 11px 10px !important;
 }
 
+/* Settings: align like an app workspace, not a centered document. */
 body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
-    max-width: 1100px !important;
+    width: min(1180px, calc(100vw - 218px)) !important;
+    max-width: 1180px !important;
+    margin-left: 0 !important;
+    margin-right: auto !important;
 }
 
 body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article {
@@ -206,40 +216,41 @@ body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article {
 }
 
 body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article > p:first-of-type {
-    font-size: 13.5px !important;
-    color: #aeb3bc !important;
+    font-size: 14px !important;
+    color: #b1b6bf !important;
     line-height: 1.6;
 }
 
 body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-table td:first-child {
-    font-size: 13px !important;
+    font-size: 13.5px !important;
 }
 
 body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-table code {
-    font-size: 11.5px !important;
+    font-size: 12px !important;
 }
 
+/* Server */
 .server-card header,
 .live-perf header,
 .log-panel > header {
-    font-size: 13px !important;
+    font-size: 13.5px !important;
     text-transform: none !important;
-    letter-spacing: .02em !important;
+    letter-spacing: .01em !important;
 }
 
 .server-card label {
-    font-size: 13px !important;
+    font-size: 13.5px !important;
 }
 
 .server-card select,
 .server-card input[type="number"] {
-    min-height: 38px !important;
-    font-size: 13.5px !important;
+    min-height: 39px !important;
+    font-size: 14px !important;
 }
 
 .available-model-row,
 .available-model-row > code {
-    font-size: 13px !important;
+    font-size: 13.5px !important;
 }
 
 .live-perf {
@@ -250,6 +261,7 @@ body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-tabl
     font-size: 12.5px !important;
 }
 
+/* Builds */
 .builds-workspace {
     max-width: 1220px !important;
 }
@@ -259,45 +271,43 @@ body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-tabl
 }
 
 .build-card-header,
-.compiled-builds-head {
-    align-items: center !important;
-}
-
+.compiled-builds-head,
 .build-actions,
 .build-ref-actions {
-    align-items: center;
+    align-items: center !important;
 }
 
 .build-actions button,
 .build-ref-actions button,
 .build-ref-actions [role="button"] {
-    min-height: 36px !important;
+    min-height: 38px !important;
 }
 
+/* Models */
 .model-card-row {
-    min-height: 54px !important;
-    font-size: 13.5px !important;
+    min-height: 56px !important;
+    font-size: 14px !important;
 }
 
 .model-card-header {
-    font-size: 11.5px !important;
+    font-size: 12px !important;
     text-transform: none !important;
-    letter-spacing: .03em !important;
+    letter-spacing: .02em !important;
 }
 
 .model-card-name {
-    font-size: 14px;
+    font-size: 14.5px;
 }
 
 .model-card-quant,
 .model-card-vram,
 .model-card-size {
-    font-size: 12.5px !important;
+    font-size: 13px !important;
 }
 
 .model-card-actions button {
-    min-height: 34px !important;
-    font-size: 12.5px !important;
+    min-height: 35px !important;
+    font-size: 13px !important;
 }
 
 label[title] {
@@ -311,5 +321,8 @@ label[title] {
     }
     main.container {
         padding: 20px !important;
+    }
+    body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
+        width: calc(100vw - 205px) !important;
     }
 }
