@@ -1,12 +1,66 @@
+// Shared UI bootstrap. Keep this dependency-free: the app deliberately has no
+// frontend build step, and this file is already loaded on every page.
+(function bootstrapWorkstationUI() {
+    if (!document.getElementById('toolchest-workstation-css')) {
+        const link = document.createElement('link');
+        link.id = 'toolchest-workstation-css';
+        link.rel = 'stylesheet';
+        link.href = '/static/workstation.css';
+        document.head.appendChild(link);
+    }
+
+    // Graphite was designed as the workstation default but historically
+    // shipped as an opt-in theme. Preserve an explicit browser preference;
+    // only choose Graphite when the user has never selected a theme.
+    try {
+        if (!localStorage.getItem('llama-toolchest-theme')) {
+            const root = document.getElementById('html-root') || document.documentElement;
+            root.setAttribute('data-theme', 'dark');
+            root.setAttribute('data-custom-theme', 'graphite');
+            localStorage.setItem('llama-toolchest-theme', 'graphite');
+        }
+    } catch (_) {
+        // Local storage can be unavailable in hardened/private contexts. The
+        // application remains usable with its server-rendered dark fallback.
+    }
+})();
+
 // Log panel: live-tail auto-scroll + copy to clipboard + clear
 document.addEventListener('DOMContentLoaded', () => {
     initLogPanels();
+    initThemeChoiceState();
 });
 
 // Re-init after htmx swaps (for dynamically inserted build logs)
 document.addEventListener('htmx:afterSettle', () => {
     initLogPanels();
 });
+
+function initThemeChoiceState() {
+    const buttons = document.querySelectorAll('button[onclick^="setTheme("]');
+    if (!buttons.length) return;
+
+    const selectedTheme = () => {
+        try {
+            return localStorage.getItem('llama-toolchest-theme') || 'graphite';
+        } catch (_) {
+            return 'graphite';
+        }
+    };
+
+    const sync = () => {
+        const selected = selectedTheme();
+        buttons.forEach(button => {
+            const match = button.getAttribute('onclick').match(/setTheme\(['"]([^'"]+)['"]\)/);
+            if (!match) return;
+            button.dataset.themeChoice = match[1];
+            button.setAttribute('aria-pressed', String(match[1] === selected));
+        });
+    };
+
+    buttons.forEach(button => button.addEventListener('click', () => setTimeout(sync, 0)));
+    sync();
+}
 
 function initLogPanels() {
     document.querySelectorAll('.log-panel').forEach(panel => {

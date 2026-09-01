@@ -1,0 +1,532 @@
+/* BigCherry Toolchest workstation UI
+ *
+ * A deliberately thin visual layer over the existing Pico + html/template +
+ * htmx application.  Keep behaviour and route/partial structure unchanged so
+ * upstream rebases stay cheap.
+ */
+
+:root {
+    --tc-gap: 14px;
+    --tc-card-radius: 12px;
+    --tc-control-radius: 8px;
+    --tc-inset: #141619;
+    --tc-border-soft: #23262c;
+    font-size: 14px;
+}
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    font-size: 14px !important;
+    line-height: 1.45;
+}
+
+main.container {
+    width: 100%;
+    max-width: none !important;
+    padding: 22px 26px !important;
+}
+
+/* ---- Application shell ------------------------------------------------- */
+nav.sidebar {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    box-shadow: none;
+}
+
+nav.sidebar .brand::before {
+    content: "L";
+    width: 28px;
+    height: 28px;
+    flex: 0 0 28px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--pico-primary);
+    border-radius: 9px;
+    background: var(--accent-soft, color-mix(in srgb, var(--pico-primary) 16%, transparent));
+    color: var(--pico-primary);
+    font: 600 14px/1 var(--pico-font-family-monospace);
+}
+
+nav.sidebar .brand hgroup h3 {
+    font-size: 16px !important;
+}
+
+nav.sidebar .brand hgroup p {
+    font-size: 11px !important;
+}
+
+nav.sidebar a {
+    font-size: 14px !important;
+    line-height: 1.3;
+}
+
+#monitor-bar {
+    font-size: 11.5px !important;
+    opacity: 1 !important;
+}
+
+#monitor-bar progress {
+    height: 7px;
+    border-radius: 5px;
+}
+
+/* ---- Typography / page hierarchy -------------------------------------- */
+h1 {
+    margin: 0 0 16px;
+    font-size: 20px !important;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+h2 { font-size: 17px; }
+h3 { font-size: 15px; }
+
+small,
+small code {
+    font-size: 12px !important;
+}
+
+code,
+kbd,
+pre,
+.mono {
+    font-family: var(--pico-font-family-monospace);
+}
+
+kbd {
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+/* ---- Cards / forms / controls ----------------------------------------- */
+article {
+    margin: 0 0 var(--tc-gap);
+    padding: 15px 17px;
+    border-radius: var(--tc-card-radius) !important;
+    box-shadow: none !important;
+}
+
+article > header {
+    margin: -3px 0 12px !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+    color: var(--pico-muted-color);
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+article > footer {
+    background: transparent;
+}
+
+label {
+    font-size: 12.5px;
+}
+
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+    min-height: 36px;
+    margin-top: 5px;
+    padding: 7px 10px !important;
+    border-radius: var(--tc-control-radius) !important;
+    font-size: 13px !important;
+}
+
+button,
+[role="button"] {
+    min-height: 34px;
+    width: auto;
+    margin-bottom: 0;
+    padding: 6px 13px !important;
+    border-radius: 9px !important;
+    font-size: 12.5px !important;
+    line-height: 1.35;
+}
+
+button.outline,
+[role="button"].outline {
+    background: transparent;
+}
+
+button:hover,
+[role="button"]:hover {
+    border-color: var(--pico-primary);
+}
+
+[role="group"] {
+    gap: 7px;
+}
+
+[role="group"] > * {
+    margin: 0 !important;
+}
+
+hr {
+    margin: 16px 0;
+    border-color: var(--pico-muted-border-color);
+}
+
+/* ---- Tables ------------------------------------------------------------ */
+table {
+    margin-bottom: 0;
+    font-size: 12.5px;
+}
+
+thead th {
+    padding: 8px 9px;
+    color: var(--pico-muted-color);
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+tbody td {
+    padding: 9px;
+    vertical-align: middle;
+}
+
+tbody tr:last-child td {
+    border-bottom: 0;
+}
+
+/* ---- Graphite completion ---------------------------------------------- */
+[data-custom-theme="graphite"] {
+    --tc-inset: #141619;
+    --tc-border-soft: #23262c;
+}
+
+[data-custom-theme="graphite"] article {
+    border: 1px solid #2b2f36;
+    background: #1e2126;
+}
+
+[data-custom-theme="graphite"] input:not([type="checkbox"]):not([type="radio"]),
+[data-custom-theme="graphite"] select,
+[data-custom-theme="graphite"] textarea {
+    background: #23272d;
+}
+
+[data-custom-theme="graphite"] pre,
+[data-custom-theme="graphite"] .log-panel pre {
+    background: #101215;
+    border-color: #2b2f36;
+}
+
+[data-custom-theme="graphite"] progress {
+    background: #141619;
+}
+
+[data-custom-theme="graphite"] progress::-webkit-progress-value {
+    background: #9aa6d4;
+}
+
+[data-custom-theme="graphite"] progress::-moz-progress-bar {
+    background: #9aa6d4;
+}
+
+[data-custom-theme="graphite"] ins,
+[data-custom-theme="graphite"] .status-success,
+[data-custom-theme="graphite"] .status-completed,
+[data-custom-theme="graphite"] .status-done {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: rgba(127, 180, 144, 0.16);
+    color: #7fb490;
+    text-decoration: none;
+}
+
+[data-custom-theme="graphite"] del,
+[data-custom-theme="graphite"] .status-failed {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: rgba(217, 138, 138, 0.16);
+    color: #d98a8a;
+    text-decoration: none;
+}
+
+[data-custom-theme="graphite"] mark,
+[data-custom-theme="graphite"] .status-running {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: rgba(154, 166, 212, 0.16);
+    color: #9aa6d4;
+}
+
+/* ---- Server ------------------------------------------------------------ */
+.server-page {
+    height: calc(100vh - 44px) !important;
+    gap: 0;
+}
+
+.server-top > .grid:first-child {
+    display: grid !important;
+    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+    gap: var(--tc-gap) !important;
+    align-items: stretch;
+}
+
+.server-top > .grid:first-child > article,
+#dashboard-cards > article {
+    min-width: 0;
+    margin: 0;
+}
+
+/* /api/dashboard emits Available Models, Inventory, API Endpoint in that
+ * order.  display:contents keeps them as siblings in the parent grid. */
+#dashboard-cards > article:nth-child(3) {
+    grid-column: 1 / -1;
+}
+
+.server-card label {
+    font-size: 12px !important;
+}
+
+.server-card select,
+.server-card input[type="number"] {
+    min-height: 34px !important;
+    font-size: 12.5px !important;
+}
+
+#server-status-badge {
+    min-height: 26px;
+}
+
+.available-models-scroll {
+    scrollbar-width: thin;
+}
+
+.live-perf {
+    margin-top: var(--tc-gap) !important;
+    padding: 12px 17px !important;
+}
+
+.server-page .log-section {
+    margin-top: 0;
+}
+
+.server-page .log-section .log-panel {
+    border-radius: var(--tc-card-radius);
+}
+
+.server-page .log-section .log-panel pre {
+    padding: 12px 14px;
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: 8px;
+    font-size: 11.5px !important;
+    line-height: 1.5;
+}
+
+/* ---- Builds ------------------------------------------------------------ */
+body:has(nav.sidebar a[href="/builds"][aria-current="page"]) main.container {
+    max-width: 1500px !important;
+}
+
+body:has(nav.sidebar a[href="/builds"][aria-current="page"]) main > article form > .grid {
+    gap: 12px;
+}
+
+body:has(nav.sidebar a[href="/builds"][aria-current="page"]) #build-output:empty,
+body:has(nav.sidebar a[href="/builds"][aria-current="page"]) #external-build-output:empty {
+    display: none;
+}
+
+body:has(nav.sidebar a[href="/builds"][aria-current="page"]) article:has(form[hx-post="/api/builds?external=1"]) {
+    border-style: dashed;
+}
+
+body:has(nav.sidebar a[href="/builds"][aria-current="page"]) article:has(form[hx-post="/api/builds?external=1"]) > header small {
+    color: var(--pico-primary);
+}
+
+/* ---- Models ------------------------------------------------------------ */
+.model-list-controls {
+    margin-bottom: 10px !important;
+}
+
+.model-card-list {
+    gap: 10px !important;
+}
+
+.model-card {
+    border-radius: 10px !important;
+    box-shadow: none;
+}
+
+.model-card-row {
+    min-height: 49px;
+    padding: 8px 11px !important;
+    font-size: 13px !important;
+}
+
+.model-card-header {
+    padding: 0 11px 6px !important;
+    font-size: 10.5px !important;
+    letter-spacing: 0.05em !important;
+}
+
+.model-card-name {
+    font-weight: 500;
+    color: var(--pico-h3-color);
+}
+
+.model-card-quant,
+.model-card-vram,
+.model-card-size {
+    font-family: var(--pico-font-family-monospace);
+    font-size: 12px;
+}
+
+.model-card-actions button {
+    min-height: 29px;
+    padding: 4px 9px !important;
+    font-size: 11.5px !important;
+}
+
+.model-card:has(.model-card-config:not(:empty)) {
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--pico-primary) 50%, transparent);
+}
+
+.model-card-config:not(:empty) {
+    border-top-color: var(--tc-border-soft) !important;
+}
+
+/* ---- Benchmarks -------------------------------------------------------- */
+body:has(nav.sidebar a[href="/benchmarks"][aria-current="page"]) main.container {
+    max-width: none !important;
+}
+
+body:has(nav.sidebar a[href="/benchmarks"][aria-current="page"]) details {
+    border-radius: 10px;
+}
+
+body:has(nav.sidebar a[href="/benchmarks"][aria-current="page"]) summary {
+    font-size: 12.5px;
+}
+
+body:has(nav.sidebar a[href="/benchmarks"][aria-current="page"]) table td code,
+body:has(nav.sidebar a[href="/benchmarks"][aria-current="page"]) .mono {
+    font-size: 11.5px;
+}
+
+/* ---- Settings ---------------------------------------------------------- */
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
+    max-width: 1040px !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article > p:first-of-type {
+    margin-top: 0;
+    color: var(--pico-muted-color);
+    font-size: 12.5px;
+    line-height: 1.55;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-table td:first-child {
+    line-height: 1.35;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) button[data-theme-choice][aria-pressed="true"] {
+    border-color: var(--pico-primary);
+    background: var(--accent-soft, color-mix(in srgb, var(--pico-primary) 14%, transparent));
+    color: var(--pico-primary-hover);
+}
+
+/* ---- Help -------------------------------------------------------------- */
+body:has(nav.sidebar a[href="/help"][aria-current="page"]) main.container {
+    max-width: 1100px !important;
+}
+
+body:has(nav.sidebar a[href="/help"][aria-current="page"]) h2 {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--pico-muted-border-color);
+}
+
+/* ---- Responsive -------------------------------------------------------- */
+@media (max-width: 1100px) {
+    nav.sidebar {
+        width: 190px;
+        min-width: 190px;
+    }
+
+    main.container {
+        padding: 18px !important;
+    }
+
+    .server-top > .grid:first-child {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    }
+
+    #dashboard-cards > article:nth-child(3) {
+        grid-column: 1 / -1;
+    }
+}
+
+@media (max-width: 760px) {
+    body {
+        display: block !important;
+    }
+
+    nav.sidebar {
+        position: static;
+        width: 100%;
+        min-width: 0;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--pico-muted-border-color);
+    }
+
+    nav.sidebar ul {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    #monitor-bar {
+        display: none;
+    }
+
+    main.container {
+        max-height: none !important;
+        padding: 16px !important;
+    }
+
+    .server-page {
+        height: auto !important;
+    }
+
+    .server-top > .grid:first-child {
+        grid-template-columns: 1fr !important;
+    }
+
+    #dashboard-cards > article:nth-child(3) {
+        grid-column: auto;
+    }
+
+    .model-card-header {
+        display: none !important;
+    }
+
+    .model-card-row {
+        grid-template-columns: 2.5rem minmax(0, 1fr) auto !important;
+    }
+
+    .model-card-quant,
+    .model-card-vram,
+    .model-card-size {
+        display: none;
+    }
+}
