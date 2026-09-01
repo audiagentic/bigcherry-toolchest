@@ -1,139 +1,167 @@
 {{define "content"}}
-<h1>Builds</h1>
-
-<article>
-    <header>New Build</header>
-    <form hx-post="/api/builds"
-          hx-target="#build-output"
-          hx-swap="innerHTML">
-        <div class="grid">
-            <label>
-                Profile
-                <select name="profile" id="build-profile"
-                        hx-get="/api/builds/options"
-                        hx-target="#build-options"
-                        hx-swap="outerHTML"
-                        hx-trigger="change, load">
-                    {{range .Backends}}
-                    {{if .Available}}
-                    <option value="{{.Name}}">{{.Name}}{{if .Info}} ({{.Info}}){{end}}</option>
-                    {{end}}
-                    {{end}}
-                </select>
-            </label>
-            <label>
-                Git Ref
-                <div style="display:flex;gap:0.5rem;align-items:center;">
-                    <select name="git_ref" id="git-ref-select" style="margin:0;"
-                            onchange="var a=document.getElementById('ref-link');var v=this.value;if(v==='latest'){a.href='https://github.com/ggerganov/llama.cpp/releases/latest';}else{a.href='https://github.com/ggerganov/llama.cpp/releases/tag/'+v;}">
-                        <option value="latest" selected>latest</option>
-                    </select>
-                    <a id="ref-link" href="https://github.com/ggerganov/llama.cpp/releases/latest"
-                       target="_blank" rel="noopener"
-                       style="margin:0;padding:0.25rem 0.75rem;font-size:0.85rem;white-space:nowrap;"
-                       class="outline"
-                       title="View release notes on GitHub">
-                        Release Notes
-                    </a>
-                    <button type="button" class="outline secondary"
-                            style="margin:0;padding:0.25rem 0.75rem;font-size:0.85rem;white-space:nowrap;"
-                            hx-get="/api/builds/refs?refresh=1"
-                            hx-target="#git-ref-select"
-                            hx-swap="innerHTML"
-                            hx-disabled-elt="this"
-                            hx-indicator="this"
-                            title="Pull latest tags from the llama.cpp remote">
-                        Refresh Tags
-                    </button>
-                </div>
-            </label>
-        </div>
-
-        <label title="Optional label appended to the build ID so multiple builds of the same ref+profile can coexist (e.g. 'rocwmma' or 'no-fattn'). Lowercase letters, digits, and hyphens. If left blank and a build with the same ref+profile already exists with different flags, a short hash of the flags is appended automatically. Also names a saved flag set when you press Save Flags.">
-            Build Tag <small>(optional; names saved flag sets)</small>
-            <input type="text" id="build-tag" name="tag" placeholder="e.g. rocwmma" pattern="[a-z0-9][a-z0-9-]*" autocomplete="off">
-        </label>
-
-        <!-- hx-target="this" is load-bearing: without it the div inherits
-             the form's hx-target="#build-output" and the row renders
-             below the Start Build button, outside the card. -->
-        <div id="flag-presets"
-             hx-get="/api/builds/flag-presets"
-             hx-include="#build-profile"
-             hx-trigger="load, change from:#build-profile"
-             hx-target="this"
-             hx-swap="innerHTML">
-        </div>
-
-        <div id="build-options">
-            <!-- Populated by htmx when profile changes -->
-        </div>
-
-        <button type="submit">Start Build</button>
-    </form>
-</article>
-
-<div id="build-output"
-     hx-get="/api/builds/active-log"
-     hx-trigger="load"
-     hx-swap="innerHTML">
+<div class="page-heading builds-page-heading">
+    <div>
+        <h1>Builds</h1>
+        <p>Compile llama.cpp variants, manage existing binaries, and select builds for benchmarking.</p>
+    </div>
 </div>
 
-<article>
-    <header>Register Existing Build <small>(BigCherry / external)</small></header>
-    <p><small>Registers an existing <code>llama-server</code> by reference. The build is immediately available to server selection and benchmark jobs; Toolchest does not copy or own the external files.</small></p>
-    <form hx-post="/api/builds?external=1"
-          hx-target="#external-build-output"
-          hx-swap="innerHTML">
-        <div class="grid">
-            <label>
-                Build ID
-                <input type="text" name="id" required placeholder="bigcherry-control-linux-multi-..." pattern="[A-Za-z0-9][A-Za-z0-9._-]*" autocomplete="off">
-            </label>
-            <label>
-                Profile
-                <select name="profile" required>
-                    {{range .Backends}}
-                    {{if .Available}}
-                    <option value="{{.Name}}">{{.Name}}{{if .Info}} ({{.Info}}){{end}}</option>
-                    {{end}}
-                    {{end}}
-                </select>
-            </label>
-        </div>
-        <label>
-            llama-server path
-            <input type="text" name="binary_path" required placeholder="/path/to/immutable/bundle/llama-server" autocomplete="off">
-        </label>
-        <div class="grid">
-            <label>
-                llama.cpp ref / revision <small>(optional)</small>
-                <input type="text" name="git_ref" placeholder="b10705 or full upstream SHA" autocomplete="off">
-            </label>
-            <label>
-                Producer Git SHA <small>(optional)</small>
-                <input type="text" name="git_sha" placeholder="BigCherry commit SHA" autocomplete="off">
-            </label>
-        </div>
-        <label>
-            Tag <small>(optional)</small>
-            <input type="text" name="tag" placeholder="effective/runtime identity" autocomplete="off">
-        </label>
-        <label style="display:flex;align-items:center;gap:0.5rem;">
-            <input type="checkbox" name="replace" value="1" role="switch" style="margin:0;">
-            Replace an existing registration with the same ID
-        </label>
-        <button type="submit">Register Build</button>
-    </form>
-    <div id="external-build-output"></div>
-</article>
+<div class="builds-workspace">
+    <article class="build-primary-card">
+        <header>
+            <div>
+                <strong>New build</strong>
+                <small>Compile a reproducible llama.cpp build</small>
+            </div>
+        </header>
+        <form hx-post="/api/builds"
+              hx-target="#build-output"
+              hx-swap="innerHTML">
+            <div class="build-top-grid">
+                <label>
+                    Profile
+                    <select name="profile" id="build-profile"
+                            hx-get="/api/builds/options"
+                            hx-target="#build-options"
+                            hx-swap="outerHTML"
+                            hx-trigger="change, load">
+                        {{range .Backends}}
+                        {{if .Available}}
+                        <option value="{{.Name}}">{{.Name}}{{if .Info}} ({{.Info}}){{end}}</option>
+                        {{end}}
+                        {{end}}
+                    </select>
+                </label>
+                <label>
+                    Git Ref
+                    <div class="build-ref-row">
+                        <select name="git_ref" id="git-ref-select"
+                                onchange="var a=document.getElementById('ref-link');var v=this.value;if(v==='latest'){a.href='https://github.com/ggerganov/llama.cpp/releases/latest';}else{a.href='https://github.com/ggerganov/llama.cpp/releases/tag/'+v;}">
+                            <option value="latest" selected>latest</option>
+                        </select>
+                        <a id="ref-link" href="https://github.com/ggerganov/llama.cpp/releases/latest"
+                           target="_blank" rel="noopener"
+                           class="outline build-inline-action"
+                           title="View release notes on GitHub">
+                            Release notes
+                        </a>
+                        <button type="button" class="outline secondary build-inline-action"
+                                hx-get="/api/builds/refs?refresh=1"
+                                hx-target="#git-ref-select"
+                                hx-swap="innerHTML"
+                                hx-disabled-elt="this"
+                                hx-indicator="this"
+                                title="Pull latest tags from the llama.cpp remote">
+                            Refresh
+                        </button>
+                    </div>
+                </label>
+            </div>
 
-<article>
-    <header>Compiled Builds</header>
-    <div id="build-list" hx-get="/api/builds" hx-trigger="load, buildsChanged from:body" hx-swap="innerHTML">
-        Loading...
+            <label title="Optional label appended to the build ID so multiple builds of the same ref+profile can coexist (e.g. 'rocwmma' or 'no-fattn'). Lowercase letters, digits, and hyphens. If left blank and a build with the same ref+profile already exists with different flags, a short hash of the flags is appended automatically. Also names a saved flag set when you press Save Flags.">
+                Build Tag <small>optional · names saved flag sets</small>
+                <input type="text" id="build-tag" name="tag" placeholder="e.g. rocwmma" pattern="[a-z0-9][a-z0-9-]*" autocomplete="off">
+            </label>
+
+            <!-- hx-target="this" is load-bearing: without it the div inherits
+                 the form's hx-target="#build-output" and the row renders
+                 below the Start Build button, outside the card. -->
+            <div id="flag-presets"
+                 hx-get="/api/builds/flag-presets"
+                 hx-include="#build-profile"
+                 hx-trigger="load, change from:#build-profile"
+                 hx-target="this"
+                 hx-swap="innerHTML">
+            </div>
+
+            <div id="build-options">
+                <!-- Populated by htmx when profile changes -->
+            </div>
+
+            <div class="build-form-actions">
+                <span class="build-form-hint">The resulting build is registered automatically when compilation succeeds.</span>
+                <button type="submit">Start build</button>
+            </div>
+        </form>
+    </article>
+
+    <div id="build-output"
+         hx-get="/api/builds/active-log"
+         hx-trigger="load"
+         hx-swap="innerHTML">
     </div>
-</article>
+
+    <details class="external-build-disclosure">
+        <summary>
+            <span>
+                <strong>Register existing build</strong>
+                <small>Advanced · BigCherry or another externally-produced llama-server</small>
+            </span>
+            <span class="disclosure-hint">Manual registration</span>
+        </summary>
+        <div class="external-build-panel">
+            <p>Registers an existing <code>llama-server</code> by reference. Toolchest does not copy or own the external files.</p>
+            <form hx-post="/api/builds?external=1"
+                  hx-target="#external-build-output"
+                  hx-swap="innerHTML">
+                <div class="build-top-grid">
+                    <label>
+                        Build ID
+                        <input type="text" name="id" required placeholder="bigcherry-control-linux-multi-..." pattern="[A-Za-z0-9][A-Za-z0-9._-]*" autocomplete="off">
+                    </label>
+                    <label>
+                        Profile
+                        <select name="profile" required>
+                            {{range .Backends}}
+                            {{if .Available}}
+                            <option value="{{.Name}}">{{.Name}}{{if .Info}} ({{.Info}}){{end}}</option>
+                            {{end}}
+                            {{end}}
+                        </select>
+                    </label>
+                </div>
+                <label>
+                    llama-server path
+                    <input type="text" name="binary_path" required placeholder="/path/to/immutable/bundle/llama-server" autocomplete="off">
+                </label>
+                <div class="build-top-grid">
+                    <label>
+                        llama.cpp ref / revision <small>optional</small>
+                        <input type="text" name="git_ref" placeholder="b10705 or full upstream SHA" autocomplete="off">
+                    </label>
+                    <label>
+                        Producer Git SHA <small>optional</small>
+                        <input type="text" name="git_sha" placeholder="BigCherry commit SHA" autocomplete="off">
+                    </label>
+                </div>
+                <label>
+                    Tag <small>optional</small>
+                    <input type="text" name="tag" placeholder="effective/runtime identity" autocomplete="off">
+                </label>
+                <div class="build-form-actions">
+                    <label class="external-replace-toggle">
+                        <input type="checkbox" name="replace" value="1" role="switch">
+                        Replace same-ID registration
+                    </label>
+                    <button type="submit" class="secondary">Register build</button>
+                </div>
+            </form>
+            <div id="external-build-output"></div>
+        </div>
+    </details>
+
+    <article class="build-list-card">
+        <header>
+            <div>
+                <strong>Compiled builds</strong>
+                <small>Available to the server and benchmark jobs</small>
+            </div>
+        </header>
+        <div id="build-list" hx-get="/api/builds" hx-trigger="load, buildsChanged from:body" hx-swap="innerHTML">
+            Loading...
+        </div>
+    </article>
+</div>
 
 <dialog id="build-info-modal" style="max-width:640px;">
     <article>
