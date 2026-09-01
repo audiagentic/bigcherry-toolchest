@@ -1,0 +1,73 @@
+name: Sync upstream Toolchest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 20 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-toolchest
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/tmac1973/llama-toolchest.git || true
+          git fetch upstream main --tags
+
+      - name: Prepare sync branch
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH=chore/sync-upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH" origin/main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-edit upstream/main; then
+            echo "Upstream merge conflicted. Resolve manually; main was not changed."
+            exit 1
+          fi
+
+          git push --force-with-lease origin "$BRANCH"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update sync PR
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.prepare.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing="$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" \
+              --title "chore: sync upstream Toolchest" \
+              --body "Automated merge of tmac1973/llama-toolchest:main into this fork. Review CI and conflicts before merging. This workflow never auto-merges."
+          else
+            gh pr create \
+              --head "$BRANCH" \
+              --base main \
+              --title "chore: sync upstream Toolchest" \
+              --body "Automated merge of tmac1973/llama-toolchest:main into this fork. Review CI and conflicts before merging. This workflow never auto-merges."
+          fi
