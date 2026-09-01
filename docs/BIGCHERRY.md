@@ -1,12 +1,46 @@
 # BigCherry Toolchest integration
 
-This fork keeps BigCherry responsible for producing tuned llama.cpp binaries and uses Toolchest as the launcher, experiment manager, benchmark matrix runner, history store, and comparison UI.
+This fork keeps BigCherry responsible for producing formal llama.cpp comparison builds and uses Toolchest as the launcher, experiment manager, benchmark matrix runner, history store, and comparison UI.
 
-## External build registration
+## Live external build registration
 
-An external build is registered into Toolchest's native `builds.json` registry. Toolchest does not copy or own the supplied binary. Existing build selection, router lifecycle, benchmark jobs, and benchmark `BuildSnapshot` capture then work without a separate BigCherry code path.
+An external build is registered into Toolchest's native build registry. Toolchest does not copy or own the supplied binary. Existing build selection, router lifecycle, benchmark jobs, and benchmark `BuildSnapshot` capture work without a separate BigCherry execution path.
 
-Use the import command from this repository:
+The live endpoint is:
+
+    POST /api/builds?external=1
+
+JSON fields:
+
+- `id`: stable build identity
+- `profile`: Toolchest build profile (`rocm`, `vulkan`, etc.)
+- `binary_path`: `llama-server` executable or directory containing it
+- `git_ref`: source/upstream revision
+- `git_sha`: producer revision
+- `tag`: optional human/identity label
+- `replace`: replace the same build ID when true
+
+A successful request updates the same in-memory Builder used by router selection and benchmark jobs and persists the entry to `builds.json`. The build is immediately available; Toolchest does not need to restart.
+
+The Builds page exposes the same operation under **Register Existing Build (BigCherry / external)**.
+
+## Automatic BigCherry handoff
+
+BigCherry can publish completed canonical builds directly by setting:
+
+    BIGCHERRY_TOOLCHEST_URL=http://127.0.0.1:3000
+
+and then running its normal build workflow, for example:
+
+    bigcherry build --profile standard
+
+With publication enabled, BigCherry produces `llama-server` plus `llama-bench` from the same content-addressed BuildPlan, publishes them into the same verified runtime bundle, and registers the immutable ArtifactStore `llama-server` path here. Toolchest then owns launch/benchmark state while BigCherry remains the artifact authority.
+
+Toolchest and BigCherry must see the registered absolute path. If Toolchest runs in a container, bind-mount the BigCherry ArtifactStore/work root at the same absolute path inside the container.
+
+## Offline importer fallback
+
+The command-line importer remains useful when Toolchest is not running:
 
     go run ./cmd/toolchest-import-build \
       --data-dir /path/to/toolchest-data \
@@ -17,49 +51,37 @@ Use the import command from this repository:
       --git-sha <bigcherry-commit> \
       --tag bigcherry-mmq
 
-`--binary` may point directly to `llama-server` or to a directory containing `llama-server`.
-
-Use `--replace` to update an existing registry entry with the same ID.
-
-Restart Toolchest after importing so the running service reloads `builds.json`.
+`--binary` may point directly to `llama-server` or to a directory containing `llama-server`. Use `--replace` to update an existing registry entry with the same ID. Because this fallback edits persisted registry state rather than the running Builder instance, restart Toolchest after using the offline importer.
 
 ## Provenance convention
 
-Until upstream Toolchest gains first-class arbitrary-source metadata, use the native build fields consistently:
+For BigCherry-published builds:
 
-- `ID`: stable lane/build identity, e.g. `bigcherry-b10227-hip-mmq`
-- `Profile`: Toolchest backend/profile, normally `rocm` or `vulkan`
-- `GitSHA`: exact BigCherry commit used to produce the binary
-- `GitRef`: upstream/base ref or BigCherry branch used for the run
-- `Tag`: short variant label, e.g. `mmq-rccl`, `cublas-rocwmma`, `baseline`
+- `ID`: `<source>-<build>-<platform>-<full BigCherry build_plan_id>`
+- `Profile`: Toolchest backend/profile; BigCherry `hip` maps to `rocm`
+- `GitRef`: exact resolved upstream llama.cpp revision
+- `GitSHA`: exact BigCherry producer revision
+- `Tag`: short effective-build/runtime-bundle identity (`eb-...-rb-...`)
+- `BinaryPath`: immutable BigCherry ArtifactStore `llama-server`
 
-These fields are already copied into benchmark `BuildSnapshot`, so historical benchmark results retain the build identity even if the build registry later changes.
+These native fields are already copied into benchmark `BuildSnapshot`, so historical benchmark results retain the registered build identity even if the live registry later changes. Detailed source-slice, patch, input, toolchain and runtime-bundle provenance remains authoritative in BigCherry's immutable artifact store.
 
-## A/B job shape
+## Formal A/B rule
 
-Toolchest benchmark jobs already expand `models x builds x presets x sweeps`. Register each upstream/BigCherry binary as a distinct build ID, then select them in one job.
+Build both stock upstream and patched candidates through BigCherry for formal comparisons. This keeps compiler/toolchain, backend stack, requested targets and build environment under one identity system; the code/patch selection is then the intended difference rather than an accidental second build pipeline.
 
-Typical matrix:
+Toolchest's native llama.cpp builder remains available for convenience and exploratory work, but it should not be used as the baseline side of formal BigCherry A/B results.
 
-- upstream HIP baseline
-- BigCherry HIP baseline
-- BigCherry HIP MMQ
-- upstream Vulkan
-- BigCherry Vulkan
-
-Then sweep model parameters such as tensor split, GPU assignment, KV type, batch/ubatch, and `draft-mtp` depth through Toolchest's existing job system.
+Toolchest benchmark jobs already expand `models x builds x presets x sweeps`. Register each upstream/BigCherry runtime bundle as a distinct Build ID, then select them in one job and sweep tensor split, GPU assignment, KV type, batch/ubatch and `draft-mtp` settings through the existing job system.
 
 ## Deletion safety
 
-Deleting an imported build from Toolchest unregisters the build. Toolchest's delete path removes only its own `dataDir/builds/<id>` directory; the registered external executable is not removed or modified.
+Deleting an imported build from Toolchest unregisters the build. Toolchest's delete path removes only its own `dataDir/builds/<id>` directory; the registered BigCherry ArtifactStore executable and runtime bundle are not removed or modified.
 
 ## Upstream maintenance
 
 Keep BigCherry-specific changes small. Generic functionality suitable for Toolchest should be proposed upstream. This fork includes a scheduled sync workflow that merges `tmac1973/llama-toolchest:main` into a sync branch and opens/updates a PR against this fork's `main`; it never auto-merges upstream changes.
 
-## Next integration slices
+## Next benchmark integrations
 
-1. Add a Web UI/API form for external build registration.
-2. Promote arbitrary source repository/upstream-base/lane fields to first-class `BuildResult`/`BuildSnapshot` metadata and propose that generic model upstream.
-3. Add SPEED-Bench as a benchmark adapter for MTP acceptance/speculative decoding characterization.
-4. Optionally add GuideLLM/k6 adapters for sustained server load and saturation tests.
+The next benchmark adapter should be SPEED-Bench for MTP/speculative-decoding acceptance and workload characterization. GuideLLM/k6 remain optional additions for sustained server load and saturation testing.

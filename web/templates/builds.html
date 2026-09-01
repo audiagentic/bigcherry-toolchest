@@ -80,6 +80,55 @@
 </div>
 
 <article>
+    <header>Register Existing Build <small>(BigCherry / external)</small></header>
+    <p><small>Registers an existing <code>llama-server</code> by reference. The build is immediately available to server selection and benchmark jobs; Toolchest does not copy or own the external files.</small></p>
+    <form hx-post="/api/builds?external=1"
+          hx-target="#external-build-output"
+          hx-swap="innerHTML">
+        <div class="grid">
+            <label>
+                Build ID
+                <input type="text" name="id" required placeholder="bigcherry-control-linux-multi-..." pattern="[A-Za-z0-9][A-Za-z0-9._-]*" autocomplete="off">
+            </label>
+            <label>
+                Profile
+                <select name="profile" required>
+                    {{range .Backends}}
+                    {{if .Available}}
+                    <option value="{{.Name}}">{{.Name}}{{if .Info}} ({{.Info}}){{end}}</option>
+                    {{end}}
+                    {{end}}
+                </select>
+            </label>
+        </div>
+        <label>
+            llama-server path
+            <input type="text" name="binary_path" required placeholder="/path/to/immutable/bundle/llama-server" autocomplete="off">
+        </label>
+        <div class="grid">
+            <label>
+                llama.cpp ref / revision <small>(optional)</small>
+                <input type="text" name="git_ref" placeholder="b10705 or full upstream SHA" autocomplete="off">
+            </label>
+            <label>
+                Producer Git SHA <small>(optional)</small>
+                <input type="text" name="git_sha" placeholder="BigCherry commit SHA" autocomplete="off">
+            </label>
+        </div>
+        <label>
+            Tag <small>(optional)</small>
+            <input type="text" name="tag" placeholder="effective/runtime identity" autocomplete="off">
+        </label>
+        <label style="display:flex;align-items:center;gap:0.5rem;">
+            <input type="checkbox" name="replace" value="1" role="switch" style="margin:0;">
+            Replace an existing registration with the same ID
+        </label>
+        <button type="submit">Register Build</button>
+    </form>
+    <div id="external-build-output"></div>
+</article>
+
+<article>
     <header>Compiled Builds</header>
     <div id="build-list" hx-get="/api/builds" hx-trigger="load, buildsChanged from:body" hx-swap="innerHTML">
         Loading...
