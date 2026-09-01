@@ -1,0 +1,315 @@
+/* BigCherry Toolchest UI v3 — readability and professional polish.
+ * Loaded after workstation-v2.css. Keep this layer presentation-only.
+ */
+
+:root {
+    font-size: 15px;
+}
+
+body {
+    font-size: 15px !important;
+    line-height: 1.5;
+    letter-spacing: 0;
+}
+
+[data-theme="dark"] {
+    --pico-color: #d4d7dd;
+    --pico-muted-color: #9aa0aa;
+    --pico-h1-color: #f1f3f6;
+    --pico-h2-color: #eef0f3;
+    --pico-h3-color: #eaedf1;
+    --pico-h4-color: #e5e8ec;
+    --pico-form-element-color: #d8dbe1;
+}
+
+nav.sidebar {
+    width: 218px !important;
+    min-width: 218px !important;
+    padding: 16px 13px !important;
+}
+
+nav.sidebar .brand {
+    margin-bottom: 20px !important;
+    padding: 0 4px;
+}
+
+nav.sidebar .brand hgroup h3 {
+    font-size: 15.5px !important;
+    line-height: 1.2;
+}
+
+nav.sidebar .brand hgroup p {
+    font-size: 11.5px !important;
+    line-height: 1.35;
+}
+
+nav.sidebar ul {
+    gap: 5px !important;
+}
+
+nav.sidebar li {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+nav.sidebar a {
+    display: flex !important;
+    align-items: center;
+    min-height: 34px;
+    padding: 7px 10px !important;
+    border-radius: 7px !important;
+    font-size: 14.5px !important;
+    font-weight: 450;
+    line-height: 1.2 !important;
+    text-align: left !important;
+}
+
+nav.sidebar a[aria-current="page"] {
+    background: #343943 !important;
+    color: #f0f2f5 !important;
+    box-shadow: inset 3px 0 0 #9ca8d2;
+    font-weight: 600;
+}
+
+nav.sidebar a:hover:not([aria-current="page"]) {
+    background: #2d3138 !important;
+    color: #eef0f3 !important;
+}
+
+#monitor-bar {
+    font-size: 12px !important;
+    line-height: 1.4;
+}
+
+main.container {
+    padding: 24px 30px !important;
+}
+
+h1 {
+    margin-bottom: 18px !important;
+    font-size: 22px !important;
+    font-weight: 650;
+    line-height: 1.2;
+}
+
+h2 { font-size: 18px !important; }
+h3 { font-size: 16px !important; }
+
+p,
+li,
+td,
+th,
+label,
+input,
+select,
+textarea,
+button,
+[role="button"] {
+    font-size: 14px;
+}
+
+small,
+small code {
+    font-size: 12.5px !important;
+}
+
+article {
+    padding: 18px 20px !important;
+    border-radius: 10px !important;
+}
+
+article > header,
+.card-h,
+.build-card-header > div:first-child > strong,
+.compiled-builds-head > div:first-child > strong {
+    color: #c8ccd3 !important;
+    font-size: 13px !important;
+    font-weight: 650 !important;
+    letter-spacing: .02em !important;
+    text-transform: none !important;
+}
+
+article > header {
+    margin-bottom: 14px !important;
+}
+
+label {
+    color: #cdd1d7;
+    font-size: 13.5px !important;
+    font-weight: 500;
+}
+
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+    min-height: 40px !important;
+    padding: 8px 11px !important;
+    font-size: 14px !important;
+    line-height: 1.35;
+}
+
+textarea {
+    line-height: 1.5;
+}
+
+button,
+[role="button"] {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px;
+    min-height: 38px !important;
+    padding: 8px 14px !important;
+    font-size: 13.5px !important;
+    font-weight: 550;
+    line-height: 1 !important;
+    text-align: center !important;
+    vertical-align: middle;
+}
+
+button svg,
+[role="button"] svg {
+    flex: 0 0 auto;
+}
+
+button:not(.contrast):not(.full-width),
+[role="button"]:not(.full-width) {
+    width: auto !important;
+}
+
+[role="group"] {
+    align-items: center;
+}
+
+table {
+    font-size: 13.5px !important;
+}
+
+thead th {
+    padding: 10px !important;
+    font-size: 11.5px !important;
+    letter-spacing: .03em !important;
+    text-transform: none !important;
+    color: #a8adb6 !important;
+}
+
+tbody td {
+    padding: 11px 10px !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
+    max-width: 1100px !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article {
+    margin-bottom: 18px !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article > p:first-of-type {
+    font-size: 13.5px !important;
+    color: #aeb3bc !important;
+    line-height: 1.6;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-table td:first-child {
+    font-size: 13px !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-table code {
+    font-size: 11.5px !important;
+}
+
+.server-card header,
+.live-perf header,
+.log-panel > header {
+    font-size: 13px !important;
+    text-transform: none !important;
+    letter-spacing: .02em !important;
+}
+
+.server-card label {
+    font-size: 13px !important;
+}
+
+.server-card select,
+.server-card input[type="number"] {
+    min-height: 38px !important;
+    font-size: 13.5px !important;
+}
+
+.available-model-row,
+.available-model-row > code {
+    font-size: 13px !important;
+}
+
+.live-perf {
+    padding: 15px 18px !important;
+}
+
+.server-page .log-section .log-panel pre {
+    font-size: 12.5px !important;
+}
+
+.builds-workspace {
+    max-width: 1220px !important;
+}
+
+.builds-page-title {
+    font-size: 22px !important;
+}
+
+.build-card-header,
+.compiled-builds-head {
+    align-items: center !important;
+}
+
+.build-actions,
+.build-ref-actions {
+    align-items: center;
+}
+
+.build-actions button,
+.build-ref-actions button,
+.build-ref-actions [role="button"] {
+    min-height: 36px !important;
+}
+
+.model-card-row {
+    min-height: 54px !important;
+    font-size: 13.5px !important;
+}
+
+.model-card-header {
+    font-size: 11.5px !important;
+    text-transform: none !important;
+    letter-spacing: .03em !important;
+}
+
+.model-card-name {
+    font-size: 14px;
+}
+
+.model-card-quant,
+.model-card-vram,
+.model-card-size {
+    font-size: 12.5px !important;
+}
+
+.model-card-actions button {
+    min-height: 34px !important;
+    font-size: 12.5px !important;
+}
+
+label[title] {
+    cursor: default;
+}
+
+@media (max-width: 1100px) {
+    nav.sidebar {
+        width: 205px !important;
+        min-width: 205px !important;
+    }
+    main.container {
+        padding: 20px !important;
+    }
+}
