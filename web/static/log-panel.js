@@ -15,6 +15,13 @@
         link.href = '/static/workstation-v2.css';
         document.head.appendChild(link);
     }
+    if (!document.getElementById('toolchest-workstation-v3-css')) {
+        const link = document.createElement('link');
+        link.id = 'toolchest-workstation-v3-css';
+        link.rel = 'stylesheet';
+        link.href = '/static/workstation-v3.css';
+        document.head.appendChild(link);
+    }
 
     // Graphite was designed as the workstation default but historically
     // shipped as an opt-in theme. Preserve an explicit browser preference;

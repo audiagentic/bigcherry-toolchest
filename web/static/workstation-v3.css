@@ -1,0 +1,328 @@
+/* BigCherry Toolchest UI v3 — readability and professional polish.
+ * Temporary final-pass override while the render is being tuned. Once the
+ * visual direction is locked this can be folded into the workstation sheet.
+ */
+
+:root {
+    font-size: 15px;
+}
+
+body {
+    font-size: 15px !important;
+    line-height: 1.5;
+    letter-spacing: 0;
+}
+
+[data-theme="dark"] {
+    --pico-color: #d8dbe1;
+    --pico-muted-color: #9fa5af;
+    --pico-h1-color: #f3f4f6;
+    --pico-h2-color: #f0f2f4;
+    --pico-h3-color: #eceff2;
+    --pico-h4-color: #e7eaee;
+    --pico-form-element-color: #dde0e5;
+}
+
+/* Sidebar: separate rows cleanly; the selected item is a row, not a pill. */
+nav.sidebar {
+    width: 218px !important;
+    min-width: 218px !important;
+    padding: 16px 13px !important;
+}
+
+nav.sidebar .brand {
+    margin-bottom: 22px !important;
+    padding: 0 5px;
+}
+
+nav.sidebar .brand hgroup h3 {
+    font-size: 16px !important;
+    line-height: 1.2;
+}
+
+nav.sidebar .brand hgroup p {
+    font-size: 11.5px !important;
+    line-height: 1.35;
+}
+
+nav.sidebar ul {
+    gap: 6px !important;
+}
+
+nav.sidebar li {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+nav.sidebar a {
+    display: flex !important;
+    align-items: center;
+    min-height: 34px;
+    padding: 7px 10px !important;
+    border: 0 !important;
+    border-radius: 6px !important;
+    font-size: 15px !important;
+    font-weight: 450;
+    line-height: 1.2 !important;
+    text-align: left !important;
+}
+
+nav.sidebar a[aria-current="page"] {
+    background: #343942 !important;
+    color: #f2f3f5 !important;
+    box-shadow: inset 3px 0 0 #9ca8d2 !important;
+    font-weight: 600 !important;
+}
+
+nav.sidebar a:hover:not([aria-current="page"]) {
+    background: #2b3037 !important;
+    color: #f0f2f4 !important;
+}
+
+#monitor-bar {
+    font-size: 12.5px !important;
+    line-height: 1.45;
+}
+
+main.container {
+    padding: 24px 30px !important;
+}
+
+h1 {
+    margin-bottom: 18px !important;
+    font-size: 22px !important;
+    font-weight: 650;
+    line-height: 1.2;
+}
+
+h2 { font-size: 18px !important; }
+h3 { font-size: 16px !important; }
+
+p,
+li,
+td,
+th,
+label,
+input,
+select,
+textarea {
+    font-size: 14.5px;
+}
+
+small,
+small code {
+    font-size: 12.5px !important;
+}
+
+/* Cards: headings should read as headings, not tiny metadata. */
+article {
+    padding: 18px 20px !important;
+    border-radius: 10px !important;
+}
+
+article > header,
+.card-h,
+.build-card-header > div:first-child > strong,
+.compiled-builds-head > div:first-child > strong {
+    color: #d1d5db !important;
+    font-size: 13.5px !important;
+    font-weight: 650 !important;
+    letter-spacing: .01em !important;
+    text-transform: none !important;
+}
+
+article > header {
+    margin-bottom: 14px !important;
+}
+
+/* Controls */
+label {
+    color: #d1d5db;
+    font-size: 14px !important;
+    font-weight: 500;
+}
+
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+    min-height: 40px !important;
+    padding: 8px 11px !important;
+    font-size: 14.5px !important;
+    line-height: 1.35;
+}
+
+textarea {
+    line-height: 1.5;
+}
+
+button,
+[role="button"] {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px;
+    width: auto;
+    min-height: 38px !important;
+    padding: 8px 15px !important;
+    font-size: 14px !important;
+    font-weight: 550;
+    line-height: 1 !important;
+    text-align: center !important;
+    vertical-align: middle;
+}
+
+button svg,
+[role="button"] svg {
+    flex: 0 0 auto;
+}
+
+[role="group"] {
+    align-items: center;
+}
+
+[role="group"] > button,
+[role="group"] > [role="button"] {
+    justify-content: center !important;
+    text-align: center !important;
+}
+
+/* Tables */
+table {
+    font-size: 14px !important;
+}
+
+thead th {
+    padding: 10px !important;
+    font-size: 12px !important;
+    letter-spacing: .02em !important;
+    text-transform: none !important;
+    color: #afb4bd !important;
+}
+
+tbody td {
+    padding: 11px 10px !important;
+}
+
+/* Settings: align like an app workspace, not a centered document. */
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
+    width: min(1180px, calc(100vw - 218px)) !important;
+    max-width: 1180px !important;
+    margin-left: 0 !important;
+    margin-right: auto !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article {
+    margin-bottom: 18px !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) article > p:first-of-type {
+    font-size: 14px !important;
+    color: #b1b6bf !important;
+    line-height: 1.6;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-table td:first-child {
+    font-size: 13.5px !important;
+}
+
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-table code {
+    font-size: 12px !important;
+}
+
+/* Server */
+.server-card header,
+.live-perf header,
+.log-panel > header {
+    font-size: 13.5px !important;
+    text-transform: none !important;
+    letter-spacing: .01em !important;
+}
+
+.server-card label {
+    font-size: 13.5px !important;
+}
+
+.server-card select,
+.server-card input[type="number"] {
+    min-height: 39px !important;
+    font-size: 14px !important;
+}
+
+.available-model-row,
+.available-model-row > code {
+    font-size: 13.5px !important;
+}
+
+.live-perf {
+    padding: 15px 18px !important;
+}
+
+.server-page .log-section .log-panel pre {
+    font-size: 12.5px !important;
+}
+
+/* Builds */
+.builds-workspace {
+    max-width: 1220px !important;
+}
+
+.builds-page-title {
+    font-size: 22px !important;
+}
+
+.build-card-header,
+.compiled-builds-head,
+.build-actions,
+.build-ref-actions {
+    align-items: center !important;
+}
+
+.build-actions button,
+.build-ref-actions button,
+.build-ref-actions [role="button"] {
+    min-height: 38px !important;
+}
+
+/* Models */
+.model-card-row {
+    min-height: 56px !important;
+    font-size: 14px !important;
+}
+
+.model-card-header {
+    font-size: 12px !important;
+    text-transform: none !important;
+    letter-spacing: .02em !important;
+}
+
+.model-card-name {
+    font-size: 14.5px;
+}
+
+.model-card-quant,
+.model-card-vram,
+.model-card-size {
+    font-size: 13px !important;
+}
+
+.model-card-actions button {
+    min-height: 35px !important;
+    font-size: 13px !important;
+}
+
+label[title] {
+    cursor: default;
+}
+
+@media (max-width: 1100px) {
+    nav.sidebar {
+        width: 205px !important;
+        min-width: 205px !important;
+    }
+    main.container {
+        padding: 20px !important;
+    }
+    body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
+        width: calc(100vw - 205px) !important;
+    }
+}
