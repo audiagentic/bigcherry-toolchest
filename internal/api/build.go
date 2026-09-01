@@ -209,6 +209,11 @@ func (s *Server) handleListBuilds(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTriggerBuild(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("external") == "1" {
+		s.handleRegisterExternalBuild(w, r)
+		return
+	}
+
 	var req struct {
 		Profile string `json:"profile"`
 		GitRef  string `json:"git_ref"`
