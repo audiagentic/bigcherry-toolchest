@@ -1,13 +1,17 @@
-/* BigCherry Toolchest UI v3 — readability and professional polish.
- * Temporary final-pass override while the render is being tuned. Once the
- * visual direction is locked this can be folded into the workstation sheet.
- */
+/* BigCherry Toolchest UI v3 — readability and workstation polish. */
 
 :root {
     font-size: 15px;
 }
 
+html,
 body {
+    height: 100%;
+}
+
+body {
+    height: 100vh;
+    overflow: hidden;
     font-size: 15px !important;
     line-height: 1.5;
     letter-spacing: 0;
@@ -23,20 +27,24 @@ body {
     --pico-form-element-color: #dde0e5;
 }
 
-/* Sidebar: separate rows cleanly; the selected item is a row, not a pill. */
+/* Sidebar: enough width for useful hardware diagnostics. */
 nav.sidebar {
-    width: 218px !important;
-    min-width: 218px !important;
-    padding: 16px 13px !important;
+    width: 280px !important;
+    min-width: 280px !important;
+    height: 100vh !important;
+    max-height: 100vh !important;
+    overflow-y: auto !important;
+    padding: 17px 15px !important;
 }
 
 nav.sidebar .brand {
-    margin-bottom: 22px !important;
+    margin-bottom: 23px !important;
     padding: 0 5px;
 }
 
 nav.sidebar .brand hgroup h3 {
-    font-size: 16px !important;
+    font-size: 16.5px !important;
+    font-weight: 700 !important;
     line-height: 1.2;
 }
 
@@ -71,7 +79,7 @@ nav.sidebar a[aria-current="page"] {
     background: #343942 !important;
     color: #f2f3f5 !important;
     box-shadow: inset 3px 0 0 #9ca8d2 !important;
-    font-weight: 600 !important;
+    font-weight: 650 !important;
 }
 
 nav.sidebar a:hover:not([aria-current="page"]) {
@@ -79,24 +87,114 @@ nav.sidebar a:hover:not([aria-current="page"]) {
     color: #f0f2f4 !important;
 }
 
+/* Sidebar diagnostics. */
 #monitor-bar {
+    margin: 0 3px;
+    padding-top: 14px !important;
     font-size: 12.5px !important;
-    line-height: 1.45;
+    line-height: 1.4;
 }
 
+.monitor-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.monitor-gpu {
+    padding: 10px 0 11px;
+    border-bottom: 1px solid color-mix(in srgb, var(--pico-muted-border-color) 72%, transparent);
+}
+
+.monitor-gpu:first-child {
+    padding-top: 0;
+}
+
+.monitor-heading,
+.monitor-metric {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.monitor-heading {
+    color: var(--pico-muted-color);
+    font-size: 11.5px;
+    font-weight: 600;
+}
+
+.monitor-heading strong {
+    color: var(--pico-color);
+    font-size: 12px;
+    font-weight: 650;
+}
+
+.monitor-name {
+    margin: 2px 0 5px;
+    color: var(--pico-h4-color);
+    font-size: 12.5px;
+    font-weight: 650;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+}
+
+.monitor-metric {
+    margin-top: 3px;
+    color: var(--pico-muted-color);
+    font-size: 11.5px;
+}
+
+.monitor-details {
+    margin-top: 3px;
+    color: var(--pico-muted-color);
+    font-size: 11.5px;
+}
+
+.monitor-system {
+    padding-top: 10px;
+}
+
+#monitor-bar progress {
+    width: 100%;
+    height: 5px !important;
+    margin: 3px 0 1px !important;
+    opacity: .82;
+}
+
+/* Main is always the full remaining viewport and always owns the scrollbar.
+ * Page-specific width constraints belong to content, never to the scrollbox. */
 main.container {
-    padding: 24px 30px !important;
+    flex: 1 1 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    height: 100vh !important;
+    max-height: 100vh !important;
+    margin: 0 !important;
+    padding: 24px 30px 38px !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    scrollbar-gutter: stable;
+    box-sizing: border-box;
 }
 
 h1 {
     margin-bottom: 18px !important;
-    font-size: 22px !important;
-    font-weight: 650;
+    font-size: 23px !important;
+    font-weight: 700 !important;
     line-height: 1.2;
 }
 
-h2 { font-size: 18px !important; }
-h3 { font-size: 16px !important; }
+h2 {
+    font-size: 18.5px !important;
+    font-weight: 700 !important;
+}
+
+h3 {
+    font-size: 16.5px !important;
+    font-weight: 650 !important;
+}
 
 p,
 li,
@@ -114,7 +212,7 @@ small code {
     font-size: 12.5px !important;
 }
 
-/* Cards: headings should read as headings, not tiny metadata. */
+/* Cards: headings read as headings rather than metadata. */
 article {
     padding: 18px 20px !important;
     border-radius: 10px !important;
@@ -124,10 +222,10 @@ article > header,
 .card-h,
 .build-card-header > div:first-child > strong,
 .compiled-builds-head > div:first-child > strong {
-    color: #d1d5db !important;
-    font-size: 13.5px !important;
-    font-weight: 650 !important;
-    letter-spacing: .01em !important;
+    color: #d7dae0 !important;
+    font-size: 14px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0 !important;
     text-transform: none !important;
 }
 
@@ -139,7 +237,7 @@ article > header {
 label {
     color: #d1d5db;
     font-size: 14px !important;
-    font-weight: 500;
+    font-weight: 550;
 }
 
 input:not([type="checkbox"]):not([type="radio"]),
@@ -149,6 +247,16 @@ textarea {
     padding: 8px 11px !important;
     font-size: 14.5px !important;
     line-height: 1.35;
+}
+
+/* Restore a real selector affordance. Earlier Graphite background shorthand
+ * removed Pico's chevron image. Native appearance is robust in Chromium and
+ * follows color-scheme correctly. */
+select:not([multiple]):not([size]) {
+    -webkit-appearance: auto !important;
+    appearance: auto !important;
+    background-image: none !important;
+    padding-right: 28px !important;
 }
 
 textarea {
@@ -165,7 +273,7 @@ button,
     min-height: 38px !important;
     padding: 8px 15px !important;
     font-size: 14px !important;
-    font-weight: 550;
+    font-weight: 600 !important;
     line-height: 1 !important;
     text-align: center !important;
     vertical-align: middle;
@@ -194,7 +302,8 @@ table {
 thead th {
     padding: 10px !important;
     font-size: 12px !important;
-    letter-spacing: .02em !important;
+    font-weight: 650 !important;
+    letter-spacing: .01em !important;
     text-transform: none !important;
     color: #afb4bd !important;
 }
@@ -203,10 +312,22 @@ tbody td {
     padding: 11px 10px !important;
 }
 
-/* Settings: align like an app workspace, not a centered document. */
-body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
-    width: min(1180px, calc(100vw - 218px)) !important;
-    max-width: 1180px !important;
+/* Utility pages share one left edge and one readable content width. */
+body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container > *,
+body:has(nav.sidebar a[href="/models/browse"][aria-current="page"]) main.container > *,
+body:has(nav.sidebar a[href="/help"][aria-current="page"]) main.container > * {
+    width: min(1220px, 100%);
+    max-width: 1220px;
+    margin-left: 0 !important;
+    margin-right: auto !important;
+    box-sizing: border-box;
+}
+
+/* Builds already has page wrappers; keep them aligned to the same left edge. */
+.builds-page-heading,
+.builds-workspace {
+    width: min(1220px, 100%) !important;
+    max-width: 1220px !important;
     margin-left: 0 !important;
     margin-right: auto !important;
 }
@@ -233,13 +354,15 @@ body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-tabl
 .server-card header,
 .live-perf header,
 .log-panel > header {
-    font-size: 13.5px !important;
+    font-size: 14px !important;
+    font-weight: 700 !important;
     text-transform: none !important;
-    letter-spacing: .01em !important;
+    letter-spacing: 0 !important;
 }
 
 .server-card label {
     font-size: 13.5px !important;
+    font-weight: 600 !important;
 }
 
 .server-card select,
@@ -262,12 +385,9 @@ body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-tabl
 }
 
 /* Builds */
-.builds-workspace {
-    max-width: 1220px !important;
-}
-
 .builds-page-title {
-    font-size: 22px !important;
+    font-size: 23px !important;
+    font-weight: 700 !important;
 }
 
 .build-card-header,
@@ -291,12 +411,14 @@ body:has(nav.sidebar a[href="/settings"][aria-current="page"]) #runtime-env-tabl
 
 .model-card-header {
     font-size: 12px !important;
+    font-weight: 650 !important;
     text-transform: none !important;
-    letter-spacing: .02em !important;
+    letter-spacing: .01em !important;
 }
 
 .model-card-name {
     font-size: 14.5px;
+    font-weight: 650;
 }
 
 .model-card-quant,
@@ -316,13 +438,31 @@ label[title] {
 
 @media (max-width: 1100px) {
     nav.sidebar {
-        width: 205px !important;
-        min-width: 205px !important;
+        width: 230px !important;
+        min-width: 230px !important;
     }
+
     main.container {
         padding: 20px !important;
     }
-    body:has(nav.sidebar a[href="/settings"][aria-current="page"]) main.container {
-        width: calc(100vw - 205px) !important;
+}
+
+@media (max-width: 760px) {
+    body {
+        height: auto;
+        overflow: auto;
+    }
+
+    nav.sidebar {
+        width: 100% !important;
+        min-width: 0 !important;
+        height: auto !important;
+        max-height: none !important;
+    }
+
+    main.container {
+        height: auto !important;
+        max-height: none !important;
+        overflow: visible !important;
     }
 }
