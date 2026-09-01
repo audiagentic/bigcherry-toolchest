@@ -5,7 +5,29 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Llama Toolchest{{if .Title}} — {{.Title}}{{end}}</title>
+    <script>
+    // Apply the saved theme before stylesheets are parsed so first paint is final.
+    (function() {
+        try {
+            var saved = localStorage.getItem('llama-toolchest-theme') || 'graphite';
+            if (!localStorage.getItem('llama-toolchest-theme')) {
+                localStorage.setItem('llama-toolchest-theme', saved);
+            }
+            var el = document.documentElement;
+            if (saved === 'dark' || saved === 'light') {
+                el.setAttribute('data-theme', saved);
+                el.removeAttribute('data-custom-theme');
+            } else {
+                el.setAttribute('data-theme', 'dark');
+                el.setAttribute('data-custom-theme', saved);
+            }
+        } catch (_) {}
+    })();
+    </script>
     <link rel="stylesheet" href="/static/pico.min.css">
+    <link rel="stylesheet" href="/static/workstation.css">
+    <link rel="stylesheet" href="/static/workstation-v2.css">
+    <link rel="stylesheet" href="/static/workstation-v3.css">
     <script src="/static/htmx.min.js"></script>
     <script src="/static/htmx-sse.js"></script>
     <script src="/static/log-panel.js" defer></script>
@@ -591,10 +613,6 @@
         {{template "content" .}}
     </main>
 <script>
-(function() {
-    var saved = localStorage.getItem('llama-toolchest-theme');
-    if (saved) setTheme(saved);
-})();
 function setTheme(theme) {
     var el = document.getElementById('html-root');
     if (theme === 'dark' || theme === 'light') {
