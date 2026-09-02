@@ -5,7 +5,9 @@ package monitor
 import "testing"
 
 func TestParseROCmProductCSVUsesBDFIdentity(t *testing.T) {
-	csv := `device,PCI Bus,Card Series,Card Model,Card Vendor,Card SKU,Subsystem ID,Device Rev,Node ID,GUID,GFX Version
+	// Header casing intentionally mirrors variants seen across rocm-smi
+	// releases; parsing must not depend on one capitalization.
+	csv := `device,PCI Bus,Card series,Card Model,Card Vendor,Card SKU,Subsystem ID,Device Rev,Node ID,GUID,GFX Version
 card0,0000:03:00.0,Radeon RX 7900 XTX,0x744c,AMD,D70201,0x0e3b,0xc8,1,123,gfx1100
 card1,0000:09:00.0,Radeon AI PRO R9700,0x7550,AMD,R9700,0x0000,0x00,2,456,gfx1201
 `
