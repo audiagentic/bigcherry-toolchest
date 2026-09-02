@@ -104,9 +104,9 @@ func parseROCmProductCSV(out string, byBDF map[string]int) map[int]gpuStaticIden
 
 	cols := make(map[string]int, len(records[0]))
 	for i, h := range records[0] {
-		cols[strings.TrimSpace(h)] = i
+		cols[normalizeROCmColumn(h)] = i
 	}
-	busCol, ok := cols["PCI Bus"]
+	busCol, ok := cols["pci bus"]
 	if !ok {
 		return result
 	}
@@ -121,13 +121,13 @@ func parseROCmProductCSV(out string, byBDF map[string]int) map[int]gpuStaticIden
 			continue
 		}
 		id := gpuStaticIdentity{BDF: bdf}
-		if col, ok := cols["Card Series"]; ok && col < len(row) {
+		if col, ok := cols["card series"]; ok && col < len(row) {
 			name := strings.TrimSpace(row[col])
 			if name != "" && !strings.EqualFold(name, "N/A") {
 				id.Name = name
 			}
 		}
-		if col, ok := cols["GFX Version"]; ok && col < len(row) {
+		if col, ok := cols["gfx version"]; ok && col < len(row) {
 			arch := strings.TrimSpace(row[col])
 			if arch != "" && !strings.EqualFold(arch, "N/A") {
 				id.Arch = arch
@@ -136,4 +136,8 @@ func parseROCmProductCSV(out string, byBDF map[string]int) map[int]gpuStaticIden
 		result[idx] = id
 	}
 	return result
+}
+
+func normalizeROCmColumn(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(s)), " "))
 }
