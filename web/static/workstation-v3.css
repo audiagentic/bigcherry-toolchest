@@ -1,7 +1,29 @@
 /* BigCherry Toolchest UI v3 — readability and workstation polish. */
 
+/*
+ * Workstation typography owns a separate face name from layout.html's legacy
+ * IBM Plex declaration. The legacy face uses font-display: swap, which lets
+ * Chromium paint system-ui first and replace it a frame later. That is visible
+ * on full-page sidebar navigation because our fractional 450/650 weights have
+ * noticeably different metrics in the fallback font.
+ *
+ * `block` keeps fallback glyphs off-screen during the short same-origin WOFF2
+ * load instead of visibly changing weight/width after first paint. The
+ * important custom properties deliberately beat the later legacy :root block
+ * in layout.html without requiring another whole-template override.
+ */
+@font-face {
+    font-family: 'IBM Plex Sans Workstation';
+    font-style: normal;
+    font-weight: 400 700;
+    font-display: block;
+    src: url('/static/fonts/ibm-plex-sans.woff2') format('woff2');
+}
+
 :root {
     font-size: 15px;
+    --pico-font-family-sans-serif: 'IBM Plex Sans Workstation', system-ui, -apple-system, sans-serif !important;
+    --pico-font-family: var(--pico-font-family-sans-serif) !important;
 }
 
 html,
@@ -12,6 +34,7 @@ body {
 body {
     height: 100vh;
     overflow: hidden;
+    font-family: var(--pico-font-family) !important;
     font-size: 15px !important;
     line-height: 1.5;
     letter-spacing: 0;
