@@ -1,32 +1,49 @@
 {{define "monitor_bar"}}
-<div class="monitor-stack">
-    {{range .GPUs}}
-    <section class="monitor-gpu" title="{{.Name}}">
-        <div class="monitor-heading">
-            <span>GPU{{.Index}}</span>
-            <strong>{{.UtilPercent}}%</strong>
+<div class="monitor-dashboard" data-monitor-backend="{{.Backend}}">
+    <div class="monitor-section-heading">
+        <span>Hardware</span>
+        <span class="monitor-device-count">{{len .GPUs}} GPUs</span>
+    </div>
+
+    <div class="monitor-gpu-grid">
+        {{range .GPUs}}
+        <details class="monitor-gpu-card" data-gpu-index="{{.Index}}" title="{{.Name}}">
+            <summary>
+                <div class="monitor-card-head">
+                    <span class="monitor-device-label">{{.DeviceLabel}}</span>
+                    <span class="monitor-util" data-field="util">{{.UtilPercent}}%</span>
+                </div>
+                <div class="monitor-card-name" data-field="short-name">{{.ShortName}}</div>
+                <div class="monitor-card-vram-row">
+                    <span>VRAM</span>
+                    <span data-field="vram">{{.VRAMGB}}</span>
+                </div>
+                <progress data-field="vram-progress" value="{{.VRAMPercent}}" max="100"></progress>
+                <div class="monitor-card-footer">
+                    <span data-field="temp">{{if gt .TempC 0}}{{.TempC}}°C{{else}}—{{end}}</span>
+                    <span data-field="power">{{if gt .PowerW 0.0}}{{printf "%.0fW" .PowerW}}{{else}}—{{end}}</span>
+                </div>
+            </summary>
+            <div class="monitor-card-detail">
+                <div><span>Device</span><strong>{{.DeviceLabel}}</strong></div>
+                <div><span>Model</span><strong data-field="full-name">{{.Name}}</strong></div>
+                {{if .Arch}}<div><span>Arch</span><code data-field="arch">{{.Arch}}</code></div>{{end}}
+                {{if .BDF}}<div><span>PCI</span><code data-field="bdf">{{.BDF}}</code></div>{{end}}
+                {{if .IsIGPU}}<div><span>Type</span><strong>Integrated</strong></div>{{end}}
+            </div>
+        </details>
+        {{end}}
+    </div>
+
+    <div class="monitor-system-grid">
+        <div class="monitor-system-card" data-system="cpu">
+            <div class="monitor-system-head"><span>CPU</span><strong data-field="cpu">{{printf "%.0f" .CPUPercent}}%</strong></div>
+            <progress data-field="cpu-progress" value="{{printf "%.0f" .CPUPercent}}" max="100"></progress>
         </div>
-        <div class="monitor-name">{{if .Name}}{{.Name}}{{else}}GPU {{.Index}}{{end}}</div>
-        <progress value="{{.UtilPercent}}" max="100"></progress>
-        <div class="monitor-metric">
-            <span>VRAM</span>
-            <span>{{.VRAMGB}}</span>
+        <div class="monitor-system-card" data-system="ram">
+            <div class="monitor-system-head"><span>RAM</span><strong data-field="ram">{{.RAMGB}}</strong></div>
+            <progress data-field="ram-progress" value="{{.RAMPercent}}" max="100"></progress>
         </div>
-        <progress value="{{.VRAMPercent}}" max="100"></progress>
-        <div class="monitor-details">{{.Details}}</div>
-    </section>
-    {{end}}
-    <div class="monitor-system">
-        <div class="monitor-metric">
-            <span>CPU</span>
-            <span>{{printf "%.0f" .CPUPercent}}%</span>
-        </div>
-        <progress value="{{printf "%.0f" .CPUPercent}}" max="100"></progress>
-        <div class="monitor-metric">
-            <span>RAM</span>
-            <span>{{.RAMGB}}</span>
-        </div>
-        <progress value="{{.RAMPercent}}" max="100"></progress>
     </div>
 </div>
 {{end}}
