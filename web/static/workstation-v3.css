@@ -27,19 +27,27 @@ body {
     --pico-form-element-color: #dde0e5;
 }
 
-/* Sidebar: enough width for useful hardware diagnostics. */
+/* Operator rail: compact fixed navigation above an independently scrolling
+ * hardware dashboard. The whole rail never scrolls as one long document. */
 nav.sidebar {
-    width: 280px !important;
-    min-width: 280px !important;
+    width: 320px !important;
+    min-width: 320px !important;
     height: 100vh !important;
     max-height: 100vh !important;
-    overflow-y: auto !important;
-    padding: 17px 15px !important;
+    overflow: hidden !important;
+    padding: 14px 12px 10px !important;
+    justify-content: flex-start !important;
+    gap: 0 !important;
+    box-sizing: border-box;
+}
+
+nav.sidebar .sidebar-top {
+    flex: 0 0 auto;
 }
 
 nav.sidebar .brand {
-    margin-bottom: 23px !important;
-    padding: 0 5px;
+    margin-bottom: 14px !important;
+    padding: 0 6px;
 }
 
 nav.sidebar .brand hgroup h3 {
@@ -54,7 +62,7 @@ nav.sidebar .brand hgroup p {
 }
 
 nav.sidebar ul {
-    gap: 6px !important;
+    gap: 2px !important;
 }
 
 nav.sidebar li {
@@ -65,11 +73,11 @@ nav.sidebar li {
 nav.sidebar a {
     display: flex !important;
     align-items: center;
-    min-height: 34px;
-    padding: 7px 10px !important;
+    min-height: 29px !important;
+    padding: 5px 8px !important;
     border: 0 !important;
-    border-radius: 6px !important;
-    font-size: 15px !important;
+    border-radius: 5px !important;
+    font-size: 14.5px !important;
     font-weight: 450;
     line-height: 1.2 !important;
     text-align: left !important;
@@ -87,79 +95,203 @@ nav.sidebar a:hover:not([aria-current="page"]) {
     color: #f0f2f4 !important;
 }
 
-/* Sidebar diagnostics. */
+/* Hardware dashboard */
 #monitor-bar {
-    margin: 0 3px;
-    padding-top: 14px !important;
-    font-size: 12.5px !important;
-    line-height: 1.4;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    margin: 12px 0 0 !important;
+    padding: 10px 3px 8px !important;
+    border-top: 1px solid var(--pico-muted-border-color);
+    font-size: 12px !important;
+    line-height: 1.35;
+    scrollbar-width: thin;
+    scrollbar-color: #4a5059 transparent;
 }
 
-.monitor-stack {
+.monitor-dashboard {
     display: flex;
     flex-direction: column;
-    gap: 0;
+    gap: 8px;
 }
 
-.monitor-gpu {
-    padding: 10px 0 11px;
-    border-bottom: 1px solid color-mix(in srgb, var(--pico-muted-border-color) 72%, transparent);
-}
-
-.monitor-gpu:first-child {
-    padding-top: 0;
-}
-
-.monitor-heading,
-.monitor-metric {
+.monitor-section-heading {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
+    padding: 0 2px 1px;
+    color: #d8dbe1;
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: .025em;
 }
 
-.monitor-heading {
+.monitor-device-count {
     color: var(--pico-muted-color);
-    font-size: 11.5px;
+    font-size: 10.5px;
+    font-weight: 550;
+}
+
+.monitor-gpu-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.monitor-gpu-card {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    border: 1px solid color-mix(in srgb, var(--pico-muted-border-color) 88%, #59616d 12%);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--pico-card-background-color) 90%, #313740 10%);
+    transition: border-color .12s ease, background-color .12s ease;
+}
+
+.monitor-gpu-card:hover {
+    border-color: #4b535e;
+    background: color-mix(in srgb, var(--pico-card-background-color) 82%, #39414c 18%);
+}
+
+.monitor-gpu-card[open] {
+    grid-column: 1 / -1;
+    border-color: #596579;
+}
+
+.monitor-gpu-card > summary {
+    display: block;
+    list-style: none;
+    padding: 8px 9px 7px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.monitor-gpu-card > summary::-webkit-details-marker {
+    display: none;
+}
+
+.monitor-card-head,
+.monitor-card-vram-row,
+.monitor-card-footer,
+.monitor-system-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+}
+
+.monitor-device-label {
+    color: #aeb7c7;
+    font-family: var(--pico-font-family-monospace);
+    font-size: 10.5px;
     font-weight: 600;
 }
 
-.monitor-heading strong {
-    color: var(--pico-color);
-    font-size: 12px;
-    font-weight: 650;
+.monitor-util {
+    color: #edf0f4;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
 }
 
-.monitor-name {
-    margin: 2px 0 5px;
-    color: var(--pico-h4-color);
+.monitor-card-name {
+    min-height: 31px;
+    margin: 4px 0 5px;
+    overflow: hidden;
+    color: #e4e7eb;
     font-size: 12.5px;
-    font-weight: 650;
-    line-height: 1.3;
-    overflow-wrap: anywhere;
+    font-weight: 700;
+    line-height: 1.22;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
 }
 
-.monitor-metric {
-    margin-top: 3px;
+.monitor-card-vram-row {
     color: var(--pico-muted-color);
-    font-size: 11.5px;
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
 }
 
-.monitor-details {
-    margin-top: 3px;
-    color: var(--pico-muted-color);
-    font-size: 11.5px;
+.monitor-card-vram-row span:last-child {
+    color: #c5cad2;
 }
 
-.monitor-system {
-    padding-top: 10px;
+.monitor-card-footer {
+    margin-top: 4px;
+    color: #989fa9;
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
 }
 
-#monitor-bar progress {
+.monitor-gpu-card progress,
+.monitor-system-card progress {
+    display: block;
     width: 100%;
-    height: 5px !important;
-    margin: 3px 0 1px !important;
+    height: 4px !important;
+    margin: 4px 0 0 !important;
     opacity: .82;
+}
+
+.monitor-card-detail {
+    display: grid;
+    gap: 5px;
+    padding: 8px 9px 9px;
+    border-top: 1px solid var(--pico-muted-border-color);
+    background: color-mix(in srgb, var(--pico-card-sectioning-background-color) 84%, transparent);
+}
+
+.monitor-card-detail > div {
+    display: grid;
+    grid-template-columns: 52px minmax(0, 1fr);
+    gap: 7px;
+    align-items: baseline;
+    min-width: 0;
+}
+
+.monitor-card-detail span {
+    color: var(--pico-muted-color);
+    font-size: 10.5px;
+}
+
+.monitor-card-detail strong,
+.monitor-card-detail code {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: #d8dbe1;
+    font-size: 10.5px !important;
+    font-weight: 550;
+}
+
+.monitor-system-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.monitor-system-card {
+    min-width: 0;
+    padding: 7px 9px 8px;
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--pico-card-background-color) 88%, transparent);
+}
+
+.monitor-system-head {
+    color: var(--pico-muted-color);
+    font-size: 10.5px;
+}
+
+.monitor-system-head strong {
+    overflow: hidden;
+    color: #d4d8de;
+    font-size: 10.5px;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
 }
 
 /* Main is always the full remaining viewport and always owns the scrollbar.
@@ -249,9 +381,6 @@ textarea {
     line-height: 1.35;
 }
 
-/* Restore a real selector affordance. Earlier Graphite background shorthand
- * removed Pico's chevron image. Native appearance is robust in Chromium and
- * follows color-scheme correctly. */
 select:not([multiple]):not([size]) {
     -webkit-appearance: auto !important;
     appearance: auto !important;
@@ -323,7 +452,6 @@ body:has(nav.sidebar a[href="/help"][aria-current="page"]) main.container > * {
     box-sizing: border-box;
 }
 
-/* Builds already has page wrappers; keep them aligned to the same left edge. */
 .builds-page-heading,
 .builds-workspace {
     width: min(1220px, 100%) !important;
@@ -438,8 +566,8 @@ label[title] {
 
 @media (max-width: 1100px) {
     nav.sidebar {
-        width: 230px !important;
-        min-width: 230px !important;
+        width: 280px !important;
+        min-width: 280px !important;
     }
 
     main.container {
@@ -458,6 +586,15 @@ label[title] {
         min-width: 0 !important;
         height: auto !important;
         max-height: none !important;
+        overflow: visible !important;
+    }
+
+    #monitor-bar {
+        overflow: visible;
+    }
+
+    .monitor-gpu-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
     main.container {
