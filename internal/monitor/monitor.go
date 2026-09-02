@@ -8,15 +8,19 @@ import (
 // Metrics holds a snapshot of system resource usage.
 type Metrics struct {
 	Timestamp time.Time  `json:"timestamp"`
+	Backend   string     `json:"backend,omitempty"`
 	GPU       []GPUInfo  `json:"gpu,omitempty"`
 	CPU       CPUInfo    `json:"cpu"`
 	Memory    MemoryInfo `json:"memory"`
 }
 
-// GPUInfo holds per-GPU metrics.
+// GPUInfo holds per-GPU metrics plus stable identity discovered by the
+// platform backend. Dynamic values are refreshed each poll; identity fields
+// are enriched from a cached hardware scan where available.
 type GPUInfo struct {
 	Index       int     `json:"index"`
 	Name        string  `json:"name"`
+	BDF         string  `json:"bdf,omitempty"`
 	UtilPercent int     `json:"util_percent"`     // 0-100
 	VRAMUsedMB  int     `json:"vram_used_mb"`
 	VRAMTotalMB int     `json:"vram_total_mb"`
@@ -122,7 +126,9 @@ func (m *Monitor) collect() {
 	}
 
 	if m.gpu != nil {
+		metrics.Backend = m.gpu.Name()
 		if gpus, err := m.gpu.Collect(); err == nil {
+			enrichGPUIdentity(metrics.Backend, gpus)
 			metrics.GPU = gpus
 		}
 	}
