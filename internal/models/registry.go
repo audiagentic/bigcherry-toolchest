@@ -93,6 +93,11 @@ type Model struct {
 	TokenEmbdBytes   int64 `json:"token_embd_bytes,omitempty"`
 	IndexerKeyLength int   `json:"indexer_key_length,omitempty"`
 	AttnLayers       int   `json:"attn_layers,omitempty"`
+	// MTPHead marks a standalone MTP drafter head that was registered as
+	// an ordinary model by a parser that couldn't recognize it. Records
+	// carrying it are dropped on the next backfill; nothing should serve
+	// one or offer it as a draft candidate. See GGUFMeta.IsMTPHead.
+	MTPHead bool `json:"mtp_head,omitempty"`
 
 	// Architecture parameters parsed from GGUF header.
 	Arch          string `json:"arch,omitempty"`
@@ -170,14 +175,31 @@ type ModelConfig struct {
 	MtpPath        string `json:"mtp_path,omitempty"`        // path to a separate MTP drafter-head GGUF (gemma-4 style); loaded via --model-draft under spec_type=draft-mtp. Empty for self-speculation MTP (Qwen3.6/DeepSeek-V3) where the head is baked into the main GGUF.
 	MtpDisabled    bool   `json:"mtp_disabled,omitempty"`    // skip the separate --model-draft MTP head at launch even when MtpPath is set; preserves the path so it can be re-enabled
 
-	// Speculative decoding
-	SpecType       string `json:"spec_type,omitempty"`        // "", "draft", "draft-mtp", "ngram-simple", "ngram-cache", etc.
-	DraftModelPath string `json:"draft_model_path,omitempty"` // path to draft model (when spec_type="draft")
+	// Speculative decoding, draft-method slot. See specmodes.go for why
+	// there are two slots and specDecodingParams for what each emits.
+	SpecType       string `json:"spec_type,omitempty"`        // "", "draft", "draft-mtp", "draft-eagle3", "draft-dflash", "draft-dspark" — draft methods only; the draftless mode lives in SpecAssist
+	DraftModelPath string `json:"draft_model_path,omitempty"` // path to the draft model or converted head (every draft method except self-speculation draft-mtp, which uses MtpPath)
 	DraftMax       int    `json:"draft_max,omitempty"`        // max draft tokens per step
 	DraftMin       int    `json:"draft_min,omitempty"`        // min draft tokens per step
 	DraftPMin      string `json:"draft_p_min,omitempty"`      // min probability threshold (string to allow empty=default)
-	NgramSizeN     int    `json:"ngram_size_n,omitempty"`     // n-gram lookup length
-	NgramSizeM     int    `json:"ngram_size_m,omitempty"`     // n-gram draft length
+
+	// Speculative decoding, draftless n-gram assist slot. Runs alongside
+	// the draft method above: llama.cpp accepts a comma-separated
+	// --spec-type list mixing one draft method with one draftless one,
+	// and the two do not share a draft length.
+	SpecAssist    string `json:"spec_assist,omitempty"`     // "", "ngram-mod", "ngram-simple", "ngram-cache", "ngram-map-k", "ngram-map-k4v"
+	AssistNMax    int    `json:"assist_n_max,omitempty"`    // --spec-ngram-mod-n-max
+	AssistNMin    int    `json:"assist_n_min,omitempty"`    // --spec-ngram-mod-n-min
+	AssistNMatch  int    `json:"assist_n_match,omitempty"`  // --spec-ngram-mod-n-match
+	AssistSizeN   int    `json:"assist_size_n,omitempty"`   // --spec-<mode>-size-n
+	AssistSizeM   int    `json:"assist_size_m,omitempty"`   // --spec-<mode>-size-m
+	AssistMinHits int    `json:"assist_min_hits,omitempty"` // --spec-<mode>-min-hits
+
+	// Legacy: the config form still posts these until the two-picker
+	// rework lands, and NormalizeSpec migrates them into the Assist*
+	// fields above. Nothing else reads them.
+	NgramSizeN int `json:"ngram_size_n,omitempty"`
+	NgramSizeM int `json:"ngram_size_m,omitempty"`
 
 	// Draft model resource overrides. Apply to spec_type="draft" and to
 	// gemma-4-style draft-mtp (separate head loaded via --model-draft). Not
@@ -636,7 +658,10 @@ func (r *Registry) ListNeedingPresetFetch() []string {
 //	1 — recurrent layers excluded from KV scaling; token-embedding size,
 //	    indexer key length and attention-layer count added for the VRAM
 //	    estimate.
-const GGUFMetaVersion = 1
+//	2 — NextN layer count and block-tensor layout added, so a standalone
+//	    MTP drafter head that reports a runnable architecture is
+//	    recognized as a head. Records for one are dropped by the backfill.
+const GGUFMetaVersion = 2
 
 // BackfillGGUFMeta re-reads GGUF metadata for records written by an older
 // parser, in one pass at startup.
@@ -668,6 +693,18 @@ func (r *Registry) BackfillGGUFMeta() {
 		meta.ApplyTo(m)
 		m.GGUFMetaVersion = GGUFMetaVersion
 		changed = true
+
+		// A head registered by a parser that couldn't tell it from a model.
+		// Drop the record — ScanModels declines to create it now, and
+		// AutoDetectMTP attaches the file to its main model instead. The
+		// file itself is untouched; only the mistaken registration goes.
+		if m.MTPHead {
+			slog.Info("dropping registry entry for MTP drafter head", "model", m.ID,
+				"file", m.FilePath, "arch", meta.Architecture)
+			delete(r.data.Models, m.ID)
+			delete(r.data.Configs, m.ID)
+			continue
+		}
 		slog.Info("re-read GGUF metadata", "model", m.ID, "version", GGUFMetaVersion,
 			"arch", meta.Architecture, "layers", meta.NLayers, "attn_layers", meta.AttnLayers,
 			"kv_full_per_tok", meta.KVFullPerTok, "was", before,
@@ -976,10 +1013,11 @@ func (r *Registry) ScanModels() int {
 			meta.ApplyTo(m)
 		}
 
-		// Skip standalone MTP / drafter "assistant" heads (e.g. gemma-4's
-		// gemma4-assistant). They're loaded via --model-draft alongside a main
-		// model, not served on their own — auto-associated by AutoDetectMTP below.
-		if IsMTPHeadArch(m.Arch) {
+		// Skip standalone MTP / drafter heads (gemma-4's gemma4-assistant,
+		// unsloth's Qwen3.8-Flash-Next heads). They're loaded via --model-draft
+		// alongside a main model, not served on their own — auto-associated by
+		// AutoDetectMTP below. Set by ApplyTo from the parsed metadata.
+		if m.MTPHead {
 			return nil
 		}
 
@@ -1115,8 +1153,37 @@ func (r *Registry) AutoDetectMMProj() int {
 // Detection is by architecture, not filename: Qwen's self-speculation MTP
 // models also carry "MTP" in their name but ARE runnable (the head is baked
 // into a normal qwen3 arch), so they must keep registering as ordinary models.
+//
+// This catches only the heads that declare an architecture of their own.
+// Prefer GGUFMeta.IsMTPHead, which also catches the ones that don't.
 func IsMTPHeadArch(arch string) bool {
 	return strings.Contains(strings.ToLower(arch), "assistant")
+}
+
+// IsMTPHead reports whether a GGUF is a standalone MTP / NextN drafter head
+// rather than a runnable model.
+//
+// An architecture name alone is not enough. gemma-4's head announces itself
+// as "gemma4-assistant", but unsloth's Qwen3.8-Flash-Next heads report
+// "qwen4exp" — the same architecture as the 111 GB model they draft for, at
+// the same embedding width. Nothing in the metadata distinguishes them, and
+// treating one as a model makes it a plausible-looking draft candidate for
+// the other, which is a configuration that cannot load.
+//
+// What does distinguish them is the tensor table. A head declares the full
+// block_count of its target but ships only the trailing NextN block: it has
+// blk.N tensors without a blk.0. Requiring that it carry blocks at all keeps
+// the first shard of a split model — which holds the metadata and, as
+// publishers ship them, no tensors — from being mistaken for one.
+//
+// Both flavors of head are covered, whether or not they carry their own
+// copies of token_embd/output: the shared variant borrows those from the
+// target at runtime, and the difference is invisible here.
+func (meta *GGUFMeta) IsMTPHead() bool {
+	if IsMTPHeadArch(meta.Architecture) {
+		return true
+	}
+	return meta.NextNPredictLayers > 0 && meta.HasBlockTensors && !meta.HasTrunkBlock0
 }
 
 // FindMTP looks for a separate MTP drafter-head GGUF associated with the given
@@ -1170,7 +1237,7 @@ func findMTPInDir(dir string) string {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		if meta, err := ParseGGUFMeta(path); err == nil && IsMTPHeadArch(meta.Architecture) {
+		if meta, err := ParseGGUFMeta(path); err == nil && meta.IsMTPHead() {
 			return path
 		}
 	}
@@ -1180,6 +1247,34 @@ func findMTPInDir(dir string) string {
 // AutoDetectMTP scans all registered models and sets MtpPath on configs where a
 // separate MTP drafter head exists in or near the model directory but isn't
 // configured yet.
+// BackfillSpecAssist migrates configs written before speculative decoding
+// had two slots, where a draftless mode sat in SpecType and its settings
+// in the draft-length fields. Runs once at startup; NormalizeSpec is
+// idempotent, so a second run finds nothing and saves nothing.
+//
+// Read paths tolerate the old shape anyway (specDecodingParams and the
+// benchmark override merge both normalise), which is what keeps stored
+// benchmark history working without being rewritten. This exists so the
+// registry on disk converges on one shape rather than staying mixed
+// indefinitely.
+func (r *Registry) BackfillSpecAssist() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	migrated := 0
+	for _, cfg := range r.data.Configs {
+		if cfg == nil || !IsAssistMode(cfg.SpecType) {
+			continue
+		}
+		NormalizeSpec(cfg)
+		migrated++
+	}
+	if migrated > 0 {
+		r.save()
+	}
+	return migrated
+}
+
 func (r *Registry) AutoDetectMTP() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1210,14 +1305,29 @@ type DraftCandidate struct {
 	Arch     string
 }
 
-// FindDraftCandidates returns models that could serve as draft models for
-// the given model: same architecture family, significantly smaller.
-func (r *Registry) FindDraftCandidates(id string) []DraftCandidate {
+// FindDraftCandidates returns models that could serve as the drafter for
+// the given model under the given speculative mode: same architecture
+// family and significantly smaller, which is what makes a draft model
+// usable at all.
+//
+// The head-based methods (draft-eagle3, draft-dflash, draft-dspark) skip
+// both of those checks. Their drafter is not a smaller model of the same
+// family, it is a trained extra layer converted to its own GGUF, so it
+// matches neither filter — applying them would leave the picker empty for
+// exactly the modes that need it.
+func (r *Registry) FindDraftCandidates(id, mode string) []DraftCandidate {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	headBased := IsHeadBasedDraftMode(mode)
+
 	target, ok := r.data.Models[id]
-	if !ok || target.Arch == "" {
+	if !ok {
+		return nil
+	}
+	// A target with no recorded architecture can still take a converted
+	// head; it just cannot be matched against a draft model.
+	if target.Arch == "" && !headBased {
 		return nil
 	}
 
@@ -1226,16 +1336,27 @@ func (r *Registry) FindDraftCandidates(id string) []DraftCandidate {
 		if m.ID == id {
 			continue
 		}
-		// Same architecture family
-		if m.Arch != target.Arch {
-			continue
-		}
-		// Must be significantly smaller (< 40% of target size)
-		if m.SizeBytes >= target.SizeBytes*4/10 {
-			continue
+		if !headBased {
+			// Same architecture family
+			if m.Arch != target.Arch {
+				continue
+			}
+			// Must be significantly smaller (< 40% of target size)
+			if m.SizeBytes >= target.SizeBytes*4/10 {
+				continue
+			}
 		}
 		// Skip embedding models
 		if m.IsEmbedding() {
+			continue
+		}
+		// Skip MTP drafter heads. They match on architecture and are far
+		// under the size bar, so they look like ideal draft candidates —
+		// but they carry no trunk and cannot load as a draft model. They
+		// belong on the config's MtpPath under spec_type=draft-mtp, which
+		// AutoDetectMTP sets. Only reaches here for a head registered by
+		// an older parser; the backfill drops those.
+		if m.MTPHead {
 			continue
 		}
 		candidates = append(candidates, DraftCandidate{
