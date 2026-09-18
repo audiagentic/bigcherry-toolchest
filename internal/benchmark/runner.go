@@ -22,6 +22,10 @@ type RunConfig struct {
 	HFToken    string // forwarded as HF_TOKEN to llama-benchy (avoids HF rate limiting)
 	HFHome     string // forwarded as HF_HOME so the tokenizer cache persists across runs
 	Sampling   SamplingParams
+	// Reasoning is how this model's thinking mode is turned off, used by
+	// the recall workload so its generation is recall rather than
+	// deliberation.
+	Reasoning ReasoningControl
 
 	// Memory returns what the model's current load allocated, once it is
 	// loaded. Nil, or a false second return, when nothing was measured —
@@ -233,7 +237,10 @@ func (r *Runner) Run(ctx context.Context, cfg RunConfig, progress chan<- Progres
 
 			// run.ID is unique per cell, so no two cells can send the
 			// same prompt and hit each other's cache.
-			result, err := r.runOneTest(ctx, cfg.RouterURL, cfg.RouterName, promptTokens, cfg.Preset.GenTokens, rep, cfg.Sampling, run.ID)
+			result, err := r.runOneTest(ctx, cfg.RouterURL, cfg.RouterName, promptTokens, cfg.Preset.GenTokens, rep, cfg.Sampling, run.ID, promptOptions{
+				Style:     cfg.Preset.PromptStyle,
+				Reasoning: cfg.Reasoning,
+			})
 			if err != nil {
 				lastErr = err
 				slog.Error("benchmark test failed", "prompt_tokens", promptTokens, "rep", rep, "error", err)
@@ -376,6 +383,72 @@ const BenchPromptPrefixTemplate = "This is benchmark repetition number %d. Pleas
 // ~4 chars/token under most BPE tokenizers).
 const BenchPromptCharsPerToken = 4
 
+// PromptStyle selects the instruction wrapped around the benchmark
+// passage. The two styles produce opposite generation workloads, and that
+// is the point: an n-gram speculative method measures exactly baseline on
+// PromptStyleAnalyze, which asks for new prose, and several times
+// baseline on PromptStyleEcho, where generation is recall of text already
+// in the context.
+type PromptStyle string
+
+const (
+	// PromptStyleAnalyze asks the model to respond to the passage. It is
+	// the zero value, so every preset that does not say otherwise keeps
+	// the behaviour it has always had.
+	PromptStyleAnalyze PromptStyle = ""
+	PromptStyleEcho    PromptStyle = "echo"
+)
+
+// BenchPromptEchoPrefixTemplate asks the model to reproduce the passage
+// rather than respond to it. Exposed so the About modal can show the
+// actual template, the same as the analysis prefix.
+const BenchPromptEchoPrefixTemplate = "This is benchmark repetition number %d. Reproduce the following text exactly, character for character, with no commentary and no introduction.\n\n"
+
+// ReasoningControl describes how to turn a model's thinking mode off, in
+// whichever way that model exposes. Detected from the chat template and
+// carried through ModelInfo so this package needs no dependency on the
+// models package.
+type ReasoningControl struct {
+	Toggle string // "chat_template_kwargs" | "reasoning_effort" | "none"
+	Kwarg  string // kwarg key when Toggle is chat_template_kwargs
+}
+
+// applyThinkingOff adds whatever the model needs to skip its reasoning
+// pass. It is used for the recall workload and nothing else.
+//
+// Without it a reasoning model spends the whole generation budget
+// deliberating about how to reproduce the passage — novel prose, which is
+// the opposite of what internal-echo is for. The measured symptom is an
+// echo preset that reads almost exactly like the analysis preset, because
+// that is what it is running.
+func (rc ReasoningControl) applyThinkingOff(payload map[string]any) {
+	switch rc.Toggle {
+	case "chat_template_kwargs":
+		if rc.Kwarg == "" {
+			return
+		}
+		payload["chat_template_kwargs"] = map[string]any{rc.Kwarg: false}
+	case "reasoning_effort":
+		payload["reasoning_effort"] = "none"
+	}
+	// "none", or a model with no reasoning mode: nothing to turn off.
+}
+
+// promptOptions bundle what the prompt and the request need beyond the
+// sizing arguments, so the two travel together and cannot disagree.
+type promptOptions struct {
+	Style     PromptStyle
+	Reasoning ReasoningControl
+}
+
+// promptPrefixTemplate returns the per-repetition prefix for a style.
+func promptPrefixTemplate(style PromptStyle) string {
+	if style == PromptStyleEcho {
+		return BenchPromptEchoPrefixTemplate
+	}
+	return BenchPromptPrefixTemplate
+}
+
 // buildPrompt constructs a prompt of approximately the target token count
 // by repeating the benchmark text. The repetition parameter varies the
 // prompt to defeat llama.cpp's prompt cache.
@@ -392,7 +465,7 @@ const BenchPromptCharsPerToken = 4
 // prompt_n collapsing from 213 to 4 and prompt-processing throughput
 // reported as ~90 t/s instead of ~1380: a meaningless number presented
 // as a measurement.
-func buildPromptFor(nonce string, targetTokens int, repetition int) string {
+func buildPromptFor(nonce string, targetTokens int, repetition int, style PromptStyle) string {
 	targetChars := targetTokens * BenchPromptCharsPerToken
 	var b strings.Builder
 	// Everything that distinguishes this request goes first, before the
@@ -406,9 +479,18 @@ func buildPromptFor(nonce string, targetTokens int, repetition int) string {
 	// prompt_n of 6309/6795/13070/25630, which sum to the real sizes, and
 	// its throughput figures measured incremental prefill at increasing
 	// depth rather than the full prefill each row claimed.
-	b.WriteString(fmt.Sprintf("Benchmark %s, target %d tokens, repetition %d.\n\n",
-		nonce, targetTokens, repetition))
-	b.WriteString(fmt.Sprintf(BenchPromptPrefixTemplate, repetition))
+	// The style belongs on this line too: both prefixes below open with
+	// "This is benchmark repetition number N", so two prompts that differ
+	// only in style would otherwise share their first ~80 characters. It
+	// is appended only when non-default, so an analysis prompt stays
+	// byte-identical to what every existing preset has always sent.
+	styleMark := ""
+	if style != PromptStyleAnalyze {
+		styleMark = ", style " + string(style)
+	}
+	b.WriteString(fmt.Sprintf("Benchmark %s, target %d tokens, repetition %d%s.\n\n",
+		nonce, targetTokens, repetition, styleMark))
+	b.WriteString(fmt.Sprintf(promptPrefixTemplate(style), repetition))
 	for b.Len() < targetChars {
 		b.WriteString(BenchPromptText)
 	}
@@ -422,14 +504,14 @@ func buildPromptFor(nonce string, targetTokens int, repetition int) string {
 // buildPrompt is the nonce-free form, kept for callers that don't need
 // cache isolation (warmup).
 func buildPrompt(targetTokens int, repetition int) string {
-	return buildPromptFor("", targetTokens, repetition)
+	return buildPromptFor("", targetTokens, repetition, PromptStyleAnalyze)
 }
 
 // sendCompletion sends a chat completion and returns the timings.
 func (r *Runner) sendCompletion(ctx context.Context, routerURL, model string, promptTokens, genTokens int) error {
 	// Warmup only needs the model resident; sampling settings are
 	// irrelevant to that and are left at server defaults.
-	_, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, 0, SamplingParams{}, "")
+	_, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, 0, SamplingParams{}, "", promptOptions{})
 	return err
 }
 
@@ -443,8 +525,8 @@ type timingsResponse struct {
 	PredictedPerSec float64 `json:"predicted_per_second"`
 }
 
-func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model string, promptTokens, genTokens, repetition int, sampling SamplingParams, nonce string) (*timingsResponse, error) {
-	prompt := buildPromptFor(nonce, promptTokens, repetition)
+func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model string, promptTokens, genTokens, repetition int, sampling SamplingParams, nonce string, opts promptOptions) (*timingsResponse, error) {
+	prompt := buildPromptFor(nonce, promptTokens, repetition, opts.Style)
 	reqPayload := map[string]any{
 		"model":      model,
 		"max_tokens": genTokens,
@@ -452,6 +534,11 @@ func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
+	}
+	if opts.Style == PromptStyleEcho {
+		// Recall only works if the model actually reproduces the passage
+		// rather than reasoning about how to.
+		opts.Reasoning.applyThinkingOff(reqPayload)
 	}
 	sampling.applyTo(reqPayload)
 	reqBody, _ := json.Marshal(reqPayload)
@@ -492,8 +579,8 @@ func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model
 }
 
 // runOneTest runs a single benchmark test point.
-func (r *Runner) runOneTest(ctx context.Context, routerURL, model string, promptTokens, genTokens, rep int, sampling SamplingParams, nonce string) (*BenchmarkResult, error) {
-	timings, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, rep, sampling, nonce)
+func (r *Runner) runOneTest(ctx context.Context, routerURL, model string, promptTokens, genTokens, rep int, sampling SamplingParams, nonce string, opts promptOptions) (*BenchmarkResult, error) {
+	timings, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, rep, sampling, nonce, opts)
 	if err != nil {
 		return nil, err
 	}

@@ -158,6 +158,10 @@ type ModelInfo struct {
 	DisplayName string         // short, human-readable name for the run
 	RouterName  string         // identifier the router responds to
 	Config      ConfigSnapshot // saved baseline; ConfigOverrides overlay on this
+	// Reasoning is how this model's thinking mode is turned off, detected
+	// from its chat template. The recall workload needs it; nothing else
+	// does.
+	Reasoning ReasoningControl
 }
 
 // JobQueue serializes job execution: only one job runs at a time. Submit
@@ -500,6 +504,7 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 		HFToken:    q.env.HFToken(),
 		HFHome:     q.env.HFCacheDir(),
 		Sampling:   samplingFromOverrides(cellOv),
+		Reasoning:  modelInfo.Reasoning,
 		Memory:     q.env.MeasuredMemory,
 	}, nil)
 
@@ -866,12 +871,39 @@ func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnaps
 	if overrides.NgramSizeM != nil {
 		out.NgramSizeM = *overrides.NgramSizeM
 	}
+	if overrides.SpecAssist != nil {
+		out.SpecAssist = *overrides.SpecAssist
+	}
+	if overrides.AssistNMax != nil {
+		out.AssistNMax = *overrides.AssistNMax
+	}
+	if overrides.AssistNMin != nil {
+		out.AssistNMin = *overrides.AssistNMin
+	}
+	if overrides.AssistNMatch != nil {
+		out.AssistNMatch = *overrides.AssistNMatch
+	}
+	if overrides.AssistSizeN != nil {
+		out.AssistSizeN = *overrides.AssistSizeN
+	}
+	if overrides.AssistSizeM != nil {
+		out.AssistSizeM = *overrides.AssistSizeM
+	}
+	if overrides.AssistMinHits != nil {
+		out.AssistMinHits = *overrides.AssistMinHits
+	}
 	if overrides.PLEMode != nil {
 		out.PLEMode = *overrides.PLEMode
 	}
 	if overrides.ExtraFlags != nil {
 		out.ExtraFlags = *overrides.ExtraFlags
 	}
+	// Not normalised here: a job stored before speculative decoding had
+	// two slots carries a draftless mode in SpecType with its settings in
+	// the legacy fields, and the snapshot keeps that shape verbatim —
+	// it is a record of what was requested. models.NormalizeSpec runs on
+	// the launch path (specDecodingParams), so such a job launches
+	// exactly as it always did without its stored history being rewritten.
 	return out
 }
 

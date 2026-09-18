@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.28.1](https://github.com/tmac1973/llama-toolchest/compare/v2.28.0...v2.28.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **benchmarks:** stop Ad-Hoc Runs claiming completed while a run is going ([#175](https://github.com/tmac1973/llama-toolchest/issues/175)) ([5258b48](https://github.com/tmac1973/llama-toolchest/commit/5258b483ccaa1c26d43678a555edc41c04cc07c5))
+
+## [2.28.0](https://github.com/tmac1973/llama-toolchest/compare/v2.27.0...v2.28.0) (2026-09-08)
+
+
+### Features
+
+* **spec:** run a draft method and an n-gram assist together ([#174](https://github.com/tmac1973/llama-toolchest/issues/174)) ([a11f91a](https://github.com/tmac1973/llama-toolchest/commit/a11f91ae259bf71d4693c16443ab6ff3a160a7f1))
+
+
+### Bug Fixes
+
+* **models:** detect MTP drafter heads that share the model's architecture ([#171](https://github.com/tmac1973/llama-toolchest/issues/171)) ([aedfb96](https://github.com/tmac1973/llama-toolchest/commit/aedfb962ed2e69060b2183e23756b998db4a2894))
+
 ## [2.27.0](https://github.com/tmac1973/llama-toolchest/compare/v2.26.0...v2.27.0) (2026-09-01)
 
 

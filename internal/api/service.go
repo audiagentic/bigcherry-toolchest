@@ -16,20 +16,24 @@ import (
 	"github.com/tmac1973/llama-toolchest/internal/process"
 )
 
-// applySpecDefaults resets speculative decoding parameters to recommended
-// values for the selected mode. Call this only on a mode *change* — calling
-// it on every save would clobber user-tuned values within an existing mode
-// (the form parser already loaded them from the request into cfg).
-func applySpecDefaults(cfg *models.ModelConfig) {
-	// Zero everything, then apply the mode's recommended defaults from
-	// the shared table — the same one the benchmark job form renders, so
-	// the two surfaces cannot disagree.
+// applyDraftDefaults resets the draft-method parameters to the recommended
+// values for the selected draft mode. Call this only on a mode *change* —
+// calling it on every save would clobber user-tuned values within an
+// existing mode (the form parser already loaded them from the request
+// into cfg).
+//
+// It touches only the draft slot, and applyAssistDefaults only the assist
+// slot: with two independent slots, one function resetting everything
+// would wipe a tuned draft depth the moment the user changed the n-gram
+// assist.
+func applyDraftDefaults(cfg *models.ModelConfig) {
+	// Zero everything in the slot, then apply the mode's recommended
+	// defaults from the shared table — the same one the benchmark job
+	// form renders, so the two surfaces cannot disagree.
 	cfg.DraftMax = 0
 	cfg.DraftMin = 0
 	cfg.DraftPMin = ""
-	cfg.NgramSizeN = 0
-	cfg.NgramSizeM = 0
-	for _, p := range models.SpecModeParams(cfg.SpecType) {
+	for _, p := range models.SpecDraftParams(cfg.SpecType) {
 		switch p.Key {
 		case "draft_max":
 			cfg.DraftMax, _ = strconv.Atoi(p.Default)
@@ -37,10 +41,34 @@ func applySpecDefaults(cfg *models.ModelConfig) {
 			cfg.DraftMin, _ = strconv.Atoi(p.Default)
 		case "draft_p_min":
 			cfg.DraftPMin = p.Default
-		case "ngram_size_n":
-			cfg.NgramSizeN, _ = strconv.Atoi(p.Default)
-		case "ngram_size_m":
-			cfg.NgramSizeM, _ = strconv.Atoi(p.Default)
+		}
+	}
+}
+
+// applyAssistDefaults resets the n-gram assist parameters to the
+// recommended values for the selected assist mode. Same rule as
+// applyDraftDefaults: only on a mode change.
+func applyAssistDefaults(cfg *models.ModelConfig) {
+	cfg.AssistNMax = 0
+	cfg.AssistNMin = 0
+	cfg.AssistNMatch = 0
+	cfg.AssistSizeN = 0
+	cfg.AssistSizeM = 0
+	cfg.AssistMinHits = 0
+	for _, p := range models.SpecAssistParams(cfg.SpecAssist) {
+		switch p.Key {
+		case "assist_n_max":
+			cfg.AssistNMax, _ = strconv.Atoi(p.Default)
+		case "assist_n_min":
+			cfg.AssistNMin, _ = strconv.Atoi(p.Default)
+		case "assist_n_match":
+			cfg.AssistNMatch, _ = strconv.Atoi(p.Default)
+		case "assist_size_n":
+			cfg.AssistSizeN, _ = strconv.Atoi(p.Default)
+		case "assist_size_m":
+			cfg.AssistSizeM, _ = strconv.Atoi(p.Default)
+		case "assist_min_hits":
+			cfg.AssistMinHits, _ = strconv.Atoi(p.Default)
 		}
 	}
 }
@@ -721,7 +749,7 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			detectedMTP = models.FindMTP(model.FilePath)
 			isEmbedding = model.IsEmbedding()
 			if !isEmbedding {
-				draftCandidates = s.registry.FindDraftCandidates(id)
+				draftCandidates = s.registry.FindDraftCandidates(id, cfg.SpecType)
 			}
 		}
 
@@ -786,6 +814,11 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			HasBuiltinVision    bool
 			IsEmbedding         bool
 			DraftCandidates     []models.DraftCandidate
+			DraftModes          []models.SpecMode
+			AssistModes         []models.SpecMode
+			DraftParams         []models.SpecModeParam
+			AssistParams        []models.SpecModeParam
+			EffectiveSpecType   string
 			GPUOptions          []models.GPUOption
 			GPUAssignWarning    string
 			NumGPUs             int
@@ -804,6 +837,11 @@ func (s *Server) handleGetModelConfig(w http.ResponseWriter, r *http.Request) {
 			HasBuiltinVision:    hasBuiltinVision,
 			IsEmbedding:         isEmbedding,
 			DraftCandidates:     draftCandidates,
+			DraftModes:          models.DraftModes(),
+			AssistModes:         models.AssistModes(),
+			DraftParams:         models.SpecDraftParams(cfg.SpecType),
+			AssistParams:        models.SpecAssistParams(cfg.SpecAssist),
+			EffectiveSpecType:   cfg.EffectiveSpecType(),
 			GPUOptions:          gpuOptions,
 			GPUAssignWarning:    s.gpuAssignWarning(cfg, metrics.GPU),
 			NumGPUs:             numGPUs,
@@ -919,11 +957,12 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 			cfg.Aliases = nil
 		}
 
-		// Speculative decoding. Capture the previous SpecType so we can tell
-		// whether the user just switched modes vs. is saving an existing one
-		// — applySpecDefaults wipes user-tuned values, so we only want to
-		// run it on a mode change.
-		prevSpecType := cfg.SpecType
+		// Speculative decoding. Capture the previous mode of each slot so
+		// we can tell whether the user just switched modes vs. is saving
+		// an existing one — the applyDefaults functions wipe user-tuned
+		// values, so we only want to run them on a mode change. Splitting
+		// them per slot is what stops a change to one wiping the other.
+		prevSpecType, prevSpecAssist := cfg.SpecType, cfg.SpecAssist
 		cfg.SpecType = r.FormValue("spec_type")
 		if r.Form.Has("draft_model_path") {
 			cfg.DraftModelPath = r.FormValue("draft_model_path")
@@ -939,16 +978,23 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 			cfg.DraftMin = 0
 		}
 		cfg.DraftPMin = r.FormValue("draft_p_min")
-		if v, err := strconv.Atoi(r.FormValue("ngram_size_n")); err == nil && v > 0 {
-			cfg.NgramSizeN = v
-		} else {
-			cfg.NgramSizeN = 0
+		cfg.SpecAssist = r.FormValue("spec_assist")
+		atoiField := func(name string) int {
+			if v, err := strconv.Atoi(r.FormValue(name)); err == nil && v > 0 {
+				return v
+			}
+			return 0
 		}
-		if v, err := strconv.Atoi(r.FormValue("ngram_size_m")); err == nil && v > 0 {
-			cfg.NgramSizeM = v
-		} else {
-			cfg.NgramSizeM = 0
-		}
+		cfg.AssistNMax = atoiField("assist_n_max")
+		cfg.AssistNMin = atoiField("assist_n_min")
+		cfg.AssistNMatch = atoiField("assist_n_match")
+		cfg.AssistSizeN = atoiField("assist_size_n")
+		cfg.AssistSizeM = atoiField("assist_size_m")
+		cfg.AssistMinHits = atoiField("assist_min_hits")
+		// The legacy n-gram inputs are gone from the form; clear any value
+		// a config still carries so nothing reads them again.
+		cfg.NgramSizeN = 0
+		cfg.NgramSizeM = 0
 
 		// Draft model resource overrides (spec_type=draft only).
 		if v, err := strconv.Atoi(r.FormValue("draft_ctx_size")); err == nil && v > 0 {
@@ -971,9 +1017,12 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 
 		// Populate recommended defaults only when the user actually switched
 		// modes — preserves any custom values they tuned within an existing
-		// mode (e.g. lowering ngram-mod's draft_min from 48 to 12).
+		// mode (e.g. lowering ngram-mod's n-min from 48 to 12).
 		if cfg.SpecType != prevSpecType {
-			applySpecDefaults(cfg)
+			applyDraftDefaults(cfg)
+		}
+		if cfg.SpecAssist != prevSpecAssist {
+			applyAssistDefaults(cfg)
 		}
 	}
 
@@ -984,6 +1033,13 @@ func (s *Server) handleUpdateModelConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := cfg.ValidateFlashAttention(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The two pickers cannot put a mode in the wrong slot, but a crafted
+	// POST or a hand-edited registry can, and llama-server treats an
+	// unknown --spec-type name as a fatal startup error.
+	if err := cfg.ValidateSpec(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
