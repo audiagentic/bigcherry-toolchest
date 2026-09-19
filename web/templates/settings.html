@@ -170,8 +170,9 @@
                     setSection('sec-label-env', b[1], !!env, 'Runtime env (' + envCount + ')');
                     setSection('sec-label-flags', b[2], (d.flag_presets || []).length > 0,
                         'Flag presets (' + (d.flag_presets || []).length + ')');
-                    setSection('sec-label-models', b[3], (d.model_configs || []).length > 0,
-                        'Model configs (' + (d.model_configs || []).length + ')');
+                    var nConfigs = (d.model_configs || []).length, nProfiles = (d.profiles || []).length;
+                    setSection('sec-label-models', b[3], nConfigs + nProfiles > 0,
+                        'Model configs (' + nConfigs + ')' + (nProfiles ? ' and saved profiles (' + nProfiles + ')' : ''));
                     parsedOK = true;
                     msg.innerHTML = hasSecrets
                         ? '<small><mark>&#9888; this file contains secrets (HF token / API key)</mark></small>'
@@ -282,6 +283,14 @@
         <button type="submit">Save</button>
     </form>
     <div id="hf-token-status"></div>
+</article>
+
+<article>
+    <header>Autoconfigure helper model</header>
+    <p>Autoconfigure uses a small model of its own to read a model's documentation (its model card) and suggest settings for it. It is loaded only while Autoconfigure runs, unloaded afterwards, and is not offered for chat or benchmarks. Its settings are managed for you.</p>
+    <div id="helper-model-panel" hx-get="/api/helper-model/panel" hx-trigger="load" hx-swap="innerHTML">
+        <small>Loading…</small>
+    </div>
 </article>
 
 <article>

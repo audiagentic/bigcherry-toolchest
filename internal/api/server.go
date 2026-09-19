@@ -21,6 +21,7 @@ import (
 	"github.com/tmac1973/llama-toolchest/internal/config"
 	"github.com/tmac1973/llama-toolchest/internal/evaluate"
 	"github.com/tmac1973/llama-toolchest/internal/huggingface"
+	"github.com/tmac1973/llama-toolchest/internal/llmcall"
 	"github.com/tmac1973/llama-toolchest/internal/memreport"
 	"github.com/tmac1973/llama-toolchest/internal/models"
 	"github.com/tmac1973/llama-toolchest/internal/modelscope"
@@ -39,7 +40,12 @@ type Server struct {
 	router     chi.Router
 	builder    *builder.Builder
 	hfClient   *huggingface.Client
-	msClient   *modelscope.Client
+	// llm asks a locally served model for structured answers
+	// (autoconfigure); see helper_model.go.
+	llm *llmcall.Client
+	// autoconf tracks the one autoconfigure run allowed at a time.
+	autoconf autoconfigState
+	msClient *modelscope.Client
 
 	// probeCache memoizes remote GGUF header probes, keyed by source,
 	// repo and file. A published file's layout does not change, so the
@@ -233,6 +239,8 @@ func NewServer(cfg *config.Config, configPath string) *Server {
 	// Runs unconditionally rather than only inside ScanModels: a head the
 	// backfill just dropped leaves its main model with no MtpPath, and a
 	// scan that finds nothing new would not re-attach it.
+	s.adoptExistingHelper()
+
 	if n := s.registry.AutoDetectMTP(); n > 0 {
 		slog.Info("auto-detected MTP drafter heads", "count", n)
 	}
@@ -242,6 +250,7 @@ func NewServer(cfg *config.Config, configPath string) *Server {
 		}
 	}
 	s.pages = s.parseTemplates()
+	s.llm = &llmcall.Client{Backend: &helperBackend{s: s}, HTTP: &http.Client{Timeout: 5 * time.Minute}}
 	s.router = s.buildRouter()
 
 	if cfg.AutoStart {
@@ -276,6 +285,11 @@ func (s *Server) templateFuncs() template.FuncMap {
 		// cssID sanitizes a string so it's safe to use as both an HTML id
 		// attribute and a CSS selector (see domID in hf.go).
 		"cssID": domID,
+		// groupThousands writes a number with thousands separators.
+		"groupThousands": groupThousands,
+		// profileCell renders a run's saved profile for the comparison
+		// table: the name, "(edited)" when what ran differed from it.
+		"profileCell": benchmark.ProfileCellText,
 		// deref turns a pointer like *int / *bool / *string / *float64
 		// into its underlying value for templates. Non-pointers pass
 		// through; nil pointers return empty string.
@@ -549,6 +563,8 @@ func (s *Server) buildRouter() chi.Router {
 		r.Route("/models", func(r chi.Router) {
 			r.Get("/", s.handleListModels)
 			r.Get("/embeddings", s.handleListEmbeddingModels)
+			r.Get("/helpers", s.handleListHelperModels)
+			r.Post("/helpers/remove", s.handleRemoveHelperFromList)
 			r.Post("/scan", s.handleScanModels)
 			r.Get("/embedding-presets", s.handleEmbeddingPresets)
 			r.Post("/embedding-presets/download", s.handleDownloadEmbeddingPreset)
@@ -560,6 +576,14 @@ func (s *Server) buildRouter() chi.Router {
 			r.Put("/{id}/enable", s.handleModelEnable)
 			r.Get("/{id}/config", s.handleGetModelConfig)
 			r.Put("/{id}/config", s.handleUpdateModelConfig)
+			r.Get("/{id}/autoconfig", s.handleAutoconfigDialog)
+			r.Post("/{id}/autoconfig", s.handleAutoconfigStart)
+			r.Get("/{id}/autoconfig/status", s.handleAutoconfigStatus)
+			r.Post("/{id}/autoconfig/save", s.handleAutoconfigSave)
+			r.Post("/{id}/autoconfig/discard", s.handleAutoconfigDiscard)
+			r.Post("/{id}/profiles", s.handleSaveProfile)
+			r.Post("/{id}/profiles/apply", s.handleApplyProfile)
+			r.Post("/{id}/profiles/delete", s.handleDeleteProfile)
 			r.Post("/{id}/refresh-presets", s.handleRefreshPresets)
 			r.Get("/{id}/vram-estimate", s.handleModelVRAMEstimate)
 			r.Get("/{id}/vram-corpus", s.handleVRAMCorpus)
@@ -588,6 +612,9 @@ func (s *Server) buildRouter() chi.Router {
 			r.Get("/loaded-models", s.handleLoadedModels)
 		})
 		r.Get("/ps", s.handlePS)
+		r.Get("/helper-model/panel", s.handleHelperPanel)
+		r.Post("/helper-model/remove", s.handleRemoveHelperModel)
+		r.Post("/helper-model/download", s.handleDownloadHelperModel)
 		r.Route("/settings", func(r chi.Router) {
 			r.Get("/", s.handleGetSettings)
 			r.Put("/", s.handleUpdateSettings)
@@ -647,8 +674,19 @@ func (s *Server) handleModelsPage(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "models.html", pageData{Title: "Models", Nav: "models"})
 }
 
+// benchmarksPageData is what benchmarks.html renders.
+type benchmarksPageData struct {
+	pageData
+	// ReadOnlyReason is set when benchmarks.json cannot be saved; the page
+	// says why, and new jobs are refused until it is fixed.
+	ReadOnlyReason string
+}
+
 func (s *Server) handleBenchmarksPage(w http.ResponseWriter, r *http.Request) {
-	s.render(w, "benchmarks.html", pageData{Title: "Benchmarks", Nav: "benchmarks"})
+	s.render(w, "benchmarks.html", benchmarksPageData{
+		pageData:       pageData{Title: "Benchmarks", Nav: "benchmarks"},
+		ReadOnlyReason: s.bench.ReadOnlyReason(),
+	})
 }
 
 func (s *Server) handleModelsBrowsePage(w http.ResponseWriter, r *http.Request) {

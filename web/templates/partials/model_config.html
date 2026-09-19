@@ -1,4 +1,34 @@
 {{define "model_config"}}
+{{/* The whole panel: header, saved-profile bar, then the autosaving form.
+     Profile actions re-render this; the form's autosave swaps only the
+     form (see model_config_autosave). */}}
+<div class="model-config-panel" id="model-config-panel-{{cssID .ModelID}}">
+    <div class="model-config-header">
+        <span>Configure <span class="mc-owner">— {{.ModelID}}</span></span>
+        <span class="mc-restart">Restart required</span>
+    </div>
+
+    {{if .ReadOnlyReason}}
+    <p role="alert" style="margin:0.5rem 0;"
+       title="The file on disk has not been changed. Fix or restore models.json, or upgrade llama-toolchest, then restart it.">
+        <mark>&#9888; {{.ReadOnlyReason}}</mark>
+    </p>
+    {{end}}
+
+    {{template "profile_bar" .}}
+    {{template "model_config_form" .}}
+</div>
+{{end}}
+
+{{/* The autosave response: the form, plus the profile status line swapped
+     out of band so "edited since" stays current without re-rendering the
+     bar (which would clear a profile name being typed). */}}
+{{define "model_config_autosave"}}
+{{template "model_config_form" .}}
+{{template "profile_status" .}}
+{{end}}
+
+{{define "model_config_form"}}
 {{/* A rejected save (validation 400, server error) leaves the form
      unswapped, and htmx is silent about it — without the error handlers
      the form just looks frozen: nothing the user changes appears to do
@@ -14,10 +44,6 @@
       hx-on::response-error="var e=this.querySelector('.cfg-save-error'); if(e){e.textContent='Not saved: '+(event.detail.xhr.responseText.trim()||('server returned '+event.detail.xhr.status)); e.style.display='block';}"
       hx-on::send-error="var e=this.querySelector('.cfg-save-error'); if(e){e.textContent='Not saved: could not reach the server.'; e.style.display='block';}">
 
-    <div class="model-config-header">
-        <span>Configure <span class="mc-owner">— {{.ModelID}}</span></span>
-        <span class="mc-restart">Restart required</span>
-    </div>
 
     <label title="Friendly names for this model. Clients can use these instead of the full ID. Comma-separated, e.g. qwen3:latest, my-chat-model">
         Aliases
@@ -31,6 +57,22 @@
             <input type="number" name="gpu_layers" value="{{.Config.GPULayers}}"
                    min="0" max="999" placeholder="999 = all layers">
         </label>
+        {{if .HasExperts}}
+        <label title="Mixture-of-experts models only. Keeps the expert weights of this many layers in system memory instead of GPU memory. Use it when the model does not fit on the GPU: it is much faster than lowering GPU Layers, because each token only reads the few experts it uses. 0 keeps everything on the GPU. At most {{.NLayers}}.">
+            CPU Expert Layers
+            <input type="number" name="cpu_moe" value="{{if gt .Config.CPUMoE 0}}{{.Config.CPUMoE}}{{end}}"
+                   min="0" max="{{.NLayers}}" placeholder="0 = all on GPU">
+            <small>Effective: {{if gt .Config.CPUMoE 0}}<code>--n-cpu-moe {{.Config.CPUMoE}}</code>{{else}}not set (all experts on the GPU){{end}}</small>
+        </label>
+        {{end}}
+        {{if .HasExperts}}
+        <label title="Mixture-of-experts models only. Keeps the expert weights of this many layers in system memory instead of GPU memory. Use it when the model does not fit on the GPU: it is much faster than lowering GPU Layers, because each token only reads the few experts it uses. 0 keeps everything on the GPU. At most {{.NLayers}}.">
+            CPU Expert Layers
+            <input type="number" name="cpu_moe" value="{{if gt .Config.CPUMoE 0}}{{.Config.CPUMoE}}{{end}}"
+                   min="0" max="{{.NLayers}}" placeholder="0 = all on GPU">
+            <small>Effective: {{if gt .Config.CPUMoE 0}}<code>--n-cpu-moe {{.Config.CPUMoE}}</code>{{else}}not set (all experts on the GPU){{end}}</small>
+        </label>
+        {{end}}
         {{if not .IsEmbedding}}
         {{$cs := .Config.ContextSize}}
         {{$mc := .MaxContext}}
@@ -111,6 +153,10 @@
                    min="1" placeholder="8">
         </label>
     </div>
+    {{if .CPURAMLabel}}
+    <small title="The part of the model's weights these settings keep in system memory rather than GPU memory: layers left off the GPU by GPU Layers, and expert layers kept on the CPU by CPU Expert Layers. The GPU memory estimate on the model card already leaves this out."
+           style="display:block;margin-bottom:0.75rem;cursor:help;">{{.CPURAMLabel}}</small>
+    {{end}}
 
 
     {{if not .IsEmbedding}}

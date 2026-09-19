@@ -2,16 +2,20 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tmac1973/llama-toolchest/internal/atomicfile"
 )
 
 // OrgAndBase returns the HuggingFace organization and base model name
@@ -98,6 +102,24 @@ type Model struct {
 	// carrying it are dropped on the next backfill; nothing should serve
 	// one or offer it as a draft candidate. See GGUFMeta.IsMTPHead.
 	MTPHead bool `json:"mtp_head,omitempty"`
+	// NextNLayers is the number of built-in MTP draft layers: non-zero
+	// means the model can draft for itself (draft-mtp with no separate
+	// head). Zero on a standalone head, which carries the key but is not
+	// a model anyone runs.
+	NextNLayers int `json:"nextn_layers,omitempty"`
+	// HelperRole marks a model the app downloaded for its own use:
+	// reading model cards for Autoconfigure, and later Autotune. It is
+	// loaded only for those, and unloaded afterwards. Its settings are
+	// fixed (see HelperConfig), it is not offered for chat or
+	// benchmarks, and the only thing to do with it is remove it.
+	HelperRole bool `json:"helper_role,omitempty"`
+	// Mixture-of-experts layout, for --n-cpu-moe (see GGUFMeta). All zero
+	// on a dense model.
+	ExpertCount      int   `json:"expert_count,omitempty"`
+	ExpertUsedCount  int   `json:"expert_used_count,omitempty"`
+	ExpertBytes      int64 `json:"expert_bytes,omitempty"`
+	ExpertLayerFirst int   `json:"expert_layer_first,omitempty"`
+	ExpertLayers     int   `json:"expert_layers,omitempty"`
 
 	// Architecture parameters parsed from GGUF header.
 	Arch          string `json:"arch,omitempty"`
@@ -152,6 +174,12 @@ type ModelConfig struct {
 	GPUAssign   string `json:"gpu_assign,omitempty"` // "all", "0", "0-1", "custom", etc.
 	ContextSize int    `json:"context_size"`
 	Parallel    int    `json:"parallel,omitempty"` // n parallel sequence slots; 0/1 = no extra slots, >1 divides ctx_size across slots
+	// CPUMoE maps to --n-cpu-moe: the expert weights of the first N layers
+	// stay in system memory. The fastest way to run a mixture-of-experts
+	// model larger than VRAM, because only the few experts each token uses
+	// are read from there. 0 keeps everything on the GPU. Meaningful only
+	// when Model.ExpertCount > 0.
+	CPUMoE int `json:"cpu_moe,omitempty"`
 	// BatchSize/UBatchSize map to --batch-size / --ubatch-size. Zero means
 	// "don't emit", leaving llama.cpp on its own defaults (2048 / 512), so
 	// existing models are unaffected. UBatchSize is the physical compute
@@ -216,6 +244,12 @@ type ModelConfig struct {
 	// ReasoningOverride lets a user correct or supply reasoning capability when
 	// chat-template auto-detection is wrong or absent. nil = use detection.
 	ReasoningOverride *ReasoningCapability `json:"reasoning,omitempty"`
+
+	// ActiveProfile names the saved profile this config was last saved as
+	// or restored from. It is a label, not a link: whether the config
+	// still matches that profile is worked out by comparing the two (see
+	// Registry.ActiveProfileState).
+	ActiveProfile string `json:"active_profile,omitempty"`
 
 	// SamplingPreset names the publisher preset whose values currently fill
 	// the sampling fields below, so the UI can show which preset is running.
@@ -348,6 +382,9 @@ func (c *ModelConfig) EffectiveFlagsFor(isEmbedding bool, backend string) string
 	if c.Parallel > 1 {
 		parts = append(parts, "--parallel", strconv.Itoa(c.Parallel))
 	}
+	if c.CPUMoE > 0 {
+		parts = append(parts, "--n-cpu-moe", strconv.Itoa(c.CPUMoE))
+	}
 	for _, p := range gpuPlacementParams(c, backend) {
 		parts = append(parts, "--"+p.Name, p.Value)
 	}
@@ -395,12 +432,36 @@ func (c *ModelConfig) EffectiveFlags() string {
 	return c.EffectiveFlagsFor(false, "")
 }
 
+// RegistrySchemaVersion is the models.json layout this build writes.
+// load() reads it back: a file written by a newer build may carry fields
+// this one does not know, and saving over it would silently drop them, so
+// such a file makes the registry read-only instead. A file with no version
+// (every file written before the field existed) is read as current.
+//
+//	1 — the version field itself
+//	2 — config_profiles
+const RegistrySchemaVersion = 2
+
+// ErrRegistryReadOnly is matched by errors.Is on every refusal from a
+// read-only registry. The error text itself is the plain-language reason.
+var ErrRegistryReadOnly = errors.New("model registry is read-only")
+
+type readOnlyError struct{ reason string }
+
+func (e readOnlyError) Error() string        { return e.reason }
+func (e readOnlyError) Is(target error) bool { return target == ErrRegistryReadOnly }
+
 type registryData struct {
-	Models  map[string]*Model       `json:"models"`
-	Configs map[string]*ModelConfig `json:"configs"`
+	SchemaVersion int                     `json:"schema_version"`
+	Models        map[string]*Model       `json:"models"`
+	Configs       map[string]*ModelConfig `json:"configs"`
 	// PendingConfigs holds backup-imported configs awaiting their model
 	// (see pending.go). Additive: older binaries ignore the field.
 	PendingConfigs []PendingConfig `json:"pending_configs,omitempty"`
+	// Profiles are named config snapshots, keyed by model identity rather
+	// than registry ID (see profiles.go). They stay when their model is
+	// deleted.
+	Profiles []ConfigProfile `json:"config_profiles,omitempty"`
 }
 
 // Registry manages local model storage and metadata.
@@ -409,6 +470,13 @@ type Registry struct {
 	dataDir   string
 	modelsDir string
 	data      registryData
+
+	// readOnly, when set, is why models.json must not be written: it could
+	// not be read, did not parse, or came from a newer build. Whatever did
+	// parse is still served, so the operator sees their models and the
+	// reason rather than an empty page. Every mutator checks it before
+	// changing anything in memory; save() checks it again as a backstop.
+	readOnly string
 }
 
 // NewRegistry creates a registry and loads persisted state. modelsDir is
@@ -431,6 +499,9 @@ func NewRegistry(dataDir, modelsDir string) *Registry {
 func (r *Registry) Add(m *Model) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 	r.data.Models[m.ID] = m
 	// A backup-imported config waiting for this identity wins over the
 	// default config. Covers downloads and scans alike — ScanModels
@@ -444,13 +515,12 @@ func (r *Registry) Add(m *Model) error {
 			TensorSplit:    "",
 			SplitMode:      "",
 			ContextSize:    8192,
-			Threads:        8,
+			Threads:        ThreadsFor(runtime.NumCPU()),
 			FlashAttention: true,
 			Jinja:          true,
 		}
 	}
-	r.save()
-	return nil
+	return r.save()
 }
 
 // List returns all models, sorted alphabetically by ModelID.
@@ -532,6 +602,9 @@ func (r *Registry) ResolveID(name string) string {
 func (r *Registry) Remove(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 
 	if _, ok := r.data.Models[id]; !ok {
 		return fmt.Errorf("model not found: %s", id)
@@ -539,14 +612,18 @@ func (r *Registry) Remove(id string) error {
 
 	delete(r.data.Models, id)
 	delete(r.data.Configs, id)
-	r.save()
-	return nil
+	return r.save()
 }
 
 // Delete removes a model entry and deletes its files from disk.
 func (r *Registry) Delete(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Checked before the files go: a delete that removed the GGUF and then
+	// could not record it would leave a registry entry for a missing file.
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 
 	m, ok := r.data.Models[id]
 	if !ok {
@@ -566,8 +643,7 @@ func (r *Registry) Delete(id string) error {
 
 	delete(r.data.Models, id)
 	delete(r.data.Configs, id)
-	r.save()
-	return nil
+	return r.save()
 }
 
 // removeEmptyDirs removes dir and its parent if they're empty, stopping at the models dir.
@@ -601,12 +677,62 @@ func (r *Registry) GetConfig(id string) (*ModelConfig, error) {
 func (r *Registry) SetConfig(id string, cfg *ModelConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 	if _, ok := r.data.Models[id]; !ok {
 		return fmt.Errorf("model not found: %s", id)
 	}
+	// The config form never posts the profile label, so an autosave would
+	// otherwise erase it on every change. Profile methods set it directly.
+	if cfg.ActiveProfile == "" {
+		if prev, ok := r.data.Configs[id]; ok && prev != nil {
+			cfg.ActiveProfile = prev.ActiveProfile
+		}
+	}
 	r.data.Configs[id] = cfg
-	r.save()
-	return nil
+	return r.save()
+}
+
+// SetHelperRole marks or unmarks a model as the app's helper model.
+func (r *Registry) SetHelperRole(id string, on bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
+	m, ok := r.data.Models[id]
+	if !ok {
+		return fmt.Errorf("model not found: %s", id)
+	}
+	if m.HelperRole == on {
+		return nil
+	}
+	m.HelperRole = on
+	return r.save()
+}
+
+// ListServing returns the models available for chat, embeddings and
+// benchmarks: everything except the app's own helper models.
+func (r *Registry) ListServing() []*Model {
+	var out []*Model
+	for _, m := range r.List() {
+		if !m.HelperRole {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// ListHelpers returns the app's helper models.
+func (r *Registry) ListHelpers() []*Model {
+	var out []*Model
+	for _, m := range r.List() {
+		if m.HelperRole {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // SetSamplingPresets replaces the sampling presets on a model record and
@@ -615,14 +741,16 @@ func (r *Registry) SetConfig(id string, cfg *ModelConfig) error {
 func (r *Registry) SetSamplingPresets(id string, presets []SamplingPreset, checkedAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 	m, ok := r.data.Models[id]
 	if !ok {
 		return fmt.Errorf("model not found: %s", id)
 	}
 	m.SamplingPresets = presets
 	m.PresetsCheckedAt = checkedAt
-	r.save()
-	return nil
+	return r.save()
 }
 
 // ListNeedingPresetFetch returns IDs of models that have never had a network
@@ -661,7 +789,10 @@ func (r *Registry) ListNeedingPresetFetch() []string {
 //	2 — NextN layer count and block-tensor layout added, so a standalone
 //	    MTP drafter head that reports a runnable architecture is
 //	    recognized as a head. Records for one are dropped by the backfill.
-const GGUFMetaVersion = 2
+//	3 — built-in MTP layer count copied to the model record, and the
+//	    mixture-of-experts layout (expert counts, expert tensor bytes and
+//	    which layers carry them) added for --n-cpu-moe.
+const GGUFMetaVersion = 3
 
 // BackfillGGUFMeta re-reads GGUF metadata for records written by an older
 // parser, in one pass at startup.
@@ -674,6 +805,9 @@ const GGUFMetaVersion = 2
 func (r *Registry) BackfillGGUFMeta() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("BackfillGGUFMeta") {
+		return
+	}
 
 	changed := false
 	for _, m := range r.data.Models {
@@ -720,6 +854,9 @@ func (r *Registry) BackfillGGUFMeta() {
 func (r *Registry) DeduplicateModels() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("DeduplicateModels") {
+		return 0
+	}
 
 	seen := make(map[string]string) // file path → first model ID
 	var dupes []string
@@ -928,7 +1065,12 @@ func (r *Registry) ScanModels() int {
 	for _, m := range r.data.Models {
 		knownPaths[m.FilePath] = true
 	}
+	readOnly := r.readOnly
 	r.mu.RUnlock()
+	if readOnly != "" {
+		slog.Warn("model registry is read-only; not scanning for new models", "reason", readOnly)
+		return 0
+	}
 
 	// Walk looking for .gguf files
 	var found []*Model
@@ -1127,6 +1269,9 @@ func findMMProjInDir(dir string) string {
 func (r *Registry) AutoDetectMMProj() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("AutoDetectMMProj") {
+		return 0
+	}
 
 	found := 0
 	for id, m := range r.data.Models {
@@ -1260,6 +1405,9 @@ func findMTPInDir(dir string) string {
 func (r *Registry) BackfillSpecAssist() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("BackfillSpecAssist") {
+		return 0
+	}
 
 	migrated := 0
 	for _, cfg := range r.data.Configs {
@@ -1278,6 +1426,9 @@ func (r *Registry) BackfillSpecAssist() int {
 func (r *Registry) AutoDetectMTP() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("AutoDetectMTP") {
+		return 0
+	}
 
 	found := 0
 	for id, m := range r.data.Models {
@@ -1446,10 +1597,27 @@ func (r *Registry) registryPath() string {
 func (r *Registry) load() {
 	data, err := os.ReadFile(r.registryPath())
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			r.readOnly = fmt.Sprintf("models.json could not be read (%v). "+
+				"Model settings will not be saved until the file can be read, "+
+				"so that nothing overwrites it.", err)
+			slog.Error("failed to read model registry; registry is read-only", "error", err)
+		}
 		return
 	}
 	if err := json.Unmarshal(data, &r.data); err != nil {
-		slog.Error("failed to load model registry", "error", err)
+		r.readOnly = fmt.Sprintf("models.json could not be parsed (%v). "+
+			"Model settings will not be saved until the file is fixed, "+
+			"so that nothing overwrites it.", err)
+		slog.Error("failed to parse model registry; registry is read-only", "error", err)
+	} else if r.data.SchemaVersion > RegistrySchemaVersion {
+		r.readOnly = fmt.Sprintf("models.json was written by a newer version of "+
+			"llama-toolchest (schema %d; this version reads up to %d). "+
+			"Model settings will not be saved until llama-toolchest is upgraded, "+
+			"so that nothing the newer version stored is lost.",
+			r.data.SchemaVersion, RegistrySchemaVersion)
+		slog.Error("model registry is from a newer build; registry is read-only",
+			"schema_version", r.data.SchemaVersion, "supported", RegistrySchemaVersion)
 	}
 	if r.data.Models == nil {
 		r.data.Models = make(map[string]*Model)
@@ -1474,12 +1642,50 @@ func (r *Registry) load() {
 	}
 }
 
-func (r *Registry) save() {
-	os.MkdirAll(filepath.Dir(r.registryPath()), 0o755)
+// ReadOnlyReason returns why the registry refuses to save, or "" when it
+// is writable.
+func (r *Registry) ReadOnlyReason() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readOnly
+}
+
+// writableLocked returns an error when the registry must not be changed.
+// Mutators call it before touching memory: a change made in memory that
+// then failed to save would launch a config the panel reported as not
+// saved.
+func (r *Registry) writableLocked() error {
+	if r.readOnly != "" {
+		return readOnlyError{r.readOnly}
+	}
+	return nil
+}
+
+// skipReadOnlyLocked is writableLocked for the startup backfills, which
+// have no caller to return an error to.
+func (r *Registry) skipReadOnlyLocked(what string) bool {
+	if r.readOnly == "" {
+		return false
+	}
+	slog.Warn("model registry is read-only; skipping", "step", what, "reason", r.readOnly)
+	return true
+}
+
+// save writes models.json with write-then-rename, so a crash mid-write
+// leaves the previous file rather than a truncated one.
+func (r *Registry) save() error {
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
+	r.data.SchemaVersion = RegistrySchemaVersion
 	data, err := json.MarshalIndent(r.data, "", "  ")
 	if err != nil {
 		slog.Error("failed to marshal model registry", "error", err)
-		return
+		return fmt.Errorf("saving models.json: %w", err)
 	}
-	os.WriteFile(r.registryPath(), data, 0o644)
+	if err := atomicfile.Write(r.registryPath(), data); err != nil {
+		slog.Error("failed to write model registry", "error", err)
+		return fmt.Errorf("saving models.json: %w", err)
+	}
+	return nil
 }

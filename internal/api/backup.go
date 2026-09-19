@@ -198,6 +198,10 @@ func (s *Server) restoreDeps() backup.Deps {
 				SavedAt:  time.Now().UTC(),
 			})
 		},
+		ImportProfile: func(p models.ConfigProfile) error {
+			_, err := s.registry.ImportProfile(p)
+			return err
+		},
 		NumGPUs:   len(s.monitor.Current().GPU),
 		ModelsDir: s.cfg.ModelsPath(),
 	}
@@ -210,7 +214,12 @@ func (s *Server) restoreDeps() backup.Deps {
 func (s *Server) handleDiscardPending(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 	modelID, quant := r.FormValue("model_id"), r.FormValue("quant")
-	if !s.registry.DiscardPendingConfig(modelID, quant) {
+	found, err := s.registry.DiscardPendingConfig(modelID, quant)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if !found {
 		http.Error(w, fmt.Sprintf("no pending config for %s %s", modelID, quant), http.StatusNotFound)
 		return
 	}

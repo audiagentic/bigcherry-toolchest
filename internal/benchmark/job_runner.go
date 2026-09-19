@@ -207,6 +207,11 @@ func (q *JobQueue) Status() (*BenchmarkJob, bool) {
 // Submit accepts a new job and starts it in a background goroutine.
 // Returns ErrJobAlreadyRunning when another job is in flight.
 func (q *JobQueue) Submit(job BenchmarkJob) error {
+	// A job run against a read-only store would be recorded in memory only
+	// and lost at the next restart.
+	if err := q.store.Writable(); err != nil {
+		return err
+	}
 	q.mu.Lock()
 	if q.current != nil {
 		q.mu.Unlock()
@@ -444,7 +449,7 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 		return fmt.Errorf("build %s no longer exists", cell.BuildID)
 	}
 
-	cfg := applyOverrides(modelInfo.Config, cellOv)
+	cfg := markProfileEdited(applyOverrides(modelInfo.Config, cellOv), modelInfo.Config)
 
 	// Make the merged config real before measuring anything. Without
 	// this the cell benchmarks the model's saved config and then records
@@ -558,7 +563,7 @@ func (q *JobQueue) runCapabilityCell(ctx context.Context, job *BenchmarkJob, cel
 	// the config-fidelity criterion. EvalConfigSnapshot, not
 	// applyOverrides: an evaluation defaults to an f16 KV cache so its
 	// score is comparable, unless the job asked for a specific one.
-	cfg := EvalConfigSnapshot(modelInfo.Config, cellOv)
+	cfg := markProfileEdited(EvalConfigSnapshot(modelInfo.Config, cellOv), modelInfo.Config)
 
 	run := BenchmarkRun{
 		ID:           newRunID(cell.Attempt),
@@ -834,6 +839,9 @@ func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnaps
 	}
 	if overrides.UBatchSize != nil {
 		out.UBatchSize = *overrides.UBatchSize
+	}
+	if overrides.CPUMoE != nil {
+		out.CPUMoE = *overrides.CPUMoE
 	}
 	if overrides.FlashAttention != nil {
 		out.FlashAttention = *overrides.FlashAttention
