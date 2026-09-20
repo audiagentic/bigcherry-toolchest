@@ -33,7 +33,7 @@ func TestApplySnapshotOverridesSetFields(t *testing.T) {
 		KVCacheQuant:   "q4_0",
 		FlashAttention: true,
 	}
-	got := applySnapshotToConfig(baseConfig(), snap)
+	got := benchmark.ApplySnapshotToConfig(baseConfig(), snap)
 
 	if got.ContextSize != 65536 {
 		t.Errorf("ContextSize = %d, want 65536", got.ContextSize)
@@ -55,7 +55,7 @@ func TestApplySnapshotOverridesSetFields(t *testing.T) {
 // Fields the snapshot doesn't model must survive untouched — the
 // override applies to a copy of the saved config, not a fresh struct.
 func TestApplySnapshotPreservesUnmodeledFields(t *testing.T) {
-	got := applySnapshotToConfig(baseConfig(), benchmark.ConfigSnapshot{
+	got := benchmark.ApplySnapshotToConfig(baseConfig(), benchmark.ConfigSnapshot{
 		ContextSize: 4096, GPUAssign: "all",
 	})
 
@@ -79,7 +79,7 @@ func TestApplySnapshotPreservesUnmodeledFields(t *testing.T) {
 // discarded while the run still recorded 0 as applied — the same
 // mislabeled-result failure this whole mechanism exists to prevent.
 func TestApplySnapshotAppliesZeroValues(t *testing.T) {
-	got := applySnapshotToConfig(baseConfig(), benchmark.ConfigSnapshot{
+	got := benchmark.ApplySnapshotToConfig(baseConfig(), benchmark.ConfigSnapshot{
 		GPULayers:   0,
 		ContextSize: 4096,
 		Threads:     8,
@@ -97,7 +97,7 @@ func TestApplySnapshotAppliesZeroValues(t *testing.T) {
 // the no-override case.
 func TestApplySnapshotRoundTripsSavedValues(t *testing.T) {
 	base := baseConfig()
-	got := applySnapshotToConfig(base, benchmark.ConfigSnapshot{
+	got := benchmark.ApplySnapshotToConfig(base, benchmark.ConfigSnapshot{
 		GPULayers:      base.GPULayers,
 		ContextSize:    base.ContextSize,
 		Threads:        base.Threads,
@@ -118,7 +118,7 @@ func TestApplySnapshotRoundTripsSavedValues(t *testing.T) {
 // registry's live config and the registry must not observe the change.
 func TestApplySnapshotDoesNotMutateInput(t *testing.T) {
 	base := baseConfig()
-	_ = applySnapshotToConfig(base, benchmark.ConfigSnapshot{ContextSize: 65536, GPULayers: 1})
+	_ = benchmark.ApplySnapshotToConfig(base, benchmark.ConfigSnapshot{ContextSize: 65536, GPULayers: 1})
 
 	if base.ContextSize != 8192 || base.GPULayers != 999 {
 		t.Errorf("input mutated: ctx=%d ngl=%d", base.ContextSize, base.GPULayers)
@@ -187,7 +187,7 @@ func TestReleaseRouterClearsOwnership(t *testing.T) {
 func TestGPUAssignSweepResolvesToRealFlags(t *testing.T) {
 	base := models.ModelConfig{GPUAssign: "all", SplitMode: "layer", MainGPU: 0}
 
-	out := applySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "0"})
+	out := benchmark.ApplySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "0"})
 	resolveGPUAssignment(&out, base, 2)
 
 	if out.GPUAssign != "0" {
@@ -201,7 +201,7 @@ func TestGPUAssignSweepResolvesToRealFlags(t *testing.T) {
 
 	// The whole point: the two sweep points must not produce the same
 	// preset input.
-	other := applySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "all"})
+	other := benchmark.ApplySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "all"})
 	resolveGPUAssignment(&other, base, 2)
 	if other.TensorSplit == out.TensorSplit && other.SplitMode == out.SplitMode && other.MainGPU == out.MainGPU {
 		t.Error("gpu_assign sweep points resolved identically; the sweep would be a no-op")
@@ -212,7 +212,7 @@ func TestGPUAssignSweepResolvesToRealFlags(t *testing.T) {
 // split-mode and main-gpu alone.
 func TestGPUAssignUnchangedLeavesDerivedFields(t *testing.T) {
 	base := models.ModelConfig{GPUAssign: "custom", TensorSplit: "3,1", SplitMode: "tensor", MainGPU: 1}
-	out := applySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "custom", TensorSplit: "3,1"})
+	out := benchmark.ApplySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "custom", TensorSplit: "3,1"})
 	resolveGPUAssignment(&out, base, 2)
 
 	if out.TensorSplit != "3,1" || out.SplitMode != "tensor" || out.MainGPU != 1 {
@@ -269,7 +269,7 @@ func TestGPUPlacementValidationIgnoresUnrelatedJobs(t *testing.T) {
 // identical measurements under different labels. Fail instead.
 func TestGPUAssignFailsWhenGPUCountUnknown(t *testing.T) {
 	base := models.ModelConfig{GPUAssign: "all"}
-	out := applySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "0-1"})
+	out := benchmark.ApplySnapshotToConfig(base, benchmark.ConfigSnapshot{GPUAssign: "0-1"})
 	if err := resolveGPUAssignment(&out, base, 0); err == nil {
 		t.Error("expected an error rather than a silently collapsed sweep")
 	}
@@ -329,7 +329,7 @@ func TestNoTakeoverMeansNoTeardownRestart(t *testing.T) {
 func TestSpecParamsReachLaunchFlags(t *testing.T) {
 	base := models.ModelConfig{Enabled: true, GPULayers: 999, ContextSize: 8192, Threads: 8}
 
-	on := applySnapshotToConfig(base, benchmark.ConfigSnapshot{
+	on := benchmark.ApplySnapshotToConfig(base, benchmark.ConfigSnapshot{
 		GPULayers: 999, ContextSize: 8192, Threads: 8,
 		SpecType: "draft-mtp", DraftMax: 6, DraftPMin: "0.75",
 	})
@@ -343,11 +343,73 @@ func TestSpecParamsReachLaunchFlags(t *testing.T) {
 	savedMTP := base
 	savedMTP.SpecType = "draft-mtp"
 	savedMTP.DraftMax = 6
-	off := applySnapshotToConfig(savedMTP, benchmark.ConfigSnapshot{
+	off := benchmark.ApplySnapshotToConfig(savedMTP, benchmark.ConfigSnapshot{
 		GPULayers: 999, ContextSize: 8192, Threads: 8,
 		// SpecType empty: the explicit off override.
 	})
 	if flags := off.EffectiveFlagsFor(false, ""); strings.Contains(flags, "--spec-type") {
 		t.Errorf("explicit off should emit no speculative flags: %s", flags)
+	}
+}
+
+// A job that measures from a saved profile must still write a preset in
+// which the model is turned on and keeps its aliases. Profiles store
+// those two fields cleared on purpose, and taking them from the profile
+// left the model out of the benchmark preset entirely: every cell then
+// failed with "404 File Not Found" from the router.
+func TestMergeBenchConfigKeepsModelIdentityFromSavedConfig(t *testing.T) {
+	saved := baseConfig()
+	profile := baseConfig()
+	profile.Enabled = false
+	profile.Aliases = nil
+	profile.ContextSize = 32768
+
+	// The cell's snapshot is taken from the profile and then swept, the
+	// way the job runner builds it.
+	snap := benchmark.ConfigSnapshot{ContextSize: profile.ContextSize, BatchSize: 2048}
+	got, err := mergeBenchConfig("m", saved, profile, snap, 1)
+	if err != nil {
+		t.Fatalf("mergeBenchConfig: %v", err)
+	}
+	if !got.Enabled {
+		t.Error("Enabled = false; the model would be left out of the preset and every load would 404")
+	}
+	if len(got.Aliases) != 1 || got.Aliases[0] != "keep-me" {
+		t.Errorf("Aliases = %v, want the saved config's [keep-me]", got.Aliases)
+	}
+	if got.ContextSize != 32768 {
+		t.Errorf("ContextSize = %d, want the profile's 32768", got.ContextSize)
+	}
+	if got.BatchSize != 2048 {
+		t.Errorf("BatchSize = %d, want the cell's 2048", got.BatchSize)
+	}
+}
+
+// Aliases are copied, not shared: the merged config is handed to the
+// preset writer while the registry keeps serving the saved one.
+func TestMergeBenchConfigCopiesAliases(t *testing.T) {
+	saved := baseConfig()
+	got, err := mergeBenchConfig("m", saved, saved, benchmark.ConfigSnapshot{}, 1)
+	if err != nil {
+		t.Fatalf("mergeBenchConfig: %v", err)
+	}
+	got.Aliases[0] = "changed"
+	if saved.Aliases[0] != "keep-me" {
+		t.Errorf("the saved config's aliases were modified: %v", saved.Aliases)
+	}
+}
+
+// A model the user turned off cannot be benchmarked at all, so say that
+// rather than letting the router answer every cell with a 404.
+func TestMergeBenchConfigRefusesDisabledModel(t *testing.T) {
+	saved := baseConfig()
+	saved.Enabled = false
+
+	_, err := mergeBenchConfig("m", saved, saved, benchmark.ConfigSnapshot{}, 1)
+	if err == nil {
+		t.Fatal("a turned-off model was accepted")
+	}
+	if !strings.Contains(err.Error(), "turned off") {
+		t.Errorf("error = %q, want it to say the model is turned off", err)
 	}
 }

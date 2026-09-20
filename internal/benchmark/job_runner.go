@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tmac1973/llama-toolchest/internal/evaluate"
+	"github.com/tmac1973/llama-toolchest/internal/models"
 	"github.com/tmac1973/llama-toolchest/internal/monitor"
 )
 
@@ -46,11 +47,18 @@ type JobEnv interface {
 	// config to apply overrides on top of, display fields).
 	ResolveModel(modelID string) (ModelInfo, error)
 
+	// ResolveModelPath returns the file of an installed model, for a
+	// sweep value that names a draft model by its registry ID.
+	ResolveModelPath(modelID string) (string, error)
+
 	// ApplyEphemeralConfig makes modelID run under cfg, restarting the
 	// router so it takes effect. Implementations must not persist the
 	// change: the user's saved config has to survive a job that is
 	// cancelled or crashes. Blocks until the router is reachable.
-	ApplyEphemeralConfig(ctx context.Context, modelID string, cfg ConfigSnapshot) error
+	// base replaces the model's saved config as what cfg is layered
+	// onto, so a job measuring a saved profile runs that profile's
+	// settings whole. Nil keeps the model's saved config.
+	ApplyEphemeralConfig(ctx context.Context, modelID string, cfg ConfigSnapshot, base *models.ModelConfig) error
 
 	// ClearEphemeralConfig drops any active override and restarts the
 	// router onto saved config. Must be a no-op when nothing is active.
@@ -172,6 +180,10 @@ type JobQueue struct {
 	env     JobEnv
 	runner  *Runner
 	current *runningJob
+	// done holds one channel per job submitted in this process, closed
+	// when the job finishes. Wait reads them; a caller that waits on a
+	// job this process never ran falls back to the stored status.
+	done map[string]chan struct{}
 }
 
 type runningJob struct {
@@ -226,11 +238,33 @@ func (q *JobQueue) Submit(job BenchmarkJob) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rj := &runningJob{id: job.ID, cancel: cancel, done: make(chan struct{})}
+	if q.done == nil {
+		q.done = map[string]chan struct{}{}
+	}
+	q.done[job.ID] = rj.done
 	q.current = rj
 	q.mu.Unlock()
 
 	go q.run(ctx, job, rj)
 	return nil
+}
+
+// Wait blocks until the job finishes and returns it as stored. A job
+// that already finished, or that this process never ran, returns at once:
+// the stored status is the answer either way.
+func (q *JobQueue) Wait(ctx context.Context, id string) (*BenchmarkJob, error) {
+	q.mu.Lock()
+	done := q.done[id]
+	q.mu.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return q.store.GetJob(id)
 }
 
 // Cancel signals the running job (if it matches id) to stop. It does
@@ -274,6 +308,10 @@ func (q *JobQueue) run(ctx context.Context, job BenchmarkJob, rj *runningJob) {
 	defer func() {
 		q.mu.Lock()
 		q.current = nil
+		// The channel is closed for whoever is waiting, and dropped: a
+		// server that runs jobs for weeks would otherwise keep one per
+		// job forever. Wait falls back to the stored status.
+		delete(q.done, job.ID)
 		q.mu.Unlock()
 		close(rj.done)
 	}()
@@ -449,7 +487,27 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 		return fmt.Errorf("build %s no longer exists", cell.BuildID)
 	}
 
-	cfg := markProfileEdited(applyOverrides(modelInfo.Config, cellOv), modelInfo.Config)
+	// A job measuring from a saved profile starts from that profile, not
+	// from the model's live config: the live config may have been edited
+	// since, and must not be what the numbers describe.
+	baseSnap := modelInfo.Config
+	var baseConfig *models.ModelConfig
+	if bp := job.BaseProfile; bp != nil {
+		baseSnap = SnapshotFromConfig(bp.Config, bp.Name, false)
+		cfgCopy := bp.Config
+		baseConfig = &cfgCopy
+	}
+	cfg := markProfileEdited(ApplyOverrides(baseSnap, cellOv), baseSnap)
+	// A spec value may name its draft file by model ID; turn it into the
+	// path the launch reads before anything is applied or recorded. Only
+	// a file the cell itself named is touched: the model's own draft
+	// model must not be moved into the MTP slot by a cell that merely
+	// switched the method.
+	if cellOv != nil && cellOv.DraftModelPath != nil {
+		if err := resolveSnapshotDraftFile(&cfg, q.env.ResolveModelPath); err != nil {
+			return err
+		}
+	}
 
 	// Make the merged config real before measuring anything. Without
 	// this the cell benchmarks the model's saved config and then records
@@ -463,10 +521,13 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 	// Sweeping a value that only affects the request (sampling) must not
 	// pay for a reload, and consecutive cells that share a config (e.g.
 	// several presets under one sweep point) only need one.
-	if cellOv != nil {
+	// A job measuring a profile applies it even when a cell overrides
+	// nothing: that cell is the baseline, and the baseline has to be the
+	// profile rather than whatever the live config happens to be.
+	if cellOv != nil || job.BaseProfile != nil {
 		want := appliedConfig{modelID: cell.ModelID, buildID: cell.BuildID, cfg: cfg}
 		if *lastApplied != want {
-			if err := q.env.ApplyEphemeralConfig(ctx, cell.ModelID, cfg); err != nil {
+			if err := q.env.ApplyEphemeralConfig(ctx, cell.ModelID, cfg, baseConfig); err != nil {
 				return fmt.Errorf("apply config overrides for %s: %w", cell.ModelID, err)
 			}
 			*lastApplied = want
@@ -508,7 +569,7 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 		HFRepoID:   modelInfo.HFRepoID,
 		HFToken:    q.env.HFToken(),
 		HFHome:     q.env.HFCacheDir(),
-		Sampling:   samplingFromOverrides(cellOv),
+		Sampling:   samplingForCell(job.BaseProfile, cellOv),
 		Reasoning:  modelInfo.Reasoning,
 		Memory:     q.env.MeasuredMemory,
 	}, nil)
@@ -722,6 +783,35 @@ func (q *JobQueue) runCapabilityCell(ctx context.Context, job *BenchmarkJob, cel
 	return nil
 }
 
+// samplingForCell is the sampling a cell's requests carry: the job's
+// overrides, or the profile being measured when it has values and the
+// job does not. A profile's sampling is part of what is being measured —
+// speculative decoding accepts fewer drafts at a high temperature — so a
+// job started from one must not send the live config's values instead.
+func samplingForCell(bp *BaseProfile, o *ConfigOverrides) SamplingParams {
+	s := samplingFromOverrides(o)
+	if bp == nil {
+		return s
+	}
+	c := bp.Config
+	if s.Temperature == nil {
+		s.Temperature = c.Temperature
+	}
+	if s.TopP == nil {
+		s.TopP = c.TopP
+	}
+	if s.TopK == nil {
+		s.TopK = c.TopK
+	}
+	if s.MinP == nil {
+		s.MinP = c.MinP
+	}
+	if s.RepeatPenalty == nil {
+		s.RepeatPenalty = c.RepeatPenalty
+	}
+	return s
+}
+
 // samplingFromOverrides extracts the per-request generation settings
 // from a job's overrides. These deliberately bypass ConfigSnapshot:
 // llama-server takes them per chat-completion request, not from the
@@ -743,6 +833,18 @@ func samplingFromOverrides(o *ConfigOverrides) SamplingParams {
 
 // applyOverrides returns base with non-nil ConfigOverrides fields
 // applied on top. A nil overrides argument returns base unchanged.
+// resolveSnapshotDraftFile turns a draft file named by a model ID into
+// its path, on the snapshot rather than a config: the same rule as
+// ResolveDraftFile, which the profile-saving path uses.
+func resolveSnapshotDraftFile(cfg *ConfigSnapshot, resolve func(id string) (string, error)) error {
+	tmp := models.ModelConfig{SpecType: cfg.SpecType, DraftModelPath: cfg.DraftModelPath, MtpPath: cfg.MtpPath}
+	if err := ResolveDraftFile(&tmp, resolve); err != nil {
+		return err
+	}
+	cfg.DraftModelPath, cfg.MtpPath = tmp.DraftModelPath, tmp.MtpPath
+	return nil
+}
+
 // EvalConfigSnapshot returns the config a CAPABILITY cell runs at:
 // applyOverrides, then the KV cache type reset to the default f16
 // unless the job asked for a specific one.
@@ -764,7 +866,7 @@ func samplingFromOverrides(o *ConfigOverrides) SamplingParams {
 // so the detail view's KV Quant column shows the cache the score was
 // actually measured through.
 func EvalConfigSnapshot(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
-	cfg := applyOverrides(base, overrides)
+	cfg := ApplyOverrides(base, overrides)
 	if overrides == nil || overrides.KVCacheQuant == nil {
 		cfg.KVCacheQuant = ""
 	}
@@ -820,7 +922,9 @@ func EvalReferenceConfig(ref, underTest ConfigSnapshot) ConfigSnapshot {
 	return out
 }
 
-func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
+// ApplyOverrides is applyOverrides for callers outside this package: it
+// layers a job cell's overrides onto a config snapshot.
+func ApplyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
 	if overrides == nil {
 		return base
 	}
@@ -842,6 +946,9 @@ func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnaps
 	}
 	if overrides.CPUMoE != nil {
 		out.CPUMoE = *overrides.CPUMoE
+	}
+	if overrides.SplitMode != nil {
+		out.SplitMode = *overrides.SplitMode
 	}
 	if overrides.FlashAttention != nil {
 		out.FlashAttention = *overrides.FlashAttention

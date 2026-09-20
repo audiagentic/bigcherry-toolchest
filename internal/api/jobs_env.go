@@ -194,6 +194,47 @@ func (e *jobEnv) restartRouter(ctx context.Context, what string) error {
 	return fmt.Errorf("timed out waiting for router after %s", what)
 }
 
+// mergeBenchConfig builds the config one benchmark cell runs under:
+// base (the model's saved config, or the profile the job measures from)
+// with the cell's swept values applied, checked for anything the router
+// would reject.
+//
+// saved is always the model's live config, even when base is a profile.
+func mergeBenchConfig(modelID string, saved, base models.ModelConfig, cfg benchmark.ConfigSnapshot, gpuCount int) (models.ModelConfig, error) {
+	merged := benchmark.ApplySnapshotToConfig(base, cfg)
+	// Enabled and Aliases say who the model is to the router, not how it
+	// runs, so they always come from the saved config. A saved profile
+	// stores them cleared on purpose (models.ApplyProfile puts the live
+	// ones back when a profile is applied), so a job measuring from a
+	// profile would otherwise write a preset with the model left out
+	// altogether, and every cell would fail to load it with "404 File
+	// Not Found".
+	merged.Enabled = saved.Enabled
+	merged.Aliases = append([]string(nil), saved.Aliases...)
+	if !merged.Enabled {
+		// A model that is turned off is left out of the preset, so the
+		// router would answer every load with a 404. Say so instead.
+		return merged, fmt.Errorf("%s is turned off, so the server cannot load it. "+
+			"Turn the model on on the Models page and run this again", modelID)
+	}
+	if err := resolveGPUAssignment(&merged, base, gpuCount); err != nil {
+		return merged, fmt.Errorf("%s: %w", modelID, err)
+	}
+	// A swept split mode wins over the one resolveGPUAssignment derives:
+	// the sweep asked for it by name.
+	if cfg.SplitMode != "" {
+		merged.SplitMode = cfg.SplitMode
+	}
+	if err := merged.ValidateBatchSizes(); err != nil {
+		// The model-config form rejects an unusable batch pair; the
+		// benchmark path has to as well, or a -ub sweep past the batch
+		// size either measures the same clamped value under several
+		// labels or fails the cell with a confusing loader error.
+		return merged, fmt.Errorf("%s: %w", modelID, err)
+	}
+	return merged, nil
+}
+
 // ApplyEphemeralConfig makes modelID run under cfg for the next
 // benchmark cell, restarting the router so it re-reads the preset.
 //
@@ -201,21 +242,17 @@ func (e *jobEnv) restartRouter(ctx context.Context, what string) error {
 // separate preset file — the user's models.json and preset.ini are never
 // modified, and an interactive restart cannot pick it up. Callers must
 // pair this with ClearEphemeralConfig.
-func (e *jobEnv) ApplyEphemeralConfig(ctx context.Context, modelID string, cfg benchmark.ConfigSnapshot) error {
-	base, err := e.s.registry.GetConfig(modelID)
+func (e *jobEnv) ApplyEphemeralConfig(ctx context.Context, modelID string, cfg benchmark.ConfigSnapshot, base *models.ModelConfig) error {
+	saved, err := e.s.registry.GetConfig(modelID)
 	if err != nil {
 		return fmt.Errorf("resolve config for %s: %w", modelID, err)
 	}
-	merged := applySnapshotToConfig(*base, cfg)
-	if err := resolveGPUAssignment(&merged, *base, len(e.s.monitor.Current().GPU)); err != nil {
-		return fmt.Errorf("%s: %w", modelID, err)
+	if base == nil {
+		base = saved
 	}
-	if err := merged.ValidateBatchSizes(); err != nil {
-		// The model-config form rejects an unusable batch pair; the
-		// benchmark path has to as well, or a -ub sweep past the batch
-		// size either measures the same clamped value under several
-		// labels or fails the cell with a confusing loader error.
-		return fmt.Errorf("%s: %w", modelID, err)
+	merged, err := mergeBenchConfig(modelID, *saved, *base, cfg, len(e.s.monitor.Current().GPU))
+	if err != nil {
+		return err
 	}
 
 	slog.Info("applying benchmark config",
@@ -390,6 +427,16 @@ func (e *jobEnv) modelInfoBundle(m *models.Model) (benchmark.ModelInfo, error) {
 	}, nil
 }
 
+// ResolveModelPath returns an installed model's file, for a sweep value
+// that names a draft model by registry ID.
+func (e *jobEnv) ResolveModelPath(modelID string) (string, error) {
+	m, err := e.s.registry.Get(modelID)
+	if err != nil {
+		return "", err
+	}
+	return m.FilePath, nil
+}
+
 // resolveKLReference picks the KL reference for modelID: overrideID when
 // set, else the largest installed quant (by SizeBytes) sharing the
 // model's HF repo. Errors when no distinct candidate exists — the model
@@ -462,7 +509,7 @@ func (e *jobEnv) EvalFlags(modelID string, snap benchmark.ConfigSnapshot, buildI
 	if err != nil {
 		return nil, fmt.Errorf("resolve config for %s: %w", modelID, err)
 	}
-	merged := applySnapshotToConfig(*base, snap)
+	merged := benchmark.ApplySnapshotToConfig(*base, snap)
 	if err := resolveGPUAssignment(&merged, *base, len(e.s.monitor.Current().GPU)); err != nil {
 		return nil, fmt.Errorf("%s: %w", modelID, err)
 	}
@@ -623,52 +670,6 @@ func (e *jobEnv) EnsureKLBase(ctx context.Context, ref benchmark.ModelInfo, unde
 // RunEval implements the JobEnv method over the phase 01 engine.
 func (e *jobEnv) RunEval(ctx context.Context, spec evaluate.Spec) (evaluate.Result, error) {
 	return evaluate.Run(ctx, spec)
-}
-
-// applySnapshotToConfig overlays a benchmark ConfigSnapshot onto a copy
-// of the model's saved config. Zero values mean "not overridden", which
-// matches how ConfigSnapshot is built in ResolveModel — a snapshot
-// always carries the saved value unless a job override replaced it.
-func applySnapshotToConfig(base models.ModelConfig, snap benchmark.ConfigSnapshot) models.ModelConfig {
-	out := base
-
-	// Every field is assigned unconditionally. ResolveModel seeds the
-	// snapshot from the model's saved config and applyOverrides then
-	// replaces only what the job set, so the snapshot is authoritative
-	// for every field it models — a zero is the value zero, not "unset".
-	//
-	// Skipping zeros here silently discarded legitimate overrides
-	// (gpu_layers=0 for CPU-only, ubatch/threads/context edge values)
-	// while the run still recorded them as applied. That is exactly the
-	// mislabeled-result bug this whole mechanism exists to prevent.
-	out.GPULayers = snap.GPULayers
-	out.ContextSize = snap.ContextSize
-	out.Threads = snap.Threads
-	out.BatchSize = snap.BatchSize
-	out.UBatchSize = snap.UBatchSize
-	out.CPUMoE = snap.CPUMoE
-	out.GPUAssign = snap.GPUAssign
-	out.TensorSplit = snap.TensorSplit
-	out.KVCacheQuant = snap.KVCacheQuant
-	out.SpecType = snap.SpecType
-	out.DraftModelPath = snap.DraftModelPath
-	out.DraftMax = snap.DraftMax
-	out.DraftMin = snap.DraftMin
-	out.DraftPMin = snap.DraftPMin
-	out.SpecAssist = snap.SpecAssist
-	out.AssistNMax = snap.AssistNMax
-	out.AssistNMin = snap.AssistNMin
-	out.AssistNMatch = snap.AssistNMatch
-	out.AssistSizeN = snap.AssistSizeN
-	out.AssistSizeM = snap.AssistSizeM
-	out.AssistMinHits = snap.AssistMinHits
-	out.NgramSizeN = snap.NgramSizeN
-	out.NgramSizeM = snap.NgramSizeM
-	out.FlashAttention = snap.FlashAttention
-	out.DirectIO = snap.DirectIO
-	out.PLEMode = snap.PLEMode
-	out.ExtraFlags = snap.ExtraFlags
-	return out
 }
 
 // resolveGPUAssignment turns a gpu_assign selection into the fields the

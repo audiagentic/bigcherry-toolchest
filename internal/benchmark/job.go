@@ -2,6 +2,8 @@ package benchmark
 
 import (
 	"time"
+
+	"github.com/tmac1973/llama-toolchest/internal/models"
 )
 
 // AdhocJobID is the synthetic catch-all job that holds runs not produced
@@ -59,6 +61,15 @@ type BenchmarkJob struct {
 	Presets   []string         `json:"presets,omitempty"`
 	Overrides *ConfigOverrides `json:"overrides,omitempty"`
 
+	// BaseProfile measures from a saved profile's settings rather than
+	// the model's live config. Autotune starts from a profile the user
+	// chose, and must neither depend on the live config nor change it.
+	BaseProfile *BaseProfile `json:"base_profile,omitempty"`
+	// AutotuneID and AutotuneStage link a job to the autotune run that
+	// submitted it, and name the stage it measures.
+	AutotuneID    string `json:"autotune_id,omitempty"`
+	AutotuneStage string `json:"autotune_stage,omitempty"`
+
 	// Sweeps expand the matrix: every combination of every axis becomes
 	// its own cell. Overrides still apply to all of them, so a fixed
 	// value acts as the baseline for whatever isn't being swept.
@@ -73,6 +84,15 @@ type BenchmarkJob struct {
 	Cells []JobCell `json:"cells,omitempty"`
 }
 
+// BaseProfile is the saved profile a job measures from: the name, for
+// the record, and the whole config, because the fields a snapshot does
+// not carry — sampling, jinja, the vision projector — have to come from
+// the profile too.
+type BaseProfile struct {
+	Name   string             `json:"name"`
+	Config models.ModelConfig `json:"config"`
+}
+
 // ConfigOverrides applies on top of each model's saved ModelConfig for
 // every cell. Pointer fields so nil = "use the model's saved value".
 type ConfigOverrides struct {
@@ -82,6 +102,7 @@ type ConfigOverrides struct {
 	BatchSize      *int    `json:"batch_size,omitempty"`
 	UBatchSize     *int    `json:"ubatch_size,omitempty"`
 	CPUMoE         *int    `json:"cpu_moe,omitempty"`
+	SplitMode      *string `json:"split_mode,omitempty"`
 	FlashAttention *bool   `json:"flash_attention,omitempty"`
 	KVCacheQuant   *string `json:"kv_cache_quant,omitempty"`
 	DirectIO       *bool   `json:"direct_io,omitempty"`
@@ -90,6 +111,10 @@ type ConfigOverrides struct {
 	GPUAssign      *string `json:"gpu_assign,omitempty"`
 	TensorSplit    *string `json:"tensor_split,omitempty"`
 	SpecType       *string `json:"spec_type,omitempty"`
+	// DraftModelPath is the draft file a cell loads. A sweep value may
+	// put a model registry ID here instead of a path; runCell resolves it
+	// before the cell runs and before the run records it, because only
+	// the runner can look a registry ID up.
 	DraftModelPath *string `json:"draft_model_path,omitempty"`
 	DraftMax       *int    `json:"draft_max,omitempty"`
 	DraftMin       *int    `json:"draft_min,omitempty"`
