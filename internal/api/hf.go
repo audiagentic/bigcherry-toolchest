@@ -446,10 +446,11 @@ func (s *Server) onDownloadComplete(source, downloadID, modelID, filename string
 
 	meta, _ := models.ParseGGUFMeta(filePath)
 
-	// MTP drafter heads (e.g. gemma-4's gemma4-assistant) aren't runnable
-	// models — they load via --model-draft. Don't register; auto-associate
-	// with sibling main models like we do for mmproj.
-	if meta != nil && models.IsMTPHeadArch(meta.Architecture) {
+	// MTP drafter heads (gemma-4's gemma4-assistant, unsloth's
+	// Qwen3.8-Flash-Next heads) aren't runnable models — they load via
+	// --model-draft. Don't register; auto-associate with sibling main
+	// models like we do for mmproj.
+	if meta != nil && meta.IsMTPHead() {
 		slog.Info("MTP drafter head downloaded, associating with sibling models", "file", filePath)
 		s.registry.AutoDetectMTP()
 		return
@@ -473,7 +474,16 @@ func (s *Server) onDownloadComplete(source, downloadID, modelID, filename string
 		meta.ApplyTo(m)
 	}
 
-	s.registry.Add(m)
+	if err := s.registry.Add(m); err != nil {
+		// The file is downloaded; a later scan registers it once the
+		// registry can be written again.
+		slog.Error("downloaded model could not be registered", "model", m.ID, "error", err)
+		return
+	}
+
+	// A model downloaded for Autoconfigure's own use is marked as such,
+	// which keeps it out of the chat, benchmark and /v1 lists.
+	s.claimDownloadedHelper(m)
 
 	// Check if an mmproj file already exists in the same directory
 	if mmproj := models.FindMMProj(filePath); mmproj != "" {

@@ -194,6 +194,47 @@ func (e *jobEnv) restartRouter(ctx context.Context, what string) error {
 	return fmt.Errorf("timed out waiting for router after %s", what)
 }
 
+// mergeBenchConfig builds the config one benchmark cell runs under:
+// base (the model's saved config, or the profile the job measures from)
+// with the cell's swept values applied, checked for anything the router
+// would reject.
+//
+// saved is always the model's live config, even when base is a profile.
+func mergeBenchConfig(modelID string, saved, base models.ModelConfig, cfg benchmark.ConfigSnapshot, gpuCount int) (models.ModelConfig, error) {
+	merged := benchmark.ApplySnapshotToConfig(base, cfg)
+	// Enabled and Aliases say who the model is to the router, not how it
+	// runs, so they always come from the saved config. A saved profile
+	// stores them cleared on purpose (models.ApplyProfile puts the live
+	// ones back when a profile is applied), so a job measuring from a
+	// profile would otherwise write a preset with the model left out
+	// altogether, and every cell would fail to load it with "404 File
+	// Not Found".
+	merged.Enabled = saved.Enabled
+	merged.Aliases = append([]string(nil), saved.Aliases...)
+	if !merged.Enabled {
+		// A model that is turned off is left out of the preset, so the
+		// router would answer every load with a 404. Say so instead.
+		return merged, fmt.Errorf("%s is turned off, so the server cannot load it. "+
+			"Turn the model on on the Models page and run this again", modelID)
+	}
+	if err := resolveGPUAssignment(&merged, base, gpuCount); err != nil {
+		return merged, fmt.Errorf("%s: %w", modelID, err)
+	}
+	// A swept split mode wins over the one resolveGPUAssignment derives:
+	// the sweep asked for it by name.
+	if cfg.SplitMode != "" {
+		merged.SplitMode = cfg.SplitMode
+	}
+	if err := merged.ValidateBatchSizes(); err != nil {
+		// The model-config form rejects an unusable batch pair; the
+		// benchmark path has to as well, or a -ub sweep past the batch
+		// size either measures the same clamped value under several
+		// labels or fails the cell with a confusing loader error.
+		return merged, fmt.Errorf("%s: %w", modelID, err)
+	}
+	return merged, nil
+}
+
 // ApplyEphemeralConfig makes modelID run under cfg for the next
 // benchmark cell, restarting the router so it re-reads the preset.
 //
@@ -201,21 +242,17 @@ func (e *jobEnv) restartRouter(ctx context.Context, what string) error {
 // separate preset file — the user's models.json and preset.ini are never
 // modified, and an interactive restart cannot pick it up. Callers must
 // pair this with ClearEphemeralConfig.
-func (e *jobEnv) ApplyEphemeralConfig(ctx context.Context, modelID string, cfg benchmark.ConfigSnapshot) error {
-	base, err := e.s.registry.GetConfig(modelID)
+func (e *jobEnv) ApplyEphemeralConfig(ctx context.Context, modelID string, cfg benchmark.ConfigSnapshot, base *models.ModelConfig) error {
+	saved, err := e.s.registry.GetConfig(modelID)
 	if err != nil {
 		return fmt.Errorf("resolve config for %s: %w", modelID, err)
 	}
-	merged := applySnapshotToConfig(*base, cfg)
-	if err := resolveGPUAssignment(&merged, *base, len(e.s.monitor.Current().GPU)); err != nil {
-		return fmt.Errorf("%s: %w", modelID, err)
+	if base == nil {
+		base = saved
 	}
-	if err := merged.ValidateBatchSizes(); err != nil {
-		// The model-config form rejects an unusable batch pair; the
-		// benchmark path has to as well, or a -ub sweep past the batch
-		// size either measures the same clamped value under several
-		// labels or fails the cell with a confusing loader error.
-		return fmt.Errorf("%s: %w", modelID, err)
+	merged, err := mergeBenchConfig(modelID, *saved, *base, cfg, len(e.s.monitor.Current().GPU))
+	if err != nil {
+		return err
 	}
 
 	slog.Info("applying benchmark config",
@@ -375,6 +412,7 @@ func (e *jobEnv) modelInfoBundle(m *models.Model) (benchmark.ModelInfo, error) {
 	if err != nil {
 		return benchmark.ModelInfo{}, err
 	}
+	profile, edited := e.s.registry.ActiveProfileState(m.ID)
 	return benchmark.ModelInfo{
 		ID:          m.ID,
 		HFRepoID:    m.ModelID,
@@ -384,28 +422,19 @@ func (e *jobEnv) modelInfoBundle(m *models.Model) (benchmark.ModelInfo, error) {
 		FilePath:    m.FilePath,
 		DisplayName: shortenModelName(m.ModelID),
 		RouterName:  e.s.registry.RouterName(m.ID),
-		Config: benchmark.ConfigSnapshot{
-			GPULayers:      cfg.GPULayers,
-			ContextSize:    cfg.ContextSize,
-			GPUAssign:      cfg.GPUAssign,
-			TensorSplit:    cfg.TensorSplit,
-			FlashAttention: cfg.FlashAttention,
-			KVCacheQuant:   cfg.KVCacheQuant,
-			DirectIO:       cfg.DirectIO,
-			Threads:        cfg.Threads,
-			BatchSize:      cfg.BatchSize,
-			UBatchSize:     cfg.UBatchSize,
-			SpecType:       cfg.SpecType,
-			DraftModelPath: cfg.DraftModelPath,
-			DraftMax:       cfg.DraftMax,
-			DraftMin:       cfg.DraftMin,
-			DraftPMin:      cfg.DraftPMin,
-			NgramSizeN:     cfg.NgramSizeN,
-			NgramSizeM:     cfg.NgramSizeM,
-			PLEMode:        cfg.PLEMode,
-			ExtraFlags:     cfg.ExtraFlags,
-		},
+		Reasoning:   reasoningControl(m, cfg),
+		Config:      benchmark.SnapshotFromConfig(*cfg, profile, edited),
 	}, nil
+}
+
+// ResolveModelPath returns an installed model's file, for a sweep value
+// that names a draft model by registry ID.
+func (e *jobEnv) ResolveModelPath(modelID string) (string, error) {
+	m, err := e.s.registry.Get(modelID)
+	if err != nil {
+		return "", err
+	}
+	return m.FilePath, nil
 }
 
 // resolveKLReference picks the KL reference for modelID: overrideID when
@@ -480,7 +509,7 @@ func (e *jobEnv) EvalFlags(modelID string, snap benchmark.ConfigSnapshot, buildI
 	if err != nil {
 		return nil, fmt.Errorf("resolve config for %s: %w", modelID, err)
 	}
-	merged := applySnapshotToConfig(*base, snap)
+	merged := benchmark.ApplySnapshotToConfig(*base, snap)
 	if err := resolveGPUAssignment(&merged, *base, len(e.s.monitor.Current().GPU)); err != nil {
 		return nil, fmt.Errorf("%s: %w", modelID, err)
 	}
@@ -497,6 +526,7 @@ func (e *jobEnv) EvalFlags(modelID string, snap benchmark.ConfigSnapshot, buildI
 		FlashAttention: merged.FlashAttention,
 		KVCacheQuant:   merged.KVCacheQuant,
 		DirectIO:       merged.DirectIO,
+		CPUMoE:         merged.CPUMoE,
 		PlacementFlags: models.GPUPlacementFlags(&merged, e.buildBackend(buildID)),
 	}
 	return evaluate.MapConfigFlags(subset), nil
@@ -642,44 +672,6 @@ func (e *jobEnv) RunEval(ctx context.Context, spec evaluate.Spec) (evaluate.Resu
 	return evaluate.Run(ctx, spec)
 }
 
-// applySnapshotToConfig overlays a benchmark ConfigSnapshot onto a copy
-// of the model's saved config. Zero values mean "not overridden", which
-// matches how ConfigSnapshot is built in ResolveModel — a snapshot
-// always carries the saved value unless a job override replaced it.
-func applySnapshotToConfig(base models.ModelConfig, snap benchmark.ConfigSnapshot) models.ModelConfig {
-	out := base
-
-	// Every field is assigned unconditionally. ResolveModel seeds the
-	// snapshot from the model's saved config and applyOverrides then
-	// replaces only what the job set, so the snapshot is authoritative
-	// for every field it models — a zero is the value zero, not "unset".
-	//
-	// Skipping zeros here silently discarded legitimate overrides
-	// (gpu_layers=0 for CPU-only, ubatch/threads/context edge values)
-	// while the run still recorded them as applied. That is exactly the
-	// mislabeled-result bug this whole mechanism exists to prevent.
-	out.GPULayers = snap.GPULayers
-	out.ContextSize = snap.ContextSize
-	out.Threads = snap.Threads
-	out.BatchSize = snap.BatchSize
-	out.UBatchSize = snap.UBatchSize
-	out.GPUAssign = snap.GPUAssign
-	out.TensorSplit = snap.TensorSplit
-	out.KVCacheQuant = snap.KVCacheQuant
-	out.SpecType = snap.SpecType
-	out.DraftModelPath = snap.DraftModelPath
-	out.DraftMax = snap.DraftMax
-	out.DraftMin = snap.DraftMin
-	out.DraftPMin = snap.DraftPMin
-	out.NgramSizeN = snap.NgramSizeN
-	out.NgramSizeM = snap.NgramSizeM
-	out.FlashAttention = snap.FlashAttention
-	out.DirectIO = snap.DirectIO
-	out.PLEMode = snap.PLEMode
-	out.ExtraFlags = snap.ExtraFlags
-	return out
-}
-
 // resolveGPUAssignment turns a gpu_assign selection into the fields the
 // preset actually emits. writeConfigParams never reads GPUAssign — it
 // emits tensor-split, split-mode and main-gpu — so without this a
@@ -806,10 +798,30 @@ func configDiff(base, merged models.ModelConfig) []string {
 	add("draft-max", base.DraftMax, merged.DraftMax)
 	add("draft-min", base.DraftMin, merged.DraftMin)
 	add("draft-p-min", base.DraftPMin, merged.DraftPMin)
+	add("spec-assist", base.SpecAssist, merged.SpecAssist)
+	add("ngram-mod-n-max", base.AssistNMax, merged.AssistNMax)
+	add("ngram-mod-n-min", base.AssistNMin, merged.AssistNMin)
+	add("ngram-mod-n-match", base.AssistNMatch, merged.AssistNMatch)
+	add("size-n", base.AssistSizeN, merged.AssistSizeN)
+	add("size-m", base.AssistSizeM, merged.AssistSizeM)
+	add("min-hits", base.AssistMinHits, merged.AssistMinHits)
 	add("ngram-size-n", base.NgramSizeN, merged.NgramSizeN)
 	add("ngram-size-m", base.NgramSizeM, merged.NgramSizeM)
 	if len(out) == 0 {
 		return []string{"none"}
 	}
 	return out
+}
+
+// reasoningControl translates the model's detected reasoning capability
+// into the shape the benchmark runner uses. Only the recall workload acts
+// on it: a reasoning model asked to reproduce a passage will otherwise
+// spend its whole generation budget deliberating, which is new prose and
+// measures nothing an n-gram method can accelerate.
+func reasoningControl(m *models.Model, cfg *models.ModelConfig) benchmark.ReasoningControl {
+	r := m.EffectiveReasoning(cfg)
+	if !r.Supported {
+		return benchmark.ReasoningControl{Toggle: models.ReasoningToggleNone}
+	}
+	return benchmark.ReasoningControl{Toggle: r.Toggle, Kwarg: r.Kwarg}
 }

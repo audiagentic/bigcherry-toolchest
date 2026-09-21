@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tmac1973/llama-toolchest/internal/atomicfile"
 	"github.com/tmac1973/llama-toolchest/internal/evaluate"
 	"github.com/tmac1973/llama-toolchest/internal/monitor"
 )
@@ -150,13 +152,27 @@ type ConfigSnapshot struct {
 	Threads        int    `json:"threads"`
 	BatchSize      int    `json:"batch_size,omitempty"`
 	UBatchSize     int    `json:"ubatch_size,omitempty"`
+	// Speculative decoding runs in two slots: a draft method and a
+	// draftless n-gram assist, either of which may be empty. Runs
+	// recorded before the split carry a draftless mode in SpecType and
+	// its settings in NgramSizeN/M; models.NormalizeSpec reads those.
 	SpecType       string `json:"spec_type,omitempty"`
 	DraftModelPath string `json:"draft_model_path,omitempty"`
-	DraftMax       int    `json:"draft_max,omitempty"`
-	DraftMin       int    `json:"draft_min,omitempty"`
-	DraftPMin      string `json:"draft_p_min,omitempty"`
-	NgramSizeN     int    `json:"ngram_size_n,omitempty"`
-	NgramSizeM     int    `json:"ngram_size_m,omitempty"`
+	// MtpPath is the separate MTP head draft-mtp loads, when the model
+	// has one rather than its own layers.
+	MtpPath       string `json:"mtp_path,omitempty"`
+	DraftMax      int    `json:"draft_max,omitempty"`
+	DraftMin      int    `json:"draft_min,omitempty"`
+	DraftPMin     string `json:"draft_p_min,omitempty"`
+	SpecAssist    string `json:"spec_assist,omitempty"`
+	AssistNMax    int    `json:"assist_n_max,omitempty"`
+	AssistNMin    int    `json:"assist_n_min,omitempty"`
+	AssistNMatch  int    `json:"assist_n_match,omitempty"`
+	AssistSizeN   int    `json:"assist_size_n,omitempty"`
+	AssistSizeM   int    `json:"assist_size_m,omitempty"`
+	AssistMinHits int    `json:"assist_min_hits,omitempty"`
+	NgramSizeN    int    `json:"ngram_size_n,omitempty"` // legacy; migrated by models.NormalizeSpec
+	NgramSizeM    int    `json:"ngram_size_m,omitempty"` // legacy; migrated by models.NormalizeSpec
 
 	// PLEMode and ExtraFlags reach llama-server through the preset INI
 	// (tensor-read-lazy, and the raw flag text appended verbatim). Both
@@ -164,6 +180,29 @@ type ConfigSnapshot struct {
 	// — see the excluded list on evaluate.MapConfigFlags.
 	PLEMode    string `json:"ple_mode,omitempty"`
 	ExtraFlags string `json:"extra_flags,omitempty"`
+
+	// GPU placement as launched. SplitMode and MainGPU are derived from
+	// GPUAssign when the config is saved, but they are what llama-server
+	// actually receives, and a sweep can set split mode on its own.
+	SplitMode string `json:"split_mode,omitempty"`
+	MainGPU   int    `json:"main_gpu,omitempty"`
+	Parallel  int    `json:"parallel,omitempty"`
+	// CPUMoE is --n-cpu-moe: expert layers kept in system memory.
+	CPUMoE int `json:"cpu_moe,omitempty"`
+
+	// Draft model resources, for the draft methods that load a second
+	// model.
+	DraftCtxSize      int    `json:"draft_ctx_size,omitempty"`
+	DraftGPULayers    int    `json:"draft_gpu_layers,omitempty"`
+	DraftKVCacheQuant string `json:"draft_kv_cache_quant,omitempty"`
+
+	// ProfileName is the saved profile the model's config came from when
+	// the run started, and ProfileEdited is true when what ran differed
+	// from it: the live config had been changed since, or the job
+	// overrode or swept a setting. Only a run with ProfileEdited false ran
+	// the profile exactly.
+	ProfileName   string `json:"profile_name,omitempty"`
+	ProfileEdited bool   `json:"profile_edited,omitempty"`
 }
 
 // GPUSnapshot captures GPU hardware at benchmark time.
@@ -312,6 +351,16 @@ type Preset struct {
 	Repetitions  int
 	Concurrency  []int // benchy only; defaults to [1] if empty
 
+	// PromptStyle selects the instruction wrapped around the passage.
+	// Zero value is PromptStyleAnalyze, so an existing preset keeps the
+	// workload it has always had and no stored result is invalidated.
+	PromptStyle PromptStyle
+
+	// Hidden keeps a preset out of the pickers. Autotune's presets are
+	// hidden: they exist to be comparable across its own stages, not to
+	// be chosen from a list, and they would only add noise to one.
+	Hidden bool
+
 	// Capability presets only (Source == PresetSourceCapability).
 	// EvalMode names the evaluation the cell runs; EvalTasks and
 	// EvalChunks are the run limits (0 = full run). Performance presets
@@ -345,6 +394,31 @@ func Presets() []Preset {
 			Description:  "Three repetitions of end-to-end requests at 128, 512, and 2048-token prompts (128 gen tokens each).",
 			Source:       PresetSourceInternal,
 			PromptTokens: []int{128, 512, 2048}, GenTokens: 128, Repetitions: 3,
+		},
+		{
+			Name:         "internal-echo",
+			Label:        "internal-echo — 3 reps × 2048-token prompt, 512 gen, recall workload (~2 min)",
+			Description:  "Three repetitions of a 2048-token prompt asking the model to reproduce the passage verbatim, with 512 generated tokens. Generation is recall of text already in the context rather than new prose, which is the workload where n-gram speculative decoding pays off: a file being rewritten, a structured response, a tool-call loop. Compare against internal-standard, whose prompts ask for new text, to see what a speculative setting costs on one workload and earns on the other.",
+			Source:       PresetSourceInternal,
+			PromptTokens: []int{2048}, GenTokens: 512, Repetitions: 3,
+			PromptStyle: PromptStyleEcho,
+		},
+		{
+			Name:         "autotune-chat",
+			Label:        "autotune-chat — 3 reps, 512 and 4096-token prompts (~1 min)",
+			Description:  "Autotune's general-chat workload: a short prompt for response time and a long one for prompt speed, with 256 generated tokens of new prose. Hidden from the pickers because it exists to be compared across autotune's own runs.",
+			Source:       PresetSourceInternal,
+			PromptTokens: []int{512, 4096}, GenTokens: 256, Repetitions: 3,
+			Hidden: true,
+		},
+		{
+			Name:         "autotune-code",
+			Label:        "autotune-code — 3 reps × 1536-token prompt, code edit (~2 min)",
+			Description:  "Autotune's coding workload: a source file to return with mechanical edits, 512 generated tokens. Most of the answer repeats the prompt, which is where speculative decoding pays off. Hidden from the pickers for the same reason as autotune-chat.",
+			Source:       PresetSourceInternal,
+			PromptTokens: []int{1536}, GenTokens: 512, Repetitions: 3,
+			PromptStyle: PromptStyleCode,
+			Hidden:      true,
 		},
 		{
 			Name:         "internal-thorough",
@@ -463,6 +537,21 @@ var presetAliases = map[string]string{
 	"thorough": "internal-thorough",
 }
 
+// VisiblePresets returns the presets a user may choose from: everything
+// except autotune's own, which are comparable within an autotune run and
+// would only clutter a picker. GetPreset still resolves them, so a stored
+// result or a running job finds its preset either way.
+func VisiblePresets() []Preset {
+	all := Presets()
+	out := make([]Preset, 0, len(all))
+	for _, p := range all {
+		if !p.Hidden {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // GetPreset returns a preset by name, falling back to "internal-standard".
 func GetPreset(name string) Preset {
 	if alias, ok := presetAliases[name]; ok {
@@ -520,6 +609,13 @@ type Store struct {
 	jobs     []BenchmarkJob
 	resolver BuildResolver
 
+	// readOnly, when set, is why benchmarks.json must not be written: it
+	// could not be read, matched neither known layout, or came from a newer
+	// build. Benchmark history cannot be rebuilt by rescanning, so the file
+	// is left exactly as found. Actions a user starts (a new job, an edit,
+	// a delete) are refused up front; persist() refuses as the backstop.
+	readOnly string
+
 	timingsMu sync.RWMutex
 	timings   map[string][]TimingSample // model ID → ring buffer
 }
@@ -530,8 +626,10 @@ const maxTimingSamples = 1000
 // was a bare JSON array of runs; v2 wraps them with a jobs list; v3
 // flags runs whose recorded config was never actually applied; v4
 // renames size_gb → size_gib and vram_total_mb → vram_total_mib (the
-// values were always binary units — the old names were wrong).
-const schemaVersion = 4
+// values were always binary units — the old names were wrong); v5 adds
+// the config profile and GPU placement to the config snapshot (new
+// fields only, no migration).
+const schemaVersion = 5
 
 // benchmarkFile is the v2 envelope. v1 files are detected by an
 // unmarshal failure into this shape and a successful retry as []BenchmarkRun.
@@ -615,6 +713,39 @@ func (s *Store) Get(id string) (*BenchmarkRun, error) {
 	return nil, fmt.Errorf("benchmark not found: %s", id)
 }
 
+// ErrStoreReadOnly is matched by errors.Is on every refusal from a
+// read-only store. The error text itself is the plain-language reason.
+var ErrStoreReadOnly = errors.New("benchmark history is read-only")
+
+type storeReadOnlyError struct{ reason string }
+
+func (e storeReadOnlyError) Error() string        { return e.reason }
+func (e storeReadOnlyError) Is(target error) bool { return target == ErrStoreReadOnly }
+
+// ReadOnlyReason returns why the store refuses to save, or "" when it is
+// writable.
+func (s *Store) ReadOnlyReason() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readOnly
+}
+
+// Writable returns an error when the store must not be changed. The job
+// queue checks it before starting a job, because a job's runs would be
+// recorded in memory only and lost at the next restart.
+func (s *Store) Writable() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.writableLocked()
+}
+
+func (s *Store) writableLocked() error {
+	if s.readOnly != "" {
+		return storeReadOnlyError{s.readOnly}
+	}
+	return nil
+}
+
 // Save adds or updates a benchmark run. Runs with no JobID are assigned
 // to the synthetic Ad-Hoc Runs job so the "every run belongs to a job"
 // invariant holds across the existing single-run code path.
@@ -642,6 +773,9 @@ func (s *Store) Save(run BenchmarkRun) {
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.writableLocked(); err != nil {
+		return err
+	}
 	for i := range s.runs {
 		if s.runs[i].ID == id {
 			s.runs = append(s.runs[:i], s.runs[i+1:]...)
@@ -707,6 +841,9 @@ func (s *Store) DeleteJob(id string, disposition DeleteDisposition) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.writableLocked(); err != nil {
+		return err
+	}
 	idx := -1
 	for i := range s.jobs {
 		if s.jobs[i].ID == id {
@@ -831,6 +968,9 @@ func (s *Store) UpdateJobDefinition(id string, def JobDefinition) (*BenchmarkJob
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.writableLocked(); err != nil {
+		return nil, err
+	}
 
 	idx := -1
 	for i := range s.jobs {
@@ -1106,6 +1246,12 @@ func (s *Store) benchmarkPath() string {
 func (s *Store) load() {
 	data, err := os.ReadFile(s.benchmarkPath())
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			s.readOnly = fmt.Sprintf("benchmarks.json could not be read (%v). "+
+				"Benchmark history will not be saved until the file can be read, "+
+				"so that nothing overwrites it.", err)
+			slog.Error("failed to read benchmarks; store is read-only", "error", err)
+		}
 		return
 	}
 
@@ -1116,10 +1262,25 @@ func (s *Store) load() {
 	if jsonErr := json.Unmarshal(data, &file); jsonErr == nil && file.Version >= 2 {
 		s.jobs = file.Jobs
 		s.runs = file.Runs
+		if file.Version > schemaVersion {
+			// Shown as-is, but never rewritten: the migrations below would
+			// write this build's layout over the newer one.
+			s.readOnly = fmt.Sprintf("benchmarks.json was written by a newer version of "+
+				"llama-toolchest (schema %d; this version reads up to %d). "+
+				"Benchmark history will not be saved until llama-toolchest is upgraded, "+
+				"so that nothing the newer version stored is lost.", file.Version, schemaVersion)
+			slog.Error("benchmarks are from a newer build; store is read-only",
+				"version", file.Version, "supported", schemaVersion)
+			return
+		}
 	} else {
 		var runs []BenchmarkRun
 		if v1Err := json.Unmarshal(data, &runs); v1Err != nil {
-			slog.Error("failed to load benchmarks (neither v2 envelope nor v1 array)", "v2_error", jsonErr, "v1_error", v1Err)
+			s.readOnly = fmt.Sprintf("benchmarks.json could not be parsed (%v). "+
+				"Benchmark history will not be saved until the file is fixed, "+
+				"so that nothing overwrites it.", jsonErr)
+			slog.Error("failed to load benchmarks (neither v2 envelope nor v1 array); store is read-only",
+				"v2_error", jsonErr, "v1_error", v1Err)
 			return
 		}
 		s.runs = runs
@@ -1256,8 +1417,14 @@ func (s *Store) hasJobLocked(id string) bool {
 	return false
 }
 
+// persist writes benchmarks.json with write-then-rename, so a crash
+// mid-write leaves the previous file rather than a truncated one. Callers
+// hold s.mu.
 func (s *Store) persist() {
-	os.MkdirAll(filepath.Dir(s.benchmarkPath()), 0o755)
+	if s.readOnly != "" {
+		slog.Warn("benchmark history is read-only; not saving", "reason", s.readOnly)
+		return
+	}
 	file := benchmarkFile{
 		Version: schemaVersion,
 		Jobs:    s.jobs,
@@ -1268,5 +1435,7 @@ func (s *Store) persist() {
 		slog.Error("failed to marshal benchmarks", "error", err)
 		return
 	}
-	os.WriteFile(s.benchmarkPath(), data, 0o644)
+	if err := atomicfile.Write(s.benchmarkPath(), data); err != nil {
+		slog.Error("failed to write benchmarks", "error", err)
+	}
 }

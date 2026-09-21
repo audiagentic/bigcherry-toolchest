@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tmac1973/llama-toolchest/internal/evaluate"
+	"github.com/tmac1973/llama-toolchest/internal/models"
 	"github.com/tmac1973/llama-toolchest/internal/monitor"
 )
 
@@ -46,11 +47,18 @@ type JobEnv interface {
 	// config to apply overrides on top of, display fields).
 	ResolveModel(modelID string) (ModelInfo, error)
 
+	// ResolveModelPath returns the file of an installed model, for a
+	// sweep value that names a draft model by its registry ID.
+	ResolveModelPath(modelID string) (string, error)
+
 	// ApplyEphemeralConfig makes modelID run under cfg, restarting the
 	// router so it takes effect. Implementations must not persist the
 	// change: the user's saved config has to survive a job that is
 	// cancelled or crashes. Blocks until the router is reachable.
-	ApplyEphemeralConfig(ctx context.Context, modelID string, cfg ConfigSnapshot) error
+	// base replaces the model's saved config as what cfg is layered
+	// onto, so a job measuring a saved profile runs that profile's
+	// settings whole. Nil keeps the model's saved config.
+	ApplyEphemeralConfig(ctx context.Context, modelID string, cfg ConfigSnapshot, base *models.ModelConfig) error
 
 	// ClearEphemeralConfig drops any active override and restarts the
 	// router onto saved config. Must be a no-op when nothing is active.
@@ -158,6 +166,10 @@ type ModelInfo struct {
 	DisplayName string         // short, human-readable name for the run
 	RouterName  string         // identifier the router responds to
 	Config      ConfigSnapshot // saved baseline; ConfigOverrides overlay on this
+	// Reasoning is how this model's thinking mode is turned off, detected
+	// from its chat template. The recall workload needs it; nothing else
+	// does.
+	Reasoning ReasoningControl
 }
 
 // JobQueue serializes job execution: only one job runs at a time. Submit
@@ -168,6 +180,10 @@ type JobQueue struct {
 	env     JobEnv
 	runner  *Runner
 	current *runningJob
+	// done holds one channel per job submitted in this process, closed
+	// when the job finishes. Wait reads them; a caller that waits on a
+	// job this process never ran falls back to the stored status.
+	done map[string]chan struct{}
 }
 
 type runningJob struct {
@@ -203,6 +219,11 @@ func (q *JobQueue) Status() (*BenchmarkJob, bool) {
 // Submit accepts a new job and starts it in a background goroutine.
 // Returns ErrJobAlreadyRunning when another job is in flight.
 func (q *JobQueue) Submit(job BenchmarkJob) error {
+	// A job run against a read-only store would be recorded in memory only
+	// and lost at the next restart.
+	if err := q.store.Writable(); err != nil {
+		return err
+	}
 	q.mu.Lock()
 	if q.current != nil {
 		q.mu.Unlock()
@@ -217,11 +238,33 @@ func (q *JobQueue) Submit(job BenchmarkJob) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rj := &runningJob{id: job.ID, cancel: cancel, done: make(chan struct{})}
+	if q.done == nil {
+		q.done = map[string]chan struct{}{}
+	}
+	q.done[job.ID] = rj.done
 	q.current = rj
 	q.mu.Unlock()
 
 	go q.run(ctx, job, rj)
 	return nil
+}
+
+// Wait blocks until the job finishes and returns it as stored. A job
+// that already finished, or that this process never ran, returns at once:
+// the stored status is the answer either way.
+func (q *JobQueue) Wait(ctx context.Context, id string) (*BenchmarkJob, error) {
+	q.mu.Lock()
+	done := q.done[id]
+	q.mu.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return q.store.GetJob(id)
 }
 
 // Cancel signals the running job (if it matches id) to stop. It does
@@ -265,6 +308,10 @@ func (q *JobQueue) run(ctx context.Context, job BenchmarkJob, rj *runningJob) {
 	defer func() {
 		q.mu.Lock()
 		q.current = nil
+		// The channel is closed for whoever is waiting, and dropped: a
+		// server that runs jobs for weeks would otherwise keep one per
+		// job forever. Wait falls back to the stored status.
+		delete(q.done, job.ID)
 		q.mu.Unlock()
 		close(rj.done)
 	}()
@@ -294,6 +341,8 @@ func (q *JobQueue) run(ctx context.Context, job BenchmarkJob, rj *runningJob) {
 		}
 	}()
 
+	writeOffs := newWriteOffTracker()
+
 	for i := range job.Cells {
 		cell := &job.Cells[i]
 
@@ -302,12 +351,24 @@ func (q *JobQueue) run(ctx context.Context, job BenchmarkJob, rj *runningJob) {
 		// don't re-run.
 		if cell.Status == CellStatusCompleted {
 			anyCompleted = true
+			writeOffs.recordSuccess(cell.SweepValues)
 			continue
 		}
 
 		if ctx.Err() != nil {
 			cell.Status = CellStatusSkipped
 			q.store.SaveJob(job)
+			continue
+		}
+
+		// A setting that has already failed the same way every time it
+		// was measured is not measured again.
+		if reason, skip := writeOffs.writeOff(cell.SweepValues, anyCompleted); skip {
+			cell.Status = CellStatusSkipped
+			cell.Error = reason
+			q.store.SaveJob(job)
+			slog.Info("skipping a cell whose setting has already failed",
+				"job", job.ID, "model", cell.ModelID, "sweep", cell.SweepValues)
 			continue
 		}
 
@@ -334,11 +395,13 @@ func (q *JobQueue) run(ctx context.Context, job BenchmarkJob, rj *runningJob) {
 		if cellErr != nil {
 			cell.Status = CellStatusFailed
 			cell.Error = cellErr.Error()
+			writeOffs.recordFailure(cell.SweepValues, cell.Error)
 			q.store.SaveJob(job)
 			slog.Warn("job cell failed", "job", job.ID, "model", cell.ModelID, "build", cell.BuildID, "preset", cell.Preset, "error", cellErr)
 			continue
 		}
 
+		writeOffs.recordSuccess(cell.SweepValues)
 		cell.Status = CellStatusCompleted
 		slog.Info("benchmark cell completed",
 			"job", job.ID, "model", cell.ModelID, "sweep", cell.SweepValues)
@@ -440,7 +503,27 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 		return fmt.Errorf("build %s no longer exists", cell.BuildID)
 	}
 
-	cfg := applyOverrides(modelInfo.Config, cellOv)
+	// A job measuring from a saved profile starts from that profile, not
+	// from the model's live config: the live config may have been edited
+	// since, and must not be what the numbers describe.
+	baseSnap := modelInfo.Config
+	var baseConfig *models.ModelConfig
+	if bp := job.BaseProfile; bp != nil {
+		baseSnap = SnapshotFromConfig(bp.Config, bp.Name, false)
+		cfgCopy := bp.Config
+		baseConfig = &cfgCopy
+	}
+	cfg := markProfileEdited(ApplyOverrides(baseSnap, cellOv), baseSnap)
+	// A spec value may name its draft file by model ID; turn it into the
+	// path the launch reads before anything is applied or recorded. Only
+	// a file the cell itself named is touched: the model's own draft
+	// model must not be moved into the MTP slot by a cell that merely
+	// switched the method.
+	if cellOv != nil && cellOv.DraftModelPath != nil {
+		if err := resolveSnapshotDraftFile(&cfg, q.env.ResolveModelPath); err != nil {
+			return err
+		}
+	}
 
 	// Make the merged config real before measuring anything. Without
 	// this the cell benchmarks the model's saved config and then records
@@ -454,10 +537,13 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 	// Sweeping a value that only affects the request (sampling) must not
 	// pay for a reload, and consecutive cells that share a config (e.g.
 	// several presets under one sweep point) only need one.
-	if cellOv != nil {
+	// A job measuring a profile applies it even when a cell overrides
+	// nothing: that cell is the baseline, and the baseline has to be the
+	// profile rather than whatever the live config happens to be.
+	if cellOv != nil || job.BaseProfile != nil {
 		want := appliedConfig{modelID: cell.ModelID, buildID: cell.BuildID, cfg: cfg}
 		if *lastApplied != want {
-			if err := q.env.ApplyEphemeralConfig(ctx, cell.ModelID, cfg); err != nil {
+			if err := q.env.ApplyEphemeralConfig(ctx, cell.ModelID, cfg, baseConfig); err != nil {
 				return fmt.Errorf("apply config overrides for %s: %w", cell.ModelID, err)
 			}
 			*lastApplied = want
@@ -499,7 +585,8 @@ func (q *JobQueue) runCell(ctx context.Context, job *BenchmarkJob, cell *JobCell
 		HFRepoID:   modelInfo.HFRepoID,
 		HFToken:    q.env.HFToken(),
 		HFHome:     q.env.HFCacheDir(),
-		Sampling:   samplingFromOverrides(cellOv),
+		Sampling:   samplingForCell(job.BaseProfile, cellOv),
+		Reasoning:  modelInfo.Reasoning,
 		Memory:     q.env.MeasuredMemory,
 	}, nil)
 
@@ -553,7 +640,7 @@ func (q *JobQueue) runCapabilityCell(ctx context.Context, job *BenchmarkJob, cel
 	// the config-fidelity criterion. EvalConfigSnapshot, not
 	// applyOverrides: an evaluation defaults to an f16 KV cache so its
 	// score is comparable, unless the job asked for a specific one.
-	cfg := EvalConfigSnapshot(modelInfo.Config, cellOv)
+	cfg := markProfileEdited(EvalConfigSnapshot(modelInfo.Config, cellOv), modelInfo.Config)
 
 	run := BenchmarkRun{
 		ID:           newRunID(cell.Attempt),
@@ -712,6 +799,35 @@ func (q *JobQueue) runCapabilityCell(ctx context.Context, job *BenchmarkJob, cel
 	return nil
 }
 
+// samplingForCell is the sampling a cell's requests carry: the job's
+// overrides, or the profile being measured when it has values and the
+// job does not. A profile's sampling is part of what is being measured —
+// speculative decoding accepts fewer drafts at a high temperature — so a
+// job started from one must not send the live config's values instead.
+func samplingForCell(bp *BaseProfile, o *ConfigOverrides) SamplingParams {
+	s := samplingFromOverrides(o)
+	if bp == nil {
+		return s
+	}
+	c := bp.Config
+	if s.Temperature == nil {
+		s.Temperature = c.Temperature
+	}
+	if s.TopP == nil {
+		s.TopP = c.TopP
+	}
+	if s.TopK == nil {
+		s.TopK = c.TopK
+	}
+	if s.MinP == nil {
+		s.MinP = c.MinP
+	}
+	if s.RepeatPenalty == nil {
+		s.RepeatPenalty = c.RepeatPenalty
+	}
+	return s
+}
+
 // samplingFromOverrides extracts the per-request generation settings
 // from a job's overrides. These deliberately bypass ConfigSnapshot:
 // llama-server takes them per chat-completion request, not from the
@@ -733,6 +849,18 @@ func samplingFromOverrides(o *ConfigOverrides) SamplingParams {
 
 // applyOverrides returns base with non-nil ConfigOverrides fields
 // applied on top. A nil overrides argument returns base unchanged.
+// resolveSnapshotDraftFile turns a draft file named by a model ID into
+// its path, on the snapshot rather than a config: the same rule as
+// ResolveDraftFile, which the profile-saving path uses.
+func resolveSnapshotDraftFile(cfg *ConfigSnapshot, resolve func(id string) (string, error)) error {
+	tmp := models.ModelConfig{SpecType: cfg.SpecType, DraftModelPath: cfg.DraftModelPath, MtpPath: cfg.MtpPath}
+	if err := ResolveDraftFile(&tmp, resolve); err != nil {
+		return err
+	}
+	cfg.DraftModelPath, cfg.MtpPath = tmp.DraftModelPath, tmp.MtpPath
+	return nil
+}
+
 // EvalConfigSnapshot returns the config a CAPABILITY cell runs at:
 // applyOverrides, then the KV cache type reset to the default f16
 // unless the job asked for a specific one.
@@ -754,7 +882,7 @@ func samplingFromOverrides(o *ConfigOverrides) SamplingParams {
 // so the detail view's KV Quant column shows the cache the score was
 // actually measured through.
 func EvalConfigSnapshot(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
-	cfg := applyOverrides(base, overrides)
+	cfg := ApplyOverrides(base, overrides)
 	if overrides == nil || overrides.KVCacheQuant == nil {
 		cfg.KVCacheQuant = ""
 	}
@@ -810,7 +938,9 @@ func EvalReferenceConfig(ref, underTest ConfigSnapshot) ConfigSnapshot {
 	return out
 }
 
-func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
+// ApplyOverrides is applyOverrides for callers outside this package: it
+// layers a job cell's overrides onto a config snapshot.
+func ApplyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnapshot {
 	if overrides == nil {
 		return base
 	}
@@ -829,6 +959,12 @@ func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnaps
 	}
 	if overrides.UBatchSize != nil {
 		out.UBatchSize = *overrides.UBatchSize
+	}
+	if overrides.CPUMoE != nil {
+		out.CPUMoE = *overrides.CPUMoE
+	}
+	if overrides.SplitMode != nil {
+		out.SplitMode = *overrides.SplitMode
 	}
 	if overrides.FlashAttention != nil {
 		out.FlashAttention = *overrides.FlashAttention
@@ -866,12 +1002,39 @@ func applyOverrides(base ConfigSnapshot, overrides *ConfigOverrides) ConfigSnaps
 	if overrides.NgramSizeM != nil {
 		out.NgramSizeM = *overrides.NgramSizeM
 	}
+	if overrides.SpecAssist != nil {
+		out.SpecAssist = *overrides.SpecAssist
+	}
+	if overrides.AssistNMax != nil {
+		out.AssistNMax = *overrides.AssistNMax
+	}
+	if overrides.AssistNMin != nil {
+		out.AssistNMin = *overrides.AssistNMin
+	}
+	if overrides.AssistNMatch != nil {
+		out.AssistNMatch = *overrides.AssistNMatch
+	}
+	if overrides.AssistSizeN != nil {
+		out.AssistSizeN = *overrides.AssistSizeN
+	}
+	if overrides.AssistSizeM != nil {
+		out.AssistSizeM = *overrides.AssistSizeM
+	}
+	if overrides.AssistMinHits != nil {
+		out.AssistMinHits = *overrides.AssistMinHits
+	}
 	if overrides.PLEMode != nil {
 		out.PLEMode = *overrides.PLEMode
 	}
 	if overrides.ExtraFlags != nil {
 		out.ExtraFlags = *overrides.ExtraFlags
 	}
+	// Not normalised here: a job stored before speculative decoding had
+	// two slots carries a draftless mode in SpecType with its settings in
+	// the legacy fields, and the snapshot keeps that shape verbatim —
+	// it is a record of what was requested. models.NormalizeSpec runs on
+	// the launch path (specDecodingParams), so such a job launches
+	// exactly as it always did without its stored history being rewritten.
 	return out
 }
 
@@ -1035,4 +1198,80 @@ func sweepCombinations(sweeps []SweepAxis) []map[string]string {
 		combos = next
 	}
 	return combos
+}
+
+// failuresBeforeWriteOff is how many times one sweep value has to fail,
+// with the same error every time and never a success, before the rest of
+// its cells are abandoned. One failure can be a fluke — a router that
+// was still settling, a cell cancelled mid-load. Two the same is a
+// setting this machine will not run.
+const failuresBeforeWriteOff = 2
+
+// writeOffTracker watches sweep values that fail the same way every time
+// they are measured. A setting the machine cannot run — a tensor split
+// where the GPUs cannot reach each other, say — otherwise costs a model
+// load and a timeout once per remaining combination, which on a wide
+// sweep is most of an hour spent proving the same thing.
+type writeOffTracker struct {
+	fails     map[string]int
+	reason    map[string]string
+	succeeded map[string]bool
+}
+
+func newWriteOffTracker() *writeOffTracker {
+	return &writeOffTracker{
+		fails:     map[string]int{},
+		reason:    map[string]string{},
+		succeeded: map[string]bool{},
+	}
+}
+
+func writeOffKey(field, value string) string { return field + "=" + value }
+
+// recordFailure notes that every value this cell carried failed with err.
+// A value that fails with a different error each time is not written off:
+// the errors have to agree for the value itself to be the cause.
+func (w *writeOffTracker) recordFailure(values map[string]string, err string) {
+	for field, value := range values {
+		k := writeOffKey(field, value)
+		if prev, seen := w.reason[k]; seen && prev != err {
+			// A second, different failure. Neither explains the value on
+			// its own, so start the count again rather than write it off
+			// on the strength of two unrelated problems.
+			w.fails[k] = 1
+			w.reason[k] = err
+			continue
+		}
+		w.fails[k]++
+		w.reason[k] = err
+	}
+}
+
+// recordSuccess clears every value the cell carried: a value that has
+// worked once is not the reason anything else failed.
+func (w *writeOffTracker) recordSuccess(values map[string]string) {
+	for field, value := range values {
+		w.succeeded[writeOffKey(field, value)] = true
+	}
+}
+
+// writeOff returns the reason to skip this cell, and whether to skip it.
+//
+// anyCompleted has to be true: until something has been measured, a run
+// of failures says the job is wrong — the wrong build, a model that will
+// not load at all — rather than any one setting being at fault, and
+// blaming a setting would put a misleading reason on every cell.
+func (w *writeOffTracker) writeOff(values map[string]string, anyCompleted bool) (string, bool) {
+	if !anyCompleted {
+		return "", false
+	}
+	for field, value := range values {
+		k := writeOffKey(field, value)
+		if w.succeeded[k] || w.fails[k] < failuresBeforeWriteOff {
+			continue
+		}
+		return fmt.Sprintf("not measured: every setting measured with %s = %s failed the same way, "+
+			"so the rest were not tried. The error was: %s", field, value, w.reason[k]), true
+	}
+	return "", false
 }

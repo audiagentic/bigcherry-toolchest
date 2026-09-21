@@ -42,6 +42,12 @@ type Config struct {
 	// RuntimeEnv (and overriding it when the same name is set in both).
 	// Any variable is accepted; known-risky ones warn on save.
 	RuntimeEnvExtra string `yaml:"runtime_env_extra,omitempty"`
+
+	// PendingHelper is the "<repo>|<filename>" of a helper model being
+	// downloaded, so the model is marked as the app's own when it
+	// finishes even if the server restarted meanwhile. The helper model
+	// is not a user choice; see api/helper_model.go.
+	PendingHelper string `yaml:"pending_helper,omitempty"`
 }
 
 // ModelsPath returns the directory where GGUF models live. ModelsDir wins

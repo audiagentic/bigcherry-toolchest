@@ -22,6 +22,10 @@ type RunConfig struct {
 	HFToken    string // forwarded as HF_TOKEN to llama-benchy (avoids HF rate limiting)
 	HFHome     string // forwarded as HF_HOME so the tokenizer cache persists across runs
 	Sampling   SamplingParams
+	// Reasoning is how this model's thinking mode is turned off, used by
+	// the recall workload so its generation is recall rather than
+	// deliberation.
+	Reasoning ReasoningControl
 
 	// Memory returns what the model's current load allocated, once it is
 	// loaded. Nil, or a false second return, when nothing was measured —
@@ -233,7 +237,10 @@ func (r *Runner) Run(ctx context.Context, cfg RunConfig, progress chan<- Progres
 
 			// run.ID is unique per cell, so no two cells can send the
 			// same prompt and hit each other's cache.
-			result, err := r.runOneTest(ctx, cfg.RouterURL, cfg.RouterName, promptTokens, cfg.Preset.GenTokens, rep, cfg.Sampling, run.ID)
+			result, err := r.runOneTest(ctx, cfg.RouterURL, cfg.RouterName, promptTokens, cfg.Preset.GenTokens, rep, cfg.Sampling, run.ID, promptOptions{
+				Style:     cfg.Preset.PromptStyle,
+				Reasoning: cfg.Reasoning,
+			})
 			if err != nil {
 				lastErr = err
 				slog.Error("benchmark test failed", "prompt_tokens", promptTokens, "rep", rep, "error", err)
@@ -376,6 +383,225 @@ const BenchPromptPrefixTemplate = "This is benchmark repetition number %d. Pleas
 // ~4 chars/token under most BPE tokenizers).
 const BenchPromptCharsPerToken = 4
 
+// PromptStyle selects the instruction wrapped around the benchmark
+// passage. The two styles produce opposite generation workloads, and that
+// is the point: an n-gram speculative method measures exactly baseline on
+// PromptStyleAnalyze, which asks for new prose, and several times
+// baseline on PromptStyleEcho, where generation is recall of text already
+// in the context.
+type PromptStyle string
+
+const (
+	// PromptStyleAnalyze asks the model to respond to the passage. It is
+	// the zero value, so every preset that does not say otherwise keeps
+	// the behaviour it has always had.
+	PromptStyleAnalyze PromptStyle = ""
+	PromptStyleEcho    PromptStyle = "echo"
+	// PromptStyleCode asks the model to return an edited copy of a source
+	// file. Most of the answer is the input again, which is the workload
+	// speculative decoding pays off on, without the artificial certainty
+	// of PromptStyleEcho: the model still has to decide what to change.
+	// It is what autotune measures a coding use case with.
+	PromptStyleCode PromptStyle = "code"
+)
+
+// BenchPromptEchoPrefixTemplate asks the model to reproduce the passage
+// rather than respond to it. Exposed so the About modal can show the
+// actual template, the same as the analysis prefix.
+const BenchPromptEchoPrefixTemplate = "This is benchmark repetition number %d. Reproduce the following text exactly, character for character, with no commentary and no introduction.\n\n"
+
+// BenchPromptCodePrefixTemplate asks for an edited copy of the file that
+// follows. The edits are mechanical and spread through the file, so the
+// answer repeats most of the input while still being written rather than
+// recalled.
+const BenchPromptCodePrefixTemplate = "This is benchmark repetition number %d. Rename the method `add_item` to `add_stock` everywhere it appears, add type hints to every function, and return the complete updated file with no commentary.\n\n"
+
+// BenchCodeText is the source file PromptStyleCode asks the model to
+// edit. Deterministic like BenchPromptText, and self-contained: no
+// imports a model might comment on, and nothing that makes the edit
+// ambiguous.
+const BenchCodeText = "```python\n" + benchCodeBody + "```\n"
+
+const benchCodeBody = `"""Inventory tracking for a small warehouse.
+
+The module keeps stock levels per item, records movements in and out,
+and reports on what needs reordering. It is deliberately plain: a
+dictionary of items, a list of movements, and functions over them.
+"""
+
+
+class Item:
+    """A single stocked product."""
+
+    def __init__(self, sku, name, unit_price, reorder_level=0):
+        self.sku = sku
+        self.name = name
+        self.unit_price = unit_price
+        self.reorder_level = reorder_level
+        self.quantity = 0
+
+    def value(self):
+        """Return the value of the stock held for this item."""
+        return self.quantity * self.unit_price
+
+    def needs_reorder(self):
+        """Return True when stock has fallen to the reorder level."""
+        return self.quantity <= self.reorder_level
+
+    def __repr__(self):
+        return "Item(sku=%r, name=%r, quantity=%r)" % (self.sku, self.name, self.quantity)
+
+
+class Movement:
+    """A change in stock: positive in, negative out."""
+
+    def __init__(self, sku, quantity, reason, at):
+        self.sku = sku
+        self.quantity = quantity
+        self.reason = reason
+        self.at = at
+
+    def is_inbound(self):
+        """Return True when this movement added stock."""
+        return self.quantity > 0
+
+
+class Inventory:
+    """The warehouse's stock, indexed by SKU."""
+
+    def __init__(self, name):
+        self.name = name
+        self.items = {}
+        self.movements = []
+
+    def register(self, item):
+        """Add an item to the catalogue, replacing one with the same SKU."""
+        self.items[item.sku] = item
+        return item
+
+    def add_item(self, sku, quantity, reason="delivery", at=None):
+        """Add stock for one SKU and record the movement.
+
+        Raises KeyError when the SKU is not in the catalogue, and
+        ValueError when the quantity is not positive.
+        """
+        if sku not in self.items:
+            raise KeyError("unknown sku: %s" % sku)
+        if quantity <= 0:
+            raise ValueError("quantity must be positive")
+        item = self.items[sku]
+        item.quantity += quantity
+        self.movements.append(Movement(sku, quantity, reason, at))
+        return item.quantity
+
+    def remove_item(self, sku, quantity, reason="sale", at=None):
+        """Take stock out for one SKU and record the movement."""
+        if sku not in self.items:
+            raise KeyError("unknown sku: %s" % sku)
+        if quantity <= 0:
+            raise ValueError("quantity must be positive")
+        item = self.items[sku]
+        if item.quantity < quantity:
+            raise ValueError("only %d of %s in stock" % (item.quantity, sku))
+        item.quantity -= quantity
+        self.movements.append(Movement(sku, -quantity, reason, at))
+        return item.quantity
+
+    def quantity_of(self, sku):
+        """Return the stock held for one SKU, or zero when unknown."""
+        item = self.items.get(sku)
+        return item.quantity if item else 0
+
+    def total_value(self):
+        """Return the value of everything in stock."""
+        return sum(item.value() for item in self.items.values())
+
+    def reorder_list(self):
+        """Return the items at or below their reorder level, by name."""
+        low = [item for item in self.items.values() if item.needs_reorder()]
+        return sorted(low, key=lambda item: item.name)
+
+    def movements_for(self, sku):
+        """Return every movement recorded for one SKU, oldest first."""
+        return [m for m in self.movements if m.sku == sku]
+
+    def busiest_items(self, limit=5):
+        """Return the SKUs with the most movements, busiest first."""
+        counts = {}
+        for movement in self.movements:
+            counts[movement.sku] = counts.get(movement.sku, 0) + 1
+        ranked = sorted(counts.items(), key=lambda pair: pair[1], reverse=True)
+        return ranked[:limit]
+
+    def summary(self):
+        """Return a short report on the state of the inventory."""
+        lines = ["Inventory: %s" % self.name]
+        lines.append("  items: %d" % len(self.items))
+        lines.append("  total value: %.2f" % self.total_value())
+        low = self.reorder_list()
+        if low:
+            lines.append("  needs reorder: %s" % ", ".join(item.name for item in low))
+        return "\n".join(lines)
+
+
+def restock_from_plan(inventory, plan, reason="plan"):
+    """Apply a {sku: quantity} plan to an inventory, skipping unknown SKUs."""
+    applied = {}
+    for sku, quantity in plan.items():
+        if sku not in inventory.items:
+            continue
+        applied[sku] = inventory.add_item(sku, quantity, reason=reason)
+    return applied
+`
+
+// ReasoningControl describes how to turn a model's thinking mode off, in
+// whichever way that model exposes. Detected from the chat template and
+// carried through ModelInfo so this package needs no dependency on the
+// models package.
+type ReasoningControl struct {
+	Toggle string // "chat_template_kwargs" | "reasoning_effort" | "none"
+	Kwarg  string // kwarg key when Toggle is chat_template_kwargs
+}
+
+// applyThinkingOff adds whatever the model needs to skip its reasoning
+// pass. It is used for the recall workload and nothing else.
+//
+// Without it a reasoning model spends the whole generation budget
+// deliberating about how to reproduce the passage — novel prose, which is
+// the opposite of what internal-echo is for. The measured symptom is an
+// echo preset that reads almost exactly like the analysis preset, because
+// that is what it is running.
+func (rc ReasoningControl) applyThinkingOff(payload map[string]any) {
+	switch rc.Toggle {
+	case "chat_template_kwargs":
+		if rc.Kwarg == "" {
+			return
+		}
+		payload["chat_template_kwargs"] = map[string]any{rc.Kwarg: false}
+	case "reasoning_effort":
+		payload["reasoning_effort"] = "none"
+	}
+	// "none", or a model with no reasoning mode: nothing to turn off.
+}
+
+// promptOptions bundle what the prompt and the request need beyond the
+// sizing arguments, so the two travel together and cannot disagree.
+type promptOptions struct {
+	Style     PromptStyle
+	Reasoning ReasoningControl
+}
+
+// promptPrefixTemplate returns the per-repetition prefix for a style.
+func promptPrefixTemplate(style PromptStyle) string {
+	switch style {
+	case PromptStyleEcho:
+		return BenchPromptEchoPrefixTemplate
+	case PromptStyleCode:
+		return BenchPromptCodePrefixTemplate
+	}
+	return BenchPromptPrefixTemplate
+}
+
 // buildPrompt constructs a prompt of approximately the target token count
 // by repeating the benchmark text. The repetition parameter varies the
 // prompt to defeat llama.cpp's prompt cache.
@@ -392,7 +618,7 @@ const BenchPromptCharsPerToken = 4
 // prompt_n collapsing from 213 to 4 and prompt-processing throughput
 // reported as ~90 t/s instead of ~1380: a meaningless number presented
 // as a measurement.
-func buildPromptFor(nonce string, targetTokens int, repetition int) string {
+func buildPromptFor(nonce string, targetTokens int, repetition int, style PromptStyle) string {
 	targetChars := targetTokens * BenchPromptCharsPerToken
 	var b strings.Builder
 	// Everything that distinguishes this request goes first, before the
@@ -406,11 +632,29 @@ func buildPromptFor(nonce string, targetTokens int, repetition int) string {
 	// prompt_n of 6309/6795/13070/25630, which sum to the real sizes, and
 	// its throughput figures measured incremental prefill at increasing
 	// depth rather than the full prefill each row claimed.
-	b.WriteString(fmt.Sprintf("Benchmark %s, target %d tokens, repetition %d.\n\n",
-		nonce, targetTokens, repetition))
-	b.WriteString(fmt.Sprintf(BenchPromptPrefixTemplate, repetition))
-	for b.Len() < targetChars {
-		b.WriteString(BenchPromptText)
+	// The style belongs on this line too: both prefixes below open with
+	// "This is benchmark repetition number N", so two prompts that differ
+	// only in style would otherwise share their first ~80 characters. It
+	// is appended only when non-default, so an analysis prompt stays
+	// byte-identical to what every existing preset has always sent.
+	styleMark := ""
+	if style != PromptStyleAnalyze {
+		styleMark = ", style " + string(style)
+	}
+	b.WriteString(fmt.Sprintf("Benchmark %s, target %d tokens, repetition %d%s.\n\n",
+		nonce, targetTokens, repetition, styleMark))
+	b.WriteString(fmt.Sprintf(promptPrefixTemplate(style), repetition))
+	body := BenchPromptText
+	if style == PromptStyleCode {
+		body = BenchCodeText
+	}
+	for i := 0; b.Len() < targetChars; i++ {
+		if style == PromptStyleCode && i > 0 {
+			// A second copy is a second file rather than the same one
+			// twice, so the edit stays unambiguous.
+			b.WriteString(fmt.Sprintf("\n\nAnd this file, inventory_v%d.py:\n\n", i+1))
+		}
+		b.WriteString(body)
 	}
 	text := b.String()
 	if len(text) > targetChars {
@@ -422,14 +666,14 @@ func buildPromptFor(nonce string, targetTokens int, repetition int) string {
 // buildPrompt is the nonce-free form, kept for callers that don't need
 // cache isolation (warmup).
 func buildPrompt(targetTokens int, repetition int) string {
-	return buildPromptFor("", targetTokens, repetition)
+	return buildPromptFor("", targetTokens, repetition, PromptStyleAnalyze)
 }
 
 // sendCompletion sends a chat completion and returns the timings.
 func (r *Runner) sendCompletion(ctx context.Context, routerURL, model string, promptTokens, genTokens int) error {
 	// Warmup only needs the model resident; sampling settings are
 	// irrelevant to that and are left at server defaults.
-	_, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, 0, SamplingParams{}, "")
+	_, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, 0, SamplingParams{}, "", promptOptions{})
 	return err
 }
 
@@ -443,8 +687,8 @@ type timingsResponse struct {
 	PredictedPerSec float64 `json:"predicted_per_second"`
 }
 
-func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model string, promptTokens, genTokens, repetition int, sampling SamplingParams, nonce string) (*timingsResponse, error) {
-	prompt := buildPromptFor(nonce, promptTokens, repetition)
+func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model string, promptTokens, genTokens, repetition int, sampling SamplingParams, nonce string, opts promptOptions) (*timingsResponse, error) {
+	prompt := buildPromptFor(nonce, promptTokens, repetition, opts.Style)
 	reqPayload := map[string]any{
 		"model":      model,
 		"max_tokens": genTokens,
@@ -452,6 +696,13 @@ func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
+	}
+	if opts.Style == PromptStyleEcho || opts.Style == PromptStyleCode {
+		// Recall only works if the model actually reproduces the passage
+		// rather than reasoning about how to; the same goes for an edit,
+		// where a reasoning pass would spend the generation budget
+		// planning the change instead of writing the file.
+		opts.Reasoning.applyThinkingOff(reqPayload)
 	}
 	sampling.applyTo(reqPayload)
 	reqBody, _ := json.Marshal(reqPayload)
@@ -492,8 +743,8 @@ func (r *Runner) sendCompletionWithTimings(ctx context.Context, routerURL, model
 }
 
 // runOneTest runs a single benchmark test point.
-func (r *Runner) runOneTest(ctx context.Context, routerURL, model string, promptTokens, genTokens, rep int, sampling SamplingParams, nonce string) (*BenchmarkResult, error) {
-	timings, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, rep, sampling, nonce)
+func (r *Runner) runOneTest(ctx context.Context, routerURL, model string, promptTokens, genTokens, rep int, sampling SamplingParams, nonce string, opts promptOptions) (*BenchmarkResult, error) {
+	timings, err := r.sendCompletionWithTimings(ctx, routerURL, model, promptTokens, genTokens, rep, sampling, nonce, opts)
 	if err != nil {
 		return nil, err
 	}

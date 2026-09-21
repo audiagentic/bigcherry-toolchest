@@ -463,7 +463,7 @@
         .model-card-header,
         .model-card-row {
             display: grid;
-            grid-template-columns: 2.5rem minmax(0, 1fr) 5rem 5rem 5rem 13rem;
+            grid-template-columns: 2.5rem minmax(0, 1fr) 7rem 5rem 5rem 15rem;
             gap: 0.75rem;
             align-items: center;
         }
@@ -505,6 +505,103 @@
         .model-card-actions [role="group"] {
             margin: 0;
         }
+        /* Two columns, so the actions stay inside their column as they
+           grow: Configure and Autoconfigure on one line, Remove and
+           (later) Autotune below. A single row overflowed into the size
+           column at three buttons. */
+        .model-card-buttons {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.3rem;
+            width: 100%;
+        }
+        .model-card-buttons button {
+            width: 100%;
+            /* A label longer than its column must shorten rather than
+               spill over the button beside it. */
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        /* Narrow windows: the fixed columns leave the model name a few
+           characters wide, so the actions move to a line of their own
+           under the row and the name gets the width back. */
+        @media (max-width: 1200px) {
+            .model-card-header,
+            .model-card-row {
+                grid-template-columns: 2.5rem minmax(0, 1fr) 7rem 5rem 5rem;
+            }
+            .model-card-actions {
+                grid-column: 1 / -1;
+                margin-top: 0.4rem;
+            }
+            .model-card-buttons {
+                width: auto;
+                grid-template-columns: repeat(2, max-content);
+                justify-content: end;
+            }
+        }
+        /* The results table of a benchmark job shares its width between
+           eleven columns, and two of them hold prose: the sweep point and
+           a cell's error or skip reason. How the browser shares the width
+           follows the narrowest each column can be squeezed to, so those
+           two decide the table.
+
+           The sweep column used to lose that contest outright. Its labels
+           are allowed to break anywhere, which makes one character its
+           smallest possible width, so it gave up everything it had to any
+           other column that asked — a sweep of four settings ended up
+           three characters wide, one letter per line, beside a status
+           column wide enough for a sentence. A floor under the sweep
+           column and a ceiling over the status column settle it: neither
+           can take the other's width, and the labels wrap inside the
+           floor rather than being shredded. The cap on the sweep column
+           is what stops a sweep of a dozen settings from growing the
+           table past the pane and pushing the measurements out of sight.
+
+           Tighter cell padding pays for the floor. Pico gives every cell
+           1rem on each side, which across eleven columns is more of the
+           pane than the measurements themselves get. At 1080p this is the
+           difference between the table fitting and not. */
+        .sweep-cell {
+            max-width: 26rem;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }
+        .sweep-cell kbd {
+            display: inline-block;
+            margin-bottom: 0.15rem;
+        }
+        /* The floor is only worth paying for when a sweep was measured:
+           a job without one would spend it on a column of em-dashes. */
+        .has-sweep .sweep-cell,
+        .bench-compare-table .sweep-cell {
+            min-width: 11rem;
+        }
+        .status-cell {
+            max-width: 11rem;
+        }
+        .job-cells th,
+        .job-cells td {
+            padding-left: 0.4rem;
+            padding-right: 0.4rem;
+        }
+        /* The state of the model's latest autotune run, always visible so a
+           finished run is not hidden behind the button that started it. */
+        .model-card-autotune {
+            margin: 0;
+            padding: 5px 10px;
+            border-top: 1px solid var(--pico-muted-border-color);
+            background: var(--pico-card-sectioning-background-color);
+        }
+        .model-card-autotune small {
+            color: var(--pico-muted-color);
+        }
+        .model-card-autotune a {
+            margin-left: 0.4em;
+            white-space: nowrap;
+        }
         /* Configure panel inside the card. When populated, the owning card's
            border turns accent so a stack of open configs never blurs together,
            and the form is recessed onto an inset surface and nested in its own
@@ -517,7 +614,7 @@
             padding: 6px;
             background: var(--pico-card-sectioning-background-color);
         }
-        .model-card-config > form {
+        .model-card-config > .model-config-panel {
             font-size: 0.85rem;
             margin: 0;
             background: var(--pico-card-background-color);
@@ -525,6 +622,33 @@
             border-radius: 9px;
             padding: 14px 16px;
         }
+        .model-config-panel > form { margin: 0; }
+        /* Saved profiles: sits between the header and the autosaving form,
+           outside it, so browsing the list never triggers a save. */
+        .profile-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-end;
+            gap: 0.5rem;
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--pico-muted-border-color);
+        }
+        .profile-bar label { margin: 0; flex: 1 1 14rem; }
+        .profile-bar select, .profile-bar input { margin: 0; }
+        .profile-bar button { margin: 0; width: auto; }
+        .profile-status { flex-basis: 100%; color: var(--pico-muted-color); }
+        .profile-banner { margin: 0 0 10px; }
+        .autoconfig-review td, .autoconfig-review th { vertical-align: top; font-size: 0.8rem; }
+        .autoconfig-notes { margin: 0.5rem 0; }
+        /* Autotune's four stages, and one result card per goal. */
+        .autotune-steps { margin: 0.5rem 0; padding-left: 1.2rem; }
+        .autotune-steps li { margin-bottom: 0.2rem; }
+        .autotune-step-waiting { color: var(--pico-muted-color); }
+        .autotune-step-done::marker { content: "\2713  "; }
+        .autotune-step-stopped { color: var(--pico-del-color); }
+        .autotune-result { margin: 0.5rem 0; padding: 0.5rem 0.75rem; }
+        .autotune-result header { margin-bottom: 0.25rem; padding: 0; background: none; }
         /* Owner header naming which model this config belongs to. */
         .model-config-header {
             display: flex;

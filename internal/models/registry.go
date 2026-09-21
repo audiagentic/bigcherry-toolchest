@@ -2,16 +2,20 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tmac1973/llama-toolchest/internal/atomicfile"
 )
 
 // OrgAndBase returns the HuggingFace organization and base model name
@@ -93,6 +97,29 @@ type Model struct {
 	TokenEmbdBytes   int64 `json:"token_embd_bytes,omitempty"`
 	IndexerKeyLength int   `json:"indexer_key_length,omitempty"`
 	AttnLayers       int   `json:"attn_layers,omitempty"`
+	// MTPHead marks a standalone MTP drafter head that was registered as
+	// an ordinary model by a parser that couldn't recognize it. Records
+	// carrying it are dropped on the next backfill; nothing should serve
+	// one or offer it as a draft candidate. See GGUFMeta.IsMTPHead.
+	MTPHead bool `json:"mtp_head,omitempty"`
+	// NextNLayers is the number of built-in MTP draft layers: non-zero
+	// means the model can draft for itself (draft-mtp with no separate
+	// head). Zero on a standalone head, which carries the key but is not
+	// a model anyone runs.
+	NextNLayers int `json:"nextn_layers,omitempty"`
+	// HelperRole marks a model the app downloaded for its own use:
+	// reading model cards for Autoconfigure, and later Autotune. It is
+	// loaded only for those, and unloaded afterwards. Its settings are
+	// fixed (see HelperConfig), it is not offered for chat or
+	// benchmarks, and the only thing to do with it is remove it.
+	HelperRole bool `json:"helper_role,omitempty"`
+	// Mixture-of-experts layout, for --n-cpu-moe (see GGUFMeta). All zero
+	// on a dense model.
+	ExpertCount      int   `json:"expert_count,omitempty"`
+	ExpertUsedCount  int   `json:"expert_used_count,omitempty"`
+	ExpertBytes      int64 `json:"expert_bytes,omitempty"`
+	ExpertLayerFirst int   `json:"expert_layer_first,omitempty"`
+	ExpertLayers     int   `json:"expert_layers,omitempty"`
 
 	// Architecture parameters parsed from GGUF header.
 	Arch          string `json:"arch,omitempty"`
@@ -147,6 +174,12 @@ type ModelConfig struct {
 	GPUAssign   string `json:"gpu_assign,omitempty"` // "all", "0", "0-1", "custom", etc.
 	ContextSize int    `json:"context_size"`
 	Parallel    int    `json:"parallel,omitempty"` // n parallel sequence slots; 0/1 = no extra slots, >1 divides ctx_size across slots
+	// CPUMoE maps to --n-cpu-moe: the expert weights of the first N layers
+	// stay in system memory. The fastest way to run a mixture-of-experts
+	// model larger than VRAM, because only the few experts each token uses
+	// are read from there. 0 keeps everything on the GPU. Meaningful only
+	// when Model.ExpertCount > 0.
+	CPUMoE int `json:"cpu_moe,omitempty"`
 	// BatchSize/UBatchSize map to --batch-size / --ubatch-size. Zero means
 	// "don't emit", leaving llama.cpp on its own defaults (2048 / 512), so
 	// existing models are unaffected. UBatchSize is the physical compute
@@ -170,14 +203,31 @@ type ModelConfig struct {
 	MtpPath        string `json:"mtp_path,omitempty"`        // path to a separate MTP drafter-head GGUF (gemma-4 style); loaded via --model-draft under spec_type=draft-mtp. Empty for self-speculation MTP (Qwen3.6/DeepSeek-V3) where the head is baked into the main GGUF.
 	MtpDisabled    bool   `json:"mtp_disabled,omitempty"`    // skip the separate --model-draft MTP head at launch even when MtpPath is set; preserves the path so it can be re-enabled
 
-	// Speculative decoding
-	SpecType       string `json:"spec_type,omitempty"`        // "", "draft", "draft-mtp", "ngram-simple", "ngram-cache", etc.
-	DraftModelPath string `json:"draft_model_path,omitempty"` // path to draft model (when spec_type="draft")
+	// Speculative decoding, draft-method slot. See specmodes.go for why
+	// there are two slots and specDecodingParams for what each emits.
+	SpecType       string `json:"spec_type,omitempty"`        // "", "draft", "draft-mtp", "draft-eagle3", "draft-dflash", "draft-dspark" — draft methods only; the draftless mode lives in SpecAssist
+	DraftModelPath string `json:"draft_model_path,omitempty"` // path to the draft model or converted head (every draft method except self-speculation draft-mtp, which uses MtpPath)
 	DraftMax       int    `json:"draft_max,omitempty"`        // max draft tokens per step
 	DraftMin       int    `json:"draft_min,omitempty"`        // min draft tokens per step
 	DraftPMin      string `json:"draft_p_min,omitempty"`      // min probability threshold (string to allow empty=default)
-	NgramSizeN     int    `json:"ngram_size_n,omitempty"`     // n-gram lookup length
-	NgramSizeM     int    `json:"ngram_size_m,omitempty"`     // n-gram draft length
+
+	// Speculative decoding, draftless n-gram assist slot. Runs alongside
+	// the draft method above: llama.cpp accepts a comma-separated
+	// --spec-type list mixing one draft method with one draftless one,
+	// and the two do not share a draft length.
+	SpecAssist    string `json:"spec_assist,omitempty"`     // "", "ngram-mod", "ngram-simple", "ngram-cache", "ngram-map-k", "ngram-map-k4v"
+	AssistNMax    int    `json:"assist_n_max,omitempty"`    // --spec-ngram-mod-n-max
+	AssistNMin    int    `json:"assist_n_min,omitempty"`    // --spec-ngram-mod-n-min
+	AssistNMatch  int    `json:"assist_n_match,omitempty"`  // --spec-ngram-mod-n-match
+	AssistSizeN   int    `json:"assist_size_n,omitempty"`   // --spec-<mode>-size-n
+	AssistSizeM   int    `json:"assist_size_m,omitempty"`   // --spec-<mode>-size-m
+	AssistMinHits int    `json:"assist_min_hits,omitempty"` // --spec-<mode>-min-hits
+
+	// Legacy: the config form still posts these until the two-picker
+	// rework lands, and NormalizeSpec migrates them into the Assist*
+	// fields above. Nothing else reads them.
+	NgramSizeN int `json:"ngram_size_n,omitempty"`
+	NgramSizeM int `json:"ngram_size_m,omitempty"`
 
 	// Draft model resource overrides. Apply to spec_type="draft" and to
 	// gemma-4-style draft-mtp (separate head loaded via --model-draft). Not
@@ -194,6 +244,12 @@ type ModelConfig struct {
 	// ReasoningOverride lets a user correct or supply reasoning capability when
 	// chat-template auto-detection is wrong or absent. nil = use detection.
 	ReasoningOverride *ReasoningCapability `json:"reasoning,omitempty"`
+
+	// ActiveProfile names the saved profile this config was last saved as
+	// or restored from. It is a label, not a link: whether the config
+	// still matches that profile is worked out by comparing the two (see
+	// Registry.ActiveProfileState).
+	ActiveProfile string `json:"active_profile,omitempty"`
 
 	// SamplingPreset names the publisher preset whose values currently fill
 	// the sampling fields below, so the UI can show which preset is running.
@@ -326,6 +382,9 @@ func (c *ModelConfig) EffectiveFlagsFor(isEmbedding bool, backend string) string
 	if c.Parallel > 1 {
 		parts = append(parts, "--parallel", strconv.Itoa(c.Parallel))
 	}
+	if c.CPUMoE > 0 {
+		parts = append(parts, "--n-cpu-moe", strconv.Itoa(c.CPUMoE))
+	}
 	for _, p := range gpuPlacementParams(c, backend) {
 		parts = append(parts, "--"+p.Name, p.Value)
 	}
@@ -373,12 +432,36 @@ func (c *ModelConfig) EffectiveFlags() string {
 	return c.EffectiveFlagsFor(false, "")
 }
 
+// RegistrySchemaVersion is the models.json layout this build writes.
+// load() reads it back: a file written by a newer build may carry fields
+// this one does not know, and saving over it would silently drop them, so
+// such a file makes the registry read-only instead. A file with no version
+// (every file written before the field existed) is read as current.
+//
+//	1 — the version field itself
+//	2 — config_profiles
+const RegistrySchemaVersion = 2
+
+// ErrRegistryReadOnly is matched by errors.Is on every refusal from a
+// read-only registry. The error text itself is the plain-language reason.
+var ErrRegistryReadOnly = errors.New("model registry is read-only")
+
+type readOnlyError struct{ reason string }
+
+func (e readOnlyError) Error() string        { return e.reason }
+func (e readOnlyError) Is(target error) bool { return target == ErrRegistryReadOnly }
+
 type registryData struct {
-	Models  map[string]*Model       `json:"models"`
-	Configs map[string]*ModelConfig `json:"configs"`
+	SchemaVersion int                     `json:"schema_version"`
+	Models        map[string]*Model       `json:"models"`
+	Configs       map[string]*ModelConfig `json:"configs"`
 	// PendingConfigs holds backup-imported configs awaiting their model
 	// (see pending.go). Additive: older binaries ignore the field.
 	PendingConfigs []PendingConfig `json:"pending_configs,omitempty"`
+	// Profiles are named config snapshots, keyed by model identity rather
+	// than registry ID (see profiles.go). They stay when their model is
+	// deleted.
+	Profiles []ConfigProfile `json:"config_profiles,omitempty"`
 }
 
 // Registry manages local model storage and metadata.
@@ -387,6 +470,13 @@ type Registry struct {
 	dataDir   string
 	modelsDir string
 	data      registryData
+
+	// readOnly, when set, is why models.json must not be written: it could
+	// not be read, did not parse, or came from a newer build. Whatever did
+	// parse is still served, so the operator sees their models and the
+	// reason rather than an empty page. Every mutator checks it before
+	// changing anything in memory; save() checks it again as a backstop.
+	readOnly string
 }
 
 // NewRegistry creates a registry and loads persisted state. modelsDir is
@@ -409,6 +499,9 @@ func NewRegistry(dataDir, modelsDir string) *Registry {
 func (r *Registry) Add(m *Model) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 	r.data.Models[m.ID] = m
 	// A backup-imported config waiting for this identity wins over the
 	// default config. Covers downloads and scans alike — ScanModels
@@ -422,13 +515,12 @@ func (r *Registry) Add(m *Model) error {
 			TensorSplit:    "",
 			SplitMode:      "",
 			ContextSize:    8192,
-			Threads:        8,
+			Threads:        ThreadsFor(runtime.NumCPU()),
 			FlashAttention: true,
 			Jinja:          true,
 		}
 	}
-	r.save()
-	return nil
+	return r.save()
 }
 
 // List returns all models, sorted alphabetically by ModelID.
@@ -510,6 +602,9 @@ func (r *Registry) ResolveID(name string) string {
 func (r *Registry) Remove(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 
 	if _, ok := r.data.Models[id]; !ok {
 		return fmt.Errorf("model not found: %s", id)
@@ -517,14 +612,18 @@ func (r *Registry) Remove(id string) error {
 
 	delete(r.data.Models, id)
 	delete(r.data.Configs, id)
-	r.save()
-	return nil
+	return r.save()
 }
 
 // Delete removes a model entry and deletes its files from disk.
 func (r *Registry) Delete(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Checked before the files go: a delete that removed the GGUF and then
+	// could not record it would leave a registry entry for a missing file.
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 
 	m, ok := r.data.Models[id]
 	if !ok {
@@ -544,8 +643,7 @@ func (r *Registry) Delete(id string) error {
 
 	delete(r.data.Models, id)
 	delete(r.data.Configs, id)
-	r.save()
-	return nil
+	return r.save()
 }
 
 // removeEmptyDirs removes dir and its parent if they're empty, stopping at the models dir.
@@ -579,12 +677,62 @@ func (r *Registry) GetConfig(id string) (*ModelConfig, error) {
 func (r *Registry) SetConfig(id string, cfg *ModelConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 	if _, ok := r.data.Models[id]; !ok {
 		return fmt.Errorf("model not found: %s", id)
 	}
+	// The config form never posts the profile label, so an autosave would
+	// otherwise erase it on every change. Profile methods set it directly.
+	if cfg.ActiveProfile == "" {
+		if prev, ok := r.data.Configs[id]; ok && prev != nil {
+			cfg.ActiveProfile = prev.ActiveProfile
+		}
+	}
 	r.data.Configs[id] = cfg
-	r.save()
-	return nil
+	return r.save()
+}
+
+// SetHelperRole marks or unmarks a model as the app's helper model.
+func (r *Registry) SetHelperRole(id string, on bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
+	m, ok := r.data.Models[id]
+	if !ok {
+		return fmt.Errorf("model not found: %s", id)
+	}
+	if m.HelperRole == on {
+		return nil
+	}
+	m.HelperRole = on
+	return r.save()
+}
+
+// ListServing returns the models available for chat, embeddings and
+// benchmarks: everything except the app's own helper models.
+func (r *Registry) ListServing() []*Model {
+	var out []*Model
+	for _, m := range r.List() {
+		if !m.HelperRole {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// ListHelpers returns the app's helper models.
+func (r *Registry) ListHelpers() []*Model {
+	var out []*Model
+	for _, m := range r.List() {
+		if m.HelperRole {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // SetSamplingPresets replaces the sampling presets on a model record and
@@ -593,14 +741,16 @@ func (r *Registry) SetConfig(id string, cfg *ModelConfig) error {
 func (r *Registry) SetSamplingPresets(id string, presets []SamplingPreset, checkedAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
 	m, ok := r.data.Models[id]
 	if !ok {
 		return fmt.Errorf("model not found: %s", id)
 	}
 	m.SamplingPresets = presets
 	m.PresetsCheckedAt = checkedAt
-	r.save()
-	return nil
+	return r.save()
 }
 
 // ListNeedingPresetFetch returns IDs of models that have never had a network
@@ -636,7 +786,13 @@ func (r *Registry) ListNeedingPresetFetch() []string {
 //	1 — recurrent layers excluded from KV scaling; token-embedding size,
 //	    indexer key length and attention-layer count added for the VRAM
 //	    estimate.
-const GGUFMetaVersion = 1
+//	2 — NextN layer count and block-tensor layout added, so a standalone
+//	    MTP drafter head that reports a runnable architecture is
+//	    recognized as a head. Records for one are dropped by the backfill.
+//	3 — built-in MTP layer count copied to the model record, and the
+//	    mixture-of-experts layout (expert counts, expert tensor bytes and
+//	    which layers carry them) added for --n-cpu-moe.
+const GGUFMetaVersion = 3
 
 // BackfillGGUFMeta re-reads GGUF metadata for records written by an older
 // parser, in one pass at startup.
@@ -649,6 +805,9 @@ const GGUFMetaVersion = 1
 func (r *Registry) BackfillGGUFMeta() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("BackfillGGUFMeta") {
+		return
+	}
 
 	changed := false
 	for _, m := range r.data.Models {
@@ -668,6 +827,18 @@ func (r *Registry) BackfillGGUFMeta() {
 		meta.ApplyTo(m)
 		m.GGUFMetaVersion = GGUFMetaVersion
 		changed = true
+
+		// A head registered by a parser that couldn't tell it from a model.
+		// Drop the record — ScanModels declines to create it now, and
+		// AutoDetectMTP attaches the file to its main model instead. The
+		// file itself is untouched; only the mistaken registration goes.
+		if m.MTPHead {
+			slog.Info("dropping registry entry for MTP drafter head", "model", m.ID,
+				"file", m.FilePath, "arch", meta.Architecture)
+			delete(r.data.Models, m.ID)
+			delete(r.data.Configs, m.ID)
+			continue
+		}
 		slog.Info("re-read GGUF metadata", "model", m.ID, "version", GGUFMetaVersion,
 			"arch", meta.Architecture, "layers", meta.NLayers, "attn_layers", meta.AttnLayers,
 			"kv_full_per_tok", meta.KVFullPerTok, "was", before,
@@ -683,6 +854,9 @@ func (r *Registry) BackfillGGUFMeta() {
 func (r *Registry) DeduplicateModels() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("DeduplicateModels") {
+		return 0
+	}
 
 	seen := make(map[string]string) // file path → first model ID
 	var dupes []string
@@ -891,7 +1065,12 @@ func (r *Registry) ScanModels() int {
 	for _, m := range r.data.Models {
 		knownPaths[m.FilePath] = true
 	}
+	readOnly := r.readOnly
 	r.mu.RUnlock()
+	if readOnly != "" {
+		slog.Warn("model registry is read-only; not scanning for new models", "reason", readOnly)
+		return 0
+	}
 
 	// Walk looking for .gguf files
 	var found []*Model
@@ -976,10 +1155,11 @@ func (r *Registry) ScanModels() int {
 			meta.ApplyTo(m)
 		}
 
-		// Skip standalone MTP / drafter "assistant" heads (e.g. gemma-4's
-		// gemma4-assistant). They're loaded via --model-draft alongside a main
-		// model, not served on their own — auto-associated by AutoDetectMTP below.
-		if IsMTPHeadArch(m.Arch) {
+		// Skip standalone MTP / drafter heads (gemma-4's gemma4-assistant,
+		// unsloth's Qwen3.8-Flash-Next heads). They're loaded via --model-draft
+		// alongside a main model, not served on their own — auto-associated by
+		// AutoDetectMTP below. Set by ApplyTo from the parsed metadata.
+		if m.MTPHead {
 			return nil
 		}
 
@@ -1089,6 +1269,9 @@ func findMMProjInDir(dir string) string {
 func (r *Registry) AutoDetectMMProj() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("AutoDetectMMProj") {
+		return 0
+	}
 
 	found := 0
 	for id, m := range r.data.Models {
@@ -1115,8 +1298,37 @@ func (r *Registry) AutoDetectMMProj() int {
 // Detection is by architecture, not filename: Qwen's self-speculation MTP
 // models also carry "MTP" in their name but ARE runnable (the head is baked
 // into a normal qwen3 arch), so they must keep registering as ordinary models.
+//
+// This catches only the heads that declare an architecture of their own.
+// Prefer GGUFMeta.IsMTPHead, which also catches the ones that don't.
 func IsMTPHeadArch(arch string) bool {
 	return strings.Contains(strings.ToLower(arch), "assistant")
+}
+
+// IsMTPHead reports whether a GGUF is a standalone MTP / NextN drafter head
+// rather than a runnable model.
+//
+// An architecture name alone is not enough. gemma-4's head announces itself
+// as "gemma4-assistant", but unsloth's Qwen3.8-Flash-Next heads report
+// "qwen4exp" — the same architecture as the 111 GB model they draft for, at
+// the same embedding width. Nothing in the metadata distinguishes them, and
+// treating one as a model makes it a plausible-looking draft candidate for
+// the other, which is a configuration that cannot load.
+//
+// What does distinguish them is the tensor table. A head declares the full
+// block_count of its target but ships only the trailing NextN block: it has
+// blk.N tensors without a blk.0. Requiring that it carry blocks at all keeps
+// the first shard of a split model — which holds the metadata and, as
+// publishers ship them, no tensors — from being mistaken for one.
+//
+// Both flavors of head are covered, whether or not they carry their own
+// copies of token_embd/output: the shared variant borrows those from the
+// target at runtime, and the difference is invisible here.
+func (meta *GGUFMeta) IsMTPHead() bool {
+	if IsMTPHeadArch(meta.Architecture) {
+		return true
+	}
+	return meta.NextNPredictLayers > 0 && meta.HasBlockTensors && !meta.HasTrunkBlock0
 }
 
 // FindMTP looks for a separate MTP drafter-head GGUF associated with the given
@@ -1170,7 +1382,7 @@ func findMTPInDir(dir string) string {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		if meta, err := ParseGGUFMeta(path); err == nil && IsMTPHeadArch(meta.Architecture) {
+		if meta, err := ParseGGUFMeta(path); err == nil && meta.IsMTPHead() {
 			return path
 		}
 	}
@@ -1180,9 +1392,43 @@ func findMTPInDir(dir string) string {
 // AutoDetectMTP scans all registered models and sets MtpPath on configs where a
 // separate MTP drafter head exists in or near the model directory but isn't
 // configured yet.
+// BackfillSpecAssist migrates configs written before speculative decoding
+// had two slots, where a draftless mode sat in SpecType and its settings
+// in the draft-length fields. Runs once at startup; NormalizeSpec is
+// idempotent, so a second run finds nothing and saves nothing.
+//
+// Read paths tolerate the old shape anyway (specDecodingParams and the
+// benchmark override merge both normalise), which is what keeps stored
+// benchmark history working without being rewritten. This exists so the
+// registry on disk converges on one shape rather than staying mixed
+// indefinitely.
+func (r *Registry) BackfillSpecAssist() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("BackfillSpecAssist") {
+		return 0
+	}
+
+	migrated := 0
+	for _, cfg := range r.data.Configs {
+		if cfg == nil || !IsAssistMode(cfg.SpecType) {
+			continue
+		}
+		NormalizeSpec(cfg)
+		migrated++
+	}
+	if migrated > 0 {
+		r.save()
+	}
+	return migrated
+}
+
 func (r *Registry) AutoDetectMTP() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.skipReadOnlyLocked("AutoDetectMTP") {
+		return 0
+	}
 
 	found := 0
 	for id, m := range r.data.Models {
@@ -1210,14 +1456,29 @@ type DraftCandidate struct {
 	Arch     string
 }
 
-// FindDraftCandidates returns models that could serve as draft models for
-// the given model: same architecture family, significantly smaller.
-func (r *Registry) FindDraftCandidates(id string) []DraftCandidate {
+// FindDraftCandidates returns models that could serve as the drafter for
+// the given model under the given speculative mode: same architecture
+// family and significantly smaller, which is what makes a draft model
+// usable at all.
+//
+// The head-based methods (draft-eagle3, draft-dflash, draft-dspark) skip
+// both of those checks. Their drafter is not a smaller model of the same
+// family, it is a trained extra layer converted to its own GGUF, so it
+// matches neither filter — applying them would leave the picker empty for
+// exactly the modes that need it.
+func (r *Registry) FindDraftCandidates(id, mode string) []DraftCandidate {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	headBased := IsHeadBasedDraftMode(mode)
+
 	target, ok := r.data.Models[id]
-	if !ok || target.Arch == "" {
+	if !ok {
+		return nil
+	}
+	// A target with no recorded architecture can still take a converted
+	// head; it just cannot be matched against a draft model.
+	if target.Arch == "" && !headBased {
 		return nil
 	}
 
@@ -1226,16 +1487,27 @@ func (r *Registry) FindDraftCandidates(id string) []DraftCandidate {
 		if m.ID == id {
 			continue
 		}
-		// Same architecture family
-		if m.Arch != target.Arch {
-			continue
-		}
-		// Must be significantly smaller (< 40% of target size)
-		if m.SizeBytes >= target.SizeBytes*4/10 {
-			continue
+		if !headBased {
+			// Same architecture family
+			if m.Arch != target.Arch {
+				continue
+			}
+			// Must be significantly smaller (< 40% of target size)
+			if m.SizeBytes >= target.SizeBytes*4/10 {
+				continue
+			}
 		}
 		// Skip embedding models
 		if m.IsEmbedding() {
+			continue
+		}
+		// Skip MTP drafter heads. They match on architecture and are far
+		// under the size bar, so they look like ideal draft candidates —
+		// but they carry no trunk and cannot load as a draft model. They
+		// belong on the config's MtpPath under spec_type=draft-mtp, which
+		// AutoDetectMTP sets. Only reaches here for a head registered by
+		// an older parser; the backfill drops those.
+		if m.MTPHead {
 			continue
 		}
 		candidates = append(candidates, DraftCandidate{
@@ -1325,10 +1597,27 @@ func (r *Registry) registryPath() string {
 func (r *Registry) load() {
 	data, err := os.ReadFile(r.registryPath())
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			r.readOnly = fmt.Sprintf("models.json could not be read (%v). "+
+				"Model settings will not be saved until the file can be read, "+
+				"so that nothing overwrites it.", err)
+			slog.Error("failed to read model registry; registry is read-only", "error", err)
+		}
 		return
 	}
 	if err := json.Unmarshal(data, &r.data); err != nil {
-		slog.Error("failed to load model registry", "error", err)
+		r.readOnly = fmt.Sprintf("models.json could not be parsed (%v). "+
+			"Model settings will not be saved until the file is fixed, "+
+			"so that nothing overwrites it.", err)
+		slog.Error("failed to parse model registry; registry is read-only", "error", err)
+	} else if r.data.SchemaVersion > RegistrySchemaVersion {
+		r.readOnly = fmt.Sprintf("models.json was written by a newer version of "+
+			"llama-toolchest (schema %d; this version reads up to %d). "+
+			"Model settings will not be saved until llama-toolchest is upgraded, "+
+			"so that nothing the newer version stored is lost.",
+			r.data.SchemaVersion, RegistrySchemaVersion)
+		slog.Error("model registry is from a newer build; registry is read-only",
+			"schema_version", r.data.SchemaVersion, "supported", RegistrySchemaVersion)
 	}
 	if r.data.Models == nil {
 		r.data.Models = make(map[string]*Model)
@@ -1353,12 +1642,50 @@ func (r *Registry) load() {
 	}
 }
 
-func (r *Registry) save() {
-	os.MkdirAll(filepath.Dir(r.registryPath()), 0o755)
+// ReadOnlyReason returns why the registry refuses to save, or "" when it
+// is writable.
+func (r *Registry) ReadOnlyReason() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readOnly
+}
+
+// writableLocked returns an error when the registry must not be changed.
+// Mutators call it before touching memory: a change made in memory that
+// then failed to save would launch a config the panel reported as not
+// saved.
+func (r *Registry) writableLocked() error {
+	if r.readOnly != "" {
+		return readOnlyError{r.readOnly}
+	}
+	return nil
+}
+
+// skipReadOnlyLocked is writableLocked for the startup backfills, which
+// have no caller to return an error to.
+func (r *Registry) skipReadOnlyLocked(what string) bool {
+	if r.readOnly == "" {
+		return false
+	}
+	slog.Warn("model registry is read-only; skipping", "step", what, "reason", r.readOnly)
+	return true
+}
+
+// save writes models.json with write-then-rename, so a crash mid-write
+// leaves the previous file rather than a truncated one.
+func (r *Registry) save() error {
+	if err := r.writableLocked(); err != nil {
+		return err
+	}
+	r.data.SchemaVersion = RegistrySchemaVersion
 	data, err := json.MarshalIndent(r.data, "", "  ")
 	if err != nil {
 		slog.Error("failed to marshal model registry", "error", err)
-		return
+		return fmt.Errorf("saving models.json: %w", err)
 	}
-	os.WriteFile(r.registryPath(), data, 0o644)
+	if err := atomicfile.Write(r.registryPath(), data); err != nil {
+		slog.Error("failed to write model registry", "error", err)
+		return fmt.Errorf("saving models.json: %w", err)
+	}
+	return nil
 }

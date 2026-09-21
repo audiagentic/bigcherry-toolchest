@@ -1,5 +1,60 @@
 # Changelog
 
+## [2.29.4](https://github.com/tmac1973/llama-toolchest/compare/v2.29.3...v2.29.4) (2026-09-20)
+
+
+### Bug Fixes
+
+* show a saved profile straight away, keep the maximum context that was asked for, and give the sweep column room to be read ([#186](https://github.com/tmac1973/llama-toolchest/issues/186)) ([a9637a7](https://github.com/tmac1973/llama-toolchest/commit/a9637a702df214268e1009c188de168a791c5896))
+
+## [2.29.3](https://github.com/tmac1973/llama-toolchest/compare/v2.29.2...v2.29.3) (2026-09-20)
+
+
+### Bug Fixes
+
+* **benchmarks:** keep the results visible when a sweep is wide ([#184](https://github.com/tmac1973/llama-toolchest/issues/184)) ([3deb02b](https://github.com/tmac1973/llama-toolchest/commit/3deb02b8e3c6bab258e9c65d0624ab60eefb78b8))
+
+## [2.29.2](https://github.com/tmac1973/llama-toolchest/compare/v2.29.1...v2.29.2) (2026-09-20)
+
+
+### Bug Fixes
+
+* give the CUDA container the shared memory NCCL needs, and stop re-measuring a setting that keeps failing ([#182](https://github.com/tmac1973/llama-toolchest/issues/182)) ([8410ea2](https://github.com/tmac1973/llama-toolchest/commit/8410ea2c2f8306de3800ae6f37150325ef47ba6f))
+
+## [2.29.1](https://github.com/tmac1973/llama-toolchest/compare/v2.29.0...v2.29.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* **vram:** count the memory a layer split and speculative decoding really use ([#180](https://github.com/tmac1973/llama-toolchest/issues/180)) ([37a7e8c](https://github.com/tmac1973/llama-toolchest/commit/37a7e8c4f12a94b4c425d9824269328778d06143))
+
+## [2.29.0](https://github.com/tmac1973/llama-toolchest/compare/v2.28.1...v2.29.0) (2026-09-20)
+
+
+### Features
+
+* Autotune — measure a model's settings and keep the fastest ([#179](https://github.com/tmac1973/llama-toolchest/issues/179)) ([bf5467e](https://github.com/tmac1973/llama-toolchest/commit/bf5467e97504af9b5ff37d93f9cd0ed128697d9f))
+* saved model profiles and Autoconfigure ([#177](https://github.com/tmac1973/llama-toolchest/issues/177)) ([7587a73](https://github.com/tmac1973/llama-toolchest/commit/7587a73daba897bacb145234a720d71358b13b08))
+
+## [2.28.1](https://github.com/tmac1973/llama-toolchest/compare/v2.28.0...v2.28.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **benchmarks:** stop Ad-Hoc Runs claiming completed while a run is going ([#175](https://github.com/tmac1973/llama-toolchest/issues/175)) ([5258b48](https://github.com/tmac1973/llama-toolchest/commit/5258b483ccaa1c26d43678a555edc41c04cc07c5))
+
+## [2.28.0](https://github.com/tmac1973/llama-toolchest/compare/v2.27.0...v2.28.0) (2026-09-08)
+
+
+### Features
+
+* **spec:** run a draft method and an n-gram assist together ([#174](https://github.com/tmac1973/llama-toolchest/issues/174)) ([a11f91a](https://github.com/tmac1973/llama-toolchest/commit/a11f91ae259bf71d4693c16443ab6ff3a160a7f1))
+
+
+### Bug Fixes
+
+* **models:** detect MTP drafter heads that share the model's architecture ([#171](https://github.com/tmac1973/llama-toolchest/issues/171)) ([aedfb96](https://github.com/tmac1973/llama-toolchest/commit/aedfb962ed2e69060b2183e23756b998db4a2894))
+
 ## [2.27.0](https://github.com/tmac1973/llama-toolchest/compare/v2.26.0...v2.27.0) (2026-09-01)
 
 

@@ -11,9 +11,8 @@ import (
 )
 
 // renderModelConfig renders the model_config partial with the PLE fields
-// set as given, returning the HTML. It mirrors the anonymous struct the
-// handler builds; the shape is duplicated because the handler's is
-// anonymous, and a mismatch surfaces as a template execution error here.
+// set as given, returning the HTML. It uses modelConfigPanelData, the
+// type the handler builds, so the two cannot drift apart.
 func renderModelConfig(t *testing.T, cfg *models.ModelConfig, hasPLE bool, sizeLabel string) string {
 	t.Helper()
 	base, err := template.New("").Funcs(testFuncMap).ParseFS(web.Templates,
@@ -21,27 +20,18 @@ func renderModelConfig(t *testing.T, cfg *models.ModelConfig, hasPLE bool, sizeL
 	if err != nil {
 		t.Fatalf("parse templates: %v", err)
 	}
-	data := struct {
-		ModelID             string
-		Config              *models.ModelConfig
-		EffectiveFlags      string
-		MaxContext          int
-		HasMMProj           bool
-		HasBuiltinVision    bool
-		IsEmbedding         bool
-		DraftCandidates     []models.DraftCandidate
-		GPUOptions          []models.GPUOption
-		NumGPUs             int
-		SamplingPresets     []models.SamplingPreset
-		SamplingPresetsJSON string
-		HasEmbeddedDefault  bool
-		HasPLE              bool
-		PLESizeLabel        string
-	}{
+	data := modelConfigPanelData{
 		ModelID:      "test-id",
 		Config:       cfg,
-		HasPLE:       hasPLE,
-		PLESizeLabel: sizeLabel,
+		DraftModes:   models.DraftModes(),
+		AssistModes:  models.AssistModes(),
+		DraftParams:  models.SpecDraftParams(cfg.SpecType),
+		AssistParams: models.SpecAssistParams(cfg.SpecAssist),
+		HasMTP:       cfg.MtpPath != "",
+
+		EffectiveSpecType: cfg.EffectiveSpecType(),
+		HasPLE:            hasPLE,
+		PLESizeLabel:      sizeLabel,
 	}
 	var buf bytes.Buffer
 	if err := base.ExecuteTemplate(&buf, "model_config", data); err != nil {

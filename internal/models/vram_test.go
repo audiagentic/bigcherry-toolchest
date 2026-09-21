@@ -139,6 +139,17 @@ func TestAuxFilesVRAMGB(t *testing.T) {
 		{"mtp disabled", ModelConfig{MtpPath: mtp, MtpDisabled: true}, 0},
 		{"draft path but not draft mode", ModelConfig{SpecType: "draft-mtp", DraftModelPath: draft}, 0},
 		{"mtp head under draft-mtp", ModelConfig{SpecType: "draft-mtp", MtpPath: mtp}, 2},
+		// The head-based methods load their converted head from
+		// DraftModelPath, so it has to be counted the same way "draft" is.
+		{"eagle3 head", ModelConfig{SpecType: "draft-eagle3", DraftModelPath: draft}, 3},
+		{"dflash head", ModelConfig{SpecType: "draft-dflash", DraftModelPath: draft}, 3},
+		{"dspark head", ModelConfig{SpecType: "draft-dspark", DraftModelPath: draft}, 3},
+		// draft-mtp's head comes from MtpPath and is counted there; a
+		// stray DraftModelPath must not be counted a second time.
+		{"draft-mtp counts its head once", ModelConfig{SpecType: "draft-mtp", MtpPath: mtp, DraftModelPath: draft}, 2},
+		// The n-gram assist loads no file at all.
+		{"assist alone", ModelConfig{SpecAssist: "ngram-mod", AssistNMax: 64}, 0},
+		{"assist adds nothing to a draft method", ModelConfig{SpecType: "draft", DraftModelPath: draft, SpecAssist: "ngram-mod"}, 3},
 		{"missing file counts zero", ModelConfig{MmprojPath: filepath.Join(dir, "nope.gguf")}, 0},
 	}
 	for _, tc := range cases {
@@ -155,4 +166,64 @@ func TestKVCacheGBSlidingWindowCap(t *testing.T) {
 	got := m.KVCacheGB(100000, "")
 	want := 1024.0 * 1000.0 * 2.0 / (1024 * 1024 * 1024)
 	approx(t, "SWA cap", got, want, 1e-9)
+}
+
+// Speculative decoding runs a second context with a KV cache of its own.
+// It was not counted at all, which is harmless at a short context and
+// gigabytes at a long one: a 27B model with built-in MTP was planned at
+// its full 262,144 tokens, loaded its weights and its own cache, and
+// then failed at "failed to allocate buffer for kv cache" while creating
+// the draft context.
+func TestSpecKVCacheIsCountedWhenDraftingIsOn(t *testing.T) {
+	m := &Model{NLayers: 65, NEmbd: 5120, NHead: 24, NKVHead: 4,
+		ContextLength: 262144, SizeBytes: 31457991680, NextNLayers: 1}
+
+	off := ModelConfig{ContextSize: 262144, KVCacheQuant: "q8_0", GPULayers: 999}
+	on := off
+	on.SpecType = "draft-mtp"
+
+	if got := SpecKVCacheGB(m, &off, 262144); got != 0 {
+		t.Errorf("draft cache counted with no draft method: %.2f GiB", got)
+	}
+	got := SpecKVCacheGB(m, &on, 262144)
+	// llama.cpp asked for 1.00 GiB on one of three cards for this model.
+	// The estimate has to cover it and may sit above: a planner that
+	// guesses low proposes a config that cannot load.
+	if got < 1.0 || got > 3.0 {
+		t.Errorf("draft cache = %.2f GiB, want between 1 and 3", got)
+	}
+	if total := VRAMBreakdownForConfigOn(m, &on, 3).Total() - VRAMBreakdownForConfigOn(m, &off, 3).Total(); total < 1.0 {
+		t.Errorf("turning drafting on added only %.2f GiB to the estimate", total)
+	}
+}
+
+// The draft context caches every position, so a model whose own layers
+// mostly cache a sliding window must not have its draft cache estimated
+// as a share of that much smaller total.
+func TestSpecKVCacheIgnoresSlidingWindow(t *testing.T) {
+	m := &Model{NLayers: 65, NEmbd: 5120, NHead: 24, NKVHead: 4,
+		ContextLength: 262144, SizeBytes: 31457991680, NextNLayers: 1,
+		KVFullPerTok: 512, KVSWAPerTok: 8192, SlidingWindow: 4096}
+	cfg := ModelConfig{ContextSize: 262144, KVCacheQuant: "q8_0", GPULayers: 999, SpecType: "draft-mtp"}
+
+	own := m.KVCacheGB(262144, "q8_0")
+	spec := SpecKVCacheGB(m, &cfg, 262144)
+	if spec < own/float64(m.NLayers)*3 {
+		t.Errorf("draft cache %.2f GiB looks like a share of the windowed total %.2f GiB", spec, own)
+	}
+}
+
+// It scales with the context, which is the whole point: it is nothing at
+// a short context and the difference between loading and not at a long one.
+func TestSpecKVCacheScalesWithContext(t *testing.T) {
+	m := &Model{NLayers: 65, NEmbd: 5120, NHead: 24, NKVHead: 4, ContextLength: 262144, NextNLayers: 1}
+	cfg := ModelConfig{SpecType: "draft-mtp", GPULayers: 999}
+	long := SpecKVCacheGB(m, &cfg, 262144)
+	short := SpecKVCacheGB(m, &cfg, 8192)
+	if short > 0.2 {
+		t.Errorf("draft cache at 8192 tokens = %.2f GiB, want it small", short)
+	}
+	if long < short*16 {
+		t.Errorf("draft cache did not scale with context: %.2f at 8k, %.2f at 256k", short, long)
+	}
 }

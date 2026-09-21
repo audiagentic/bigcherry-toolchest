@@ -57,9 +57,25 @@ func (s *Server) renderJobList(w http.ResponseWriter, jobs []benchmark.Benchmark
 	if len(enriched) > 0 {
 		// The synthetic adhoc job carries no Cells, so its progress
 		// column should show the total run count instead.
+		//
+		// Its status needs deriving for the same reason. newAdhocJob
+		// synthesizes it as "completed" — it is a container for
+		// individually-started runs, not something that runs — and nothing
+		// revisits that, so the row claimed completed while a run inside it
+		// was still going, with the expanded list showing the running run
+		// directly under the badge contradicting it.
 		for i := range enriched {
-			if enriched[i].Job.ID == benchmark.AdhocJobID {
-				enriched[i].AdhocRuns = len(s.bench.RunsForJob(benchmark.AdhocJobID))
+			if enriched[i].Job.ID != benchmark.AdhocJobID {
+				continue
+			}
+			runs := s.bench.RunsForJob(benchmark.AdhocJobID)
+			enriched[i].AdhocRuns = len(runs)
+			enriched[i].Job.Status = benchmark.JobStatusCompleted
+			for _, r := range runs {
+				if r.Status == benchmark.StatusRunning {
+					enriched[i].Job.Status = benchmark.JobStatusRunning
+					break
+				}
 			}
 		}
 	}
@@ -590,13 +606,58 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		// existing flat run list instead so legacy + quick-bench runs
 		// stay visible.
 		if job.ID == benchmark.AdhocJobID {
-			s.renderBenchmarkList(w, s.bench.RunsForJob(benchmark.AdhocJobID))
+			s.renderAdhocDetail(w)
 			return
 		}
 		s.renderJobDetail(w, job)
 		return
 	}
 	respondJSON(w, job)
+}
+
+// renderAdhocDetail renders the adhoc job's expanded view: the shared run
+// list, wrapped in the bits that keep its collapsed row honest.
+//
+// The row is drawn by the job list, which has no idea a run has started, so
+// without the out-of-band updates below it keeps whatever badge it was
+// rendered with — "completed" over a running run, which the list underneath
+// then contradicts. Polling while a run is in flight is what keeps both
+// current; an idle list does not poll, since a history of hundreds of runs
+// should not re-render itself every two seconds forever.
+//
+// This lives here rather than inside renderBenchmarkList because that
+// renderer also serves GET /api/benchmarks/, and these updates are specific
+// to being the adhoc job's detail.
+func (s *Server) renderAdhocDetail(w http.ResponseWriter) {
+	runs := s.bench.RunsForJob(benchmark.AdhocJobID)
+
+	running := false
+	for _, r := range runs {
+		if r.Status == benchmark.StatusRunning {
+			running = true
+			break
+		}
+	}
+
+	status := benchmark.JobStatusCompleted
+	if running {
+		status = benchmark.JobStatusRunning
+	}
+	fmt.Fprintf(w,
+		`<span id="job-status-%[1]s" hx-swap-oob="true" class="job-status status-%[2]s" title="status: %[2]s">%[2]s</span>`,
+		benchmark.AdhocJobID, status)
+	fmt.Fprintf(w,
+		`<span id="job-progress-%s" hx-swap-oob="true" class="job-progress">%d run%s</span>`,
+		benchmark.AdhocJobID, len(runs), pluralS(len(runs)))
+
+	if running {
+		fmt.Fprintf(w,
+			`<div hx-get="/api/benchmark-jobs/%s" hx-trigger="every 2s" hx-swap="outerHTML">`,
+			benchmark.AdhocJobID)
+		defer w.Write([]byte(`</div>`))
+	}
+
+	s.renderBenchmarkList(w, runs)
 }
 
 // renderJobDetail enriches a job's cells with their linked run summary
@@ -621,7 +682,15 @@ func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.Benchmark
 	rows := make([]cellRow, 0, len(job.Cells))
 	var done, failed int
 	hasEval := false
+	// Whether any cell measured a sweep point at all. The sweep column
+	// has a minimum width so its labels stay readable (see .sweep-cell);
+	// a job with no sweep has nothing to put there, and would be paying
+	// that width for a column of em-dashes.
+	hasSweep := false
 	for i, c := range job.Cells {
+		if len(c.SweepValues) > 0 {
+			hasSweep = true
+		}
 		switch c.Status {
 		case benchmark.CellStatusCompleted:
 			done++
@@ -680,13 +749,14 @@ func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.Benchmark
 		rows = append(rows, row)
 	}
 	s.renderPartial(w, "job_detail", struct {
-		Job     *benchmark.BenchmarkJob
-		Rows    []cellRow
-		Done    int
-		Failed  int
-		Total   int
-		HasEval bool
-	}{Job: job, Rows: rows, Done: done, Failed: failed, Total: len(job.Cells), HasEval: hasEval})
+		Job      *benchmark.BenchmarkJob
+		Rows     []cellRow
+		Done     int
+		Failed   int
+		Total    int
+		HasEval  bool
+		HasSweep bool
+	}{Job: job, Rows: rows, Done: done, Failed: failed, Total: len(job.Cells), HasEval: hasEval, HasSweep: hasSweep})
 }
 
 // handleJobForm renders the new-job modal contents (multi-select models,
@@ -694,7 +764,8 @@ func (s *Server) renderJobDetail(w http.ResponseWriter, job *benchmark.Benchmark
 func (s *Server) handleJobForm(w http.ResponseWriter, r *http.Request) {
 	respondHTML(w)
 	var enabled []*models.Model
-	for _, m := range s.registry.List() {
+	// Helper models are not benchmark targets (see handleBenchmarkForm).
+	for _, m := range s.registry.ListServing() {
 		if cfg, err := s.registry.GetConfig(m.ID); err == nil && cfg.Enabled {
 			enabled = append(enabled, m)
 		}
@@ -740,7 +811,7 @@ func (s *Server) handleJobForm(w http.ResponseWriter, r *http.Request) {
 	}{
 		Models:      enabled,
 		Builds:      builds,
-		Presets:     benchmark.Presets(),
+		Presets:     benchmark.VisiblePresets(),
 		GPUOptions:  models.GPUAssignOptions(numGPUs, igpuFlags(gpuList)),
 		Params:      paramViews(numGPUs, igpuFlags(gpuList)),
 		MaxCells:    maxJobCells,

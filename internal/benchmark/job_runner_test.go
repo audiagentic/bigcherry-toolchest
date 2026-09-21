@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tmac1973/llama-toolchest/internal/evaluate"
+	"github.com/tmac1973/llama-toolchest/internal/models"
 	"github.com/tmac1973/llama-toolchest/internal/monitor"
 )
 
@@ -26,6 +27,7 @@ type fakeEnv struct {
 	saved     ConfigSnapshot
 
 	applied       []ConfigSnapshot // one per ApplyEphemeralConfig call
+	appliedBase   *models.ModelConfig
 	appliedT      []time.Time
 	cleared       int
 	clearedT      []time.Time
@@ -35,6 +37,10 @@ type fakeEnv struct {
 	buildRestarts int
 
 	applyErr error
+	// applyErrFor fails only the cells whose config it picks out, so a
+	// test can model a setting this machine cannot run rather than a
+	// machine that can run nothing.
+	applyErrFor func(ConfigSnapshot) error
 
 	// Capability-cell machinery (see the method set below). The fake
 	// models a router that starts RUNNING (running bool), a build with
@@ -91,7 +97,14 @@ func (f *fakeEnv) ResolveModel(id string) (ModelInfo, error) {
 	}, nil
 }
 
-func (f *fakeEnv) ApplyEphemeralConfig(_ context.Context, _ string, cfg ConfigSnapshot) error {
+func (f *fakeEnv) ResolveModelPath(id string) (string, error) {
+	return "/models/" + id + ".gguf", nil
+}
+
+func (f *fakeEnv) ApplyEphemeralConfig(_ context.Context, _ string, cfg ConfigSnapshot, base *models.ModelConfig) error {
+	f.mu.Lock()
+	f.appliedBase = base
+	f.mu.Unlock()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// The real implementation arms the override and marks the router
@@ -100,6 +113,11 @@ func (f *fakeEnv) ApplyEphemeralConfig(_ context.Context, _ string, cfg ConfigSn
 	f.dirty = true
 	if f.applyErr != nil {
 		return f.applyErr
+	}
+	if f.applyErrFor != nil {
+		if err := f.applyErrFor(cfg); err != nil {
+			return err
+		}
 	}
 	f.applied = append(f.applied, cfg)
 	f.appliedT = append(f.appliedT, time.Now())

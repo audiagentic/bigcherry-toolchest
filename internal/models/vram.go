@@ -139,6 +139,35 @@ const (
 	// CUDA/HIP context and allocations llama.cpp does not itemise. Constant
 	// per device across the corpus.
 	vramPerDeviceOverheadGB = 0.85
+	// What a layer split costs in graph scratch over a tensor-parallel
+	// one, on top of the per-card figure above.
+	//
+	// Every point the coefficients were fitted on was split
+	// tensor-parallel, where the cards act as one device and share one
+	// set of buffers. A layer split gives each card its own, and
+	// llama.cpp then runs the layers as a pipeline, keeping several
+	// copies of the graph in flight so a card is not idle waiting for
+	// the one before it. Its default is four copies.
+	//
+	// Four does not cover what was measured: the same model at the same
+	// context and micro-batch took 4.99 GiB of graph scratch split by
+	// layer over three NVIDIA cards against 0.96 GiB tensor-parallel
+	// over four AMD ones. This is the measured ratio, and it stands on
+	// that single pair — the backend differs as well as the split, so
+	// part of it may not be the split at all. It is kept at the measured
+	// figure rather than the explainable four because the estimate
+	// decides whether a model is offered at a context it can load at,
+	// and promising a fit that fails is the error worth avoiding.
+	layerSplitComputeCopies = 6.5
+	// A hybrid model's linear-attention layers keep a state buffer
+	// instead of a KV cache. It does not grow with the context: the 27B
+	// held the same 0.60 GiB across a sweep from 8,192 to 262,144
+	// tokens, which is what makes a flat per-layer figure the right
+	// shape. Split by layer it measured 1.75 GiB for the same model,
+	// hence the second constant — one pair, like the compute factor
+	// above.
+	recurrentStateGiBPerLayer = 0.0125
+	recurrentLayerSplitCopies = 2.9
 )
 
 // VRAMBreakdown is the estimate term by term, in GiB. The terms are named
@@ -151,25 +180,39 @@ const (
 // Which measured figure each term answers to:
 //
 //	Weights, Aux    model buffers on a device
-//	KVCache         KV and recurrent-state buffers
+//	KVCache, SpecKV  the attention caches: the model's, and the draft
+//	                 context's when speculative decoding is on
+//	Recurrent       the linear-attention state buffers of a hybrid model
 //	IndexerCache    the sparse-attention key cache
 //	Compute         compute and output buffers
 //	IndexerScratch  the rest of the compute buffers on a sparse model
 //	Overhead        nothing — it is the remainder llama.cpp never itemises,
 //	                the gap between its own accounting and the card counters
 type VRAMBreakdown struct {
-	Weights        float64
-	Aux            float64
-	KVCache        float64
+	Weights float64
+	Aux     float64
+	KVCache float64
+	// SpecKV is the KV cache of the speculative draft context, which is
+	// separate from the model's own and is not quantized.
+	SpecKV float64
+	// Recurrent is the state buffer of a hybrid model's linear-attention
+	// layers. Unlike a KV cache it does not grow with the context.
+	Recurrent      float64
 	IndexerCache   float64
 	Compute        float64
 	IndexerScratch float64
 	Overhead       float64
+
+	// CPURAM is not part of the GPU total: it is what the config keeps in
+	// system memory instead — the weights and KV cache of layers left off
+	// the GPU (gpu_layers below the layer count), and expert layers kept
+	// on the CPU (cpu_moe).
+	CPURAM float64
 }
 
 // Total is the figure the UI shows.
 func (b VRAMBreakdown) Total() float64 {
-	return b.Weights + b.Aux + b.KVCache + b.IndexerCache + b.Compute + b.IndexerScratch + b.Overhead
+	return b.Weights + b.Aux + b.KVCache + b.SpecKV + b.Recurrent + b.IndexerCache + b.Compute + b.IndexerScratch + b.Overhead
 }
 
 // Reported is the part of the estimate llama.cpp itemises while loading,
@@ -205,14 +248,27 @@ func VRAMBreakdownForConfigOn(m *Model, cfg *ModelConfig, cards int) VRAMBreakdo
 	if resident < 0 {
 		resident = m.SizeBytes
 	}
-	b.Weights = BytesToGiB(resident)
+	onCPU := CPUWeightBytes(m, cfg)
+	if onCPU > resident {
+		onCPU = resident
+	}
+	b.Weights = BytesToGiB(resident - onCPU)
+	b.CPURAM = BytesToGiB(onCPU)
 
 	b.KVCache = m.KVCacheGB(ctx, cfg.KVCacheQuant)
+	// llama.cpp keeps each layer's KV cache on the device that runs the
+	// layer, so layers left on the CPU take their share of it to system
+	// memory. Same "zero is not set" rule as the weights.
+	if cfg.GPULayers > 0 && cfg.GPULayers < m.NLayers && m.NLayers > 0 {
+		onGPU := b.KVCache * float64(cfg.GPULayers) / float64(m.NLayers)
+		b.CPURAM += b.KVCache - onGPU
+		b.KVCache = onGPU
+	}
 
 	// Graph scratch.
 	ub := cfg.EffectiveUBatchSize()
 	perCard := computeMiBPerUBatchTok*float64(ub) + computeMiBPerCtxTok*float64(ctx)
-	b.Compute = float64(cards) * perCard / 1024
+	b.Compute = float64(cards) * perCard / 1024 * layerSplitComputeFactor(cfg, cards)
 
 	// Sparse attention: a key cache of its own, plus scratch that scales
 	// with context times micro-batch on every device.
@@ -225,9 +281,128 @@ func VRAMBreakdownForConfigOn(m *Model, cfg *ModelConfig, cards int) VRAMBreakdo
 		b.IndexerScratch = float64(cards) * indexerScratchCopies * float64(ctx) * float64(ub) * 4 / (1024 * 1024 * 1024)
 	}
 
+	b.SpecKV = SpecKVCacheGB(m, cfg, ctx)
+
+	// Hybrid models: the layers that are not attention layers keep a
+	// recurrent state buffer instead of a KV cache.
+	if m.AttnLayers > 0 && m.AttnLayers < m.NLayers {
+		recurrent := float64(m.NLayers - m.AttnLayers)
+		b.Recurrent = recurrent * recurrentStateGiBPerLayer
+		if layerSplitComputeFactor(cfg, cards) > 1 {
+			b.Recurrent *= recurrentLayerSplitCopies
+		}
+	}
+
 	b.Aux = AuxFilesVRAMGB(cfg)
 	b.Overhead = float64(cards) * vramPerDeviceOverheadGB
 	return b
+}
+
+// specDraftLayers is how many layers of KV cache the draft context holds
+// when the count is not known from the file: the drafter's own layer,
+// and the one it predicts from.
+const specDraftLayers = 2
+
+// SpecKVCacheGB estimates the KV cache of the speculative draft context,
+// which llama.cpp allocates separately from the model's own.
+//
+// It is the term that was missing when a 27B model with built-in MTP was
+// planned at its full 262,144-token context: everything else fitted, and
+// the load failed at "failed to allocate buffer for kv cache" while
+// creating the draft context. The cache is worth nothing at a short
+// context and gigabytes at a long one, which is exactly where a planner
+// has to get it right.
+//
+// Two things make it larger than its share of layers suggests. It is not
+// quantized — the model's cache-type setting does not reach it, so it is
+// f16 whatever the main cache is — and it spans the drafter's layers
+// plus the one it predicts from.
+func SpecKVCacheGB(m *Model, cfg *ModelConfig, ctx int) float64 {
+	if m == nil || cfg == nil || !IsDraftMode(cfg.SpecType) || m.NLayers <= 0 {
+		return 0
+	}
+	if ctx <= 0 {
+		ctx = m.ContextLength
+	}
+	if ctx <= 0 {
+		return 0
+	}
+	layers := specDraftLayers
+	if n := m.NextNLayers; n > 0 && n+1 > layers {
+		layers = n + 1
+	}
+	if layers > m.NLayers {
+		layers = m.NLayers
+	}
+	// Full attention at f16, deliberately. The draft context caches
+	// every position it drafts over, so a share of the model's own
+	// cache would understate it badly on a model whose layers mostly
+	// cache a sliding window — which is where the context is longest
+	// and the term matters most.
+	//
+	// The model's own per-token rate is the best measure of a layer
+	// available: it counts elements per token across the attention
+	// layers, so dividing by them gives one layer's rate directly,
+	// without having to guess a head size from the embedding width.
+	if m.KVFullPerTok > 0 && m.AttnLayers > 0 {
+		perLayer := float64(m.KVFullPerTok) / float64(m.AttnLayers)
+		return perLayer * float64(layers) * float64(ctx) * kvBytesPerElem("") / (1024 * 1024 * 1024)
+	}
+	return EstimateKVCacheGB(layers, m.NKVHead, m.NHead, m.NEmbd, ctx, "")
+}
+
+// layerSplitComputeFactor is how much the graph scratch is multiplied by
+// on this placement: one for a single card or a tensor-parallel split,
+// and layerSplitComputeCopies for a layer split over several cards.
+//
+// A split mode is only read when there is more than one card to split
+// over. An empty mode is llama.cpp's default, which is a layer split.
+func layerSplitComputeFactor(cfg *ModelConfig, cards int) float64 {
+	if cards < 2 || cfg.SplitMode == "tensor" {
+		return 1
+	}
+	return layerSplitComputeCopies
+}
+
+// CPUWeightBytes estimates the model weights a config keeps in system
+// memory rather than on a GPU: the expert tensors of the first CPUMoE
+// layers, and the layers gpu_layers leaves off the GPU. Both are
+// approximations spread evenly over layers, which matches how uniform
+// transformer layers are; the estimate stays conservative because what is
+// not moved is still counted on the GPU.
+func CPUWeightBytes(m *Model, cfg *ModelConfig) int64 {
+	if m.NLayers <= 0 {
+		return 0
+	}
+	var moved int64
+
+	// --n-cpu-moe N counts layers from 0, dense leading layers included,
+	// so only the part of that range that carries experts moves.
+	var expertMoved int64
+	if cfg.CPUMoE > 0 && m.ExpertBytes > 0 && m.ExpertLayers > 0 {
+		n := cfg.CPUMoE - m.ExpertLayerFirst
+		if n > m.ExpertLayers {
+			n = m.ExpertLayers
+		}
+		if n > 0 {
+			expertMoved = m.ExpertBytes / int64(m.ExpertLayers) * int64(n)
+		}
+	}
+	moved += expertMoved
+
+	// gpu_layers counts from the top: llama.cpp offloads the last N
+	// layers, so the rest stay on the CPU. 999 (or anything at or above
+	// the layer count) offloads all of them. Zero is left out: many
+	// callers build a config with only the fields they care about, where
+	// a zero means "not set" rather than "CPU only", and counting it as a
+	// full move would report a model as fitting that does not.
+	if cfg.GPULayers > 0 && cfg.GPULayers < m.NLayers {
+		body := m.SizeBytes - m.PLEBytes - m.TokenEmbdBytes - expertMoved
+		if body > 0 {
+			moved += body / int64(m.NLayers) * int64(m.NLayers-cfg.GPULayers)
+		}
+	}
+	return moved
 }
 
 // PLEAutoMinBytes mirrors auto_lazy_min_size in llama.cpp's model loader:
@@ -250,7 +425,15 @@ func AuxFilesVRAMGB(cfg *ModelConfig) float64 {
 	if cfg.MtpPath != "" && !cfg.MtpDisabled {
 		gb += fileSizeGB(cfg.MtpPath)
 	}
-	if cfg.SpecType == "draft" && cfg.DraftModelPath != "" {
+	// Every draft method except draft-mtp loads its drafter — a smaller
+	// model of the same family, or a converted EAGLE-3 / DFlash / DSpark
+	// head — from DraftModelPath. draft-mtp is excluded because its head
+	// comes from MtpPath and is already counted just above, so each
+	// method contributes exactly once.
+	//
+	// The n-gram assist is deliberately absent: it matches text already in
+	// the context and loads no file, so it adds nothing here.
+	if IsDraftMode(cfg.SpecType) && cfg.SpecType != "draft-mtp" && cfg.DraftModelPath != "" {
 		gb += fileSizeGB(cfg.DraftModelPath)
 	}
 	return gb
